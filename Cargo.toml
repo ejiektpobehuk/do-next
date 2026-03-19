@@ -1,0 +1,35 @@
+[package]
+name = "do-next"
+description = "Pick your next Jira task & manage it from the terminal"
+version = "0.0.0-2026.3.19"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ejiektpobehuk/do-next"
+readme = "README.md"
+authors = ["Vlad Petrov <oss@ejiek.id>"]
+keywords = ["jira", "tui", "task-management", "productivity", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "do-next"
+path = "src/main.rs"
+
+[dependencies]
+ratatui    = "0.30"
+crossterm  = { version = "0.29", features = ["event-stream"] }
+tokio      = { version = "1", features = ["full"] }
+reqwest    = { version = "0.13", features = ["json", "rustls", "query"], default-features = false }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+json5      = "1.3"
+clap       = { version = "4", features = ["derive"] }
+keyring    = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+anyhow     = "1"
+log        = "0.4"
+simplelog  = "0.12"
+thiserror  = "2"
+dirs       = "6"
+open       = "5"
+chrono     = { version = "0.4", features = ["serde"] }
+futures    = "0.3"
+indexmap   = "2"
