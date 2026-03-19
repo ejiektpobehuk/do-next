@@ -11,7 +11,7 @@ Pick your next Jira task & manage it from the terminal.
 
 Right now `do-next` is intended for internal use in my teams.
 
-`v0.0.0-yyyy-mm-dd` is the versioning scheme before the release.
+`v0.0.0-yyyy.mm.dd` is the versioning scheme before the release.
 
 Polished experience and documentation are coming closer to the first public release.
 
@@ -29,9 +29,13 @@ Download a compiled binary from [GitHub Releases](https://github.com/ejiektpobeh
 
 ### Rust way
 
+Pre-release versions have to be provided explicitly:
+
 ```sh
-cargo install do-next
+cargo install do-next@0.0.0-yyyy.mm.dd
 ```
+
+The latest published version: ![Crates.io Version](https://img.shields.io/crates/v/do-next?style=flat-square&label=%40&labelColor=282828&color=3c3836)
 
 ### Nix way
 
