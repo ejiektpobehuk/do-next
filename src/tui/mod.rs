@@ -75,7 +75,7 @@ async fn run_inner(
     }
 
     // Spawn input task
-    spawn_input_task(tx.clone());
+    let mut input_task = spawn_input_task(tx.clone());
 
     // Spawn tick task (active while loading)
     let tick_tx = tx.clone();
@@ -102,8 +102,8 @@ async fn run_inner(
 
         maybe_spawn_field_names_fetch(&mut app, &client, &tx);
 
-        handle_pending_comment(terminal, &mut app, &client, &tx);
-        handle_pending_field_edit(terminal, &mut app, &client, &tx);
+        handle_pending_comment(terminal, &mut app, &client, &tx, &mut rx, &mut input_task);
+        handle_pending_field_edit(terminal, &mut app, &mut rx, &mut input_task, &tx);
 
         // Dispatch any pending action signals (transition fetch, hide, assign, move)
         dispatch_action(
@@ -140,13 +140,19 @@ fn handle_pending_comment(
     app: &mut AppState,
     client: &JiraClient,
     tx: &UnboundedSender<AppEvent>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    input_task: &mut tokio::task::JoinHandle<()>,
 ) {
     let ActionState::PendingComment { ref issue_key } = app.action_state else {
         return;
     };
     let key = issue_key.clone();
     app.action_state = ActionState::None;
-    match open_editor_for_comment(terminal) {
+    input_task.abort();
+    let editor_result = open_editor_for_comment(terminal);
+    *input_task = spawn_input_task(tx.clone());
+    drain_input_events(rx);
+    match editor_result {
         Ok(Some(body)) => {
             app.action_state = ActionState::AwaitingAction {
                 description: "Posting comment…".into(),
@@ -176,7 +182,8 @@ fn handle_pending_comment(
 fn handle_pending_field_edit(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut AppState,
-    client: &JiraClient,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    input_task: &mut tokio::task::JoinHandle<()>,
     tx: &UnboundedSender<AppEvent>,
 ) {
     let ActionState::PendingFieldEdit {
@@ -195,31 +202,25 @@ fn handle_pending_field_edit(
         original_json.clone(),
     );
     app.action_state = ActionState::None;
-    match open_editor_with_content(terminal, &current_value) {
+    input_task.abort();
+    let editor_result = open_editor_with_content(terminal, &current_value);
+    *input_task = spawn_input_task(tx.clone());
+    drain_input_events(rx);
+    match editor_result {
         Ok(Some(new_text)) => {
-            let new_value = shape_field_value(&new_text, &original_json);
-            app.action_state = ActionState::AwaitingAction {
-                description: "Updating field…".into(),
-            };
-            let client2 = client.clone();
-            let tx2 = tx.clone();
-            tokio::spawn(async move {
-                match client2
-                    .update_field(&key, &field_id, new_value.clone())
-                    .await
-                {
-                    Ok(()) => {
-                        let _ = tx2.send(AppEvent::ActionDone(ActionResult::FieldUpdated {
-                            issue_key: key,
-                            field_id,
-                            new_value,
-                        }));
-                    }
-                    Err(e) => {
-                        let _ = tx2.send(AppEvent::ActionDone(ActionResult::Error(e)));
-                    }
-                }
-            });
+            if new_text == current_value.trim() {
+                // No change — skip Jira update
+            } else {
+                let new_value = shape_field_value(&new_text, &original_json);
+                app.action_state = ActionState::ConfirmingFieldEdit {
+                    issue_key: key,
+                    field_id,
+                    old_text: current_value,
+                    new_text,
+                    new_value,
+                    tab: 0,
+                };
+            }
         }
         Ok(None) => {} // cancelled
         Err(e) => {
@@ -228,7 +229,7 @@ fn handle_pending_field_edit(
     }
 }
 
-fn spawn_input_task(tx: UnboundedSender<AppEvent>) {
+fn spawn_input_task(tx: UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut stream = EventStream::new();
         while let Some(Ok(event)) = stream.next().await {
@@ -236,7 +237,12 @@ fn spawn_input_task(tx: UnboundedSender<AppEvent>) {
                 break;
             }
         }
-    });
+    })
+}
+
+/// Discard any input events queued while the editor was blocking the event loop.
+fn drain_input_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) {
+    while let Ok(AppEvent::Input(_)) = rx.try_recv() {}
 }
 
 /// Dispatch any pending typed action states.

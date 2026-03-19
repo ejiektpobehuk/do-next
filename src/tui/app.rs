@@ -136,6 +136,16 @@ pub enum ActionState {
         field_id: String,
         new_value: serde_json::Value,
     },
+    /// Showing a diff preview; waiting for user to confirm or cancel.
+    ConfirmingFieldEdit {
+        issue_key: String,
+        field_id: String,
+        old_text: String,
+        new_text: String,
+        new_value: serde_json::Value,
+        /// Active tab: 0 = Preview, 1 = Diff
+        tab: usize,
+    },
     /// Interactive datetime picker overlay.
     EditingDatetimeField {
         issue_key: String,
@@ -585,6 +595,10 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
         }
         ActionState::EditingDatetimeField { .. } => {
             handle_datetime_picker_input(app, event);
+            return;
+        }
+        ActionState::ConfirmingFieldEdit { .. } => {
+            handle_confirm_field_edit_input(app, &event);
             return;
         }
         ActionState::KeybindingsHelp => {
@@ -1048,6 +1062,42 @@ fn handle_hide_input(app: &mut AppState, event: crossterm::event::Event) {
             }
             _ => {}
         }
+    }
+}
+
+fn handle_confirm_field_edit_input(app: &mut AppState, event: &crossterm::event::Event) {
+    use crossterm::event::{Event, KeyCode, KeyEvent};
+    let ActionState::ConfirmingFieldEdit {
+        ref issue_key,
+        ref field_id,
+        ref new_value,
+        ref mut tab,
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+    let Event::Key(KeyEvent { code, .. }) = event else {
+        return;
+    };
+    match code {
+        KeyCode::Tab => {
+            *tab = 1 - *tab;
+        }
+        KeyCode::Char('y') | KeyCode::Enter => {
+            let issue_key = issue_key.clone();
+            let field_id = field_id.clone();
+            let new_value = new_value.clone();
+            app.action_state = ActionState::CommittingFieldEdit {
+                issue_key,
+                field_id,
+                new_value,
+            };
+        }
+        KeyCode::Char('n' | 'q') | KeyCode::Esc => {
+            app.action_state = ActionState::None;
+        }
+        _ => {}
     }
 }
 

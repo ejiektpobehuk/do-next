@@ -100,6 +100,9 @@ pub fn render(
         ActionState::CommittingFieldEdit { .. } => {
             overlays::await_spinner::render_await(f, "Updating field…", app.tick_count);
         }
+        ActionState::ConfirmingFieldEdit { .. } => {
+            overlays::field_edit_confirm::render_field_edit_confirm_overlay(f, &app.action_state);
+        }
         ActionState::SelectingFieldOption { .. } => {
             overlays::field_select::render_field_select_overlay(f, &app.action_state);
         }

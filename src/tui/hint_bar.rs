@@ -8,12 +8,14 @@ use ratatui::{
 
 use crate::tui::app::{ActionState, AppState, FocusedPanel, ViewMode};
 
-pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
-    // Context-specific hints for modal states
-    match &app.action_state {
-        ActionState::KeybindingsHelp | ActionState::EditingDatetimeField { .. } => {
+/// Renders hints for modal action states. Returns `true` if a modal state was
+/// handled (caller should return early).
+fn try_render_modal_hints(f: &mut Frame, area: Rect, action_state: &ActionState) -> bool {
+    match action_state {
+        ActionState::KeybindingsHelp
+        | ActionState::EditingDatetimeField { .. }
+        | ActionState::ConfirmingFieldEdit { .. } => {
             f.render_widget(Block::default().borders(Borders::BOTTOM), area);
-            return;
         }
         ActionState::InlineEditingField { .. } => {
             let title = Line::from(vec![
@@ -30,7 +32,6 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
                     .title_bottom(title),
                 area,
             );
-            return;
         }
         ActionState::SelectingFieldOption { .. } | ActionState::SelectingFieldOptions { .. } => {
             let title = Line::from(vec![
@@ -49,9 +50,15 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
                     .title_bottom(title),
                 area,
             );
-            return;
         }
-        _ => {}
+        _ => return false,
+    }
+    true
+}
+
+pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
+    if try_render_modal_hints(f, area, &app.action_state) {
+        return;
     }
 
     let list_focused = app.focused_panel == FocusedPanel::List;
