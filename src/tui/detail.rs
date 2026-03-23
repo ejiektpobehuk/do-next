@@ -84,6 +84,9 @@ fn render_detail_content(
                 }
                 ViewMode::Review => views::review::render_review(f, area, &issue, app),
                 ViewMode::Comments => views::comments::render_comments(f, area, &issue, app),
+                ViewMode::Attachments => {
+                    views::attachments::render_attachments(f, area, &issue, app)
+                }
             }
         }
         None => {

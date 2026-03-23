@@ -24,7 +24,9 @@ use crate::config::types::Config;
 use crate::events::{ActionResult, AppEvent};
 use crate::jira::JiraClient;
 use crate::sources::spawn_fetches;
-use crate::tui::app::{ActionState, AppState, update_state};
+use crate::tui::app::{
+    ActionState, AppState, AttachmentFetchRequest, cache_path_for, update_state,
+};
 use crate::tui::render::{RenderOut, render};
 
 /// Entry point for the interactive TUI.
@@ -89,6 +91,9 @@ async fn run_inner(
         }
     });
 
+    // Initialize image picker (best-effort; terminal must be in raw mode for query)
+    app.image_picker = ratatui_image::picker::Picker::from_query_stdio().ok();
+
     let hidden_file = hidden_path(project_override)?;
     let mut hidden = HiddenState::load(&hidden_file)?;
 
@@ -104,6 +109,7 @@ async fn run_inner(
 
         handle_pending_comment(terminal, &mut app, &client, &tx, &mut rx, &mut input_task);
         handle_pending_field_edit(terminal, &mut app, &mut rx, &mut input_task, &tx);
+        handle_pending_comment_edit(terminal, &mut app, &mut rx, &mut input_task, &tx);
 
         // Dispatch any pending action signals (transition fetch, hide, assign, move)
         dispatch_action(
@@ -126,9 +132,12 @@ async fn run_inner(
 
         let mut render_out = RenderOut::default();
         terminal.draw(|f| render(f, &app, &mut list_state, &mut render_out))?;
-        app.postmortem_field_offsets = std::mem::take(&mut render_out.postmortem_field_offsets);
+        app.postmortem_focus_offsets = std::mem::take(&mut render_out.postmortem_focus_offsets);
         app.last_detail_viewport_h = render_out.detail_viewport_h;
         app.last_detail_content_h = render_out.detail_content_h;
+        app.overlay_content_h = render_out.overlay_content_h;
+        app.overlay_viewport_h = render_out.overlay_viewport_h;
+        app.overlay_comment_offsets = std::mem::take(&mut render_out.overlay_comment_offsets);
     }
 
     tick_handle.abort();
@@ -161,9 +170,10 @@ fn handle_pending_comment(
             let tx2 = tx.clone();
             tokio::spawn(async move {
                 match client2.post_comment(&key, &body).await {
-                    Ok(_) => {
+                    Ok(new_comment) => {
                         let _ = tx2.send(AppEvent::ActionDone(ActionResult::CommentPosted {
                             issue_key: key,
+                            new_comment,
                         }));
                     }
                     Err(e) => {
@@ -255,6 +265,11 @@ fn dispatch_action(
     hidden_file: &std::path::PathBuf,
     _project_override: bool,
 ) -> Result<()> {
+    // Silent background attachment fetch (not ActionState-driven)
+    if let Some(req) = app.pending_attachment_fetch.take() {
+        spawn_cache_attachment(req, false, client.clone(), tx.clone());
+    }
+
     match app.action_state.clone() {
         ActionState::LoadingTransitions { issue_key } => {
             app.action_state = ActionState::AwaitingAction {
@@ -305,10 +320,8 @@ fn dispatch_action(
             description,
             multi,
         } => {
-            app.action_state = ActionState::AwaitingAction {
-                description: "Fetching options…".into(),
-            };
-            spawn_load_field_options(
+            dispatch_load_field_options(
+                app,
                 FieldOptionsRequest {
                     issue_key,
                     field_id,
@@ -317,8 +330,8 @@ fn dispatch_action(
                     description,
                     multi,
                 },
-                client.clone(),
-                tx.clone(),
+                client,
+                tx,
             );
         }
         ActionState::CommittingFieldEdit {
@@ -326,14 +339,150 @@ fn dispatch_action(
             field_id,
             new_value,
         } => {
-            app.action_state = ActionState::AwaitingAction {
-                description: "Updating field…".into(),
-            };
-            spawn_commit_field_edit(issue_key, field_id, new_value, client.clone(), tx.clone());
+            dispatch_committing_field_edit(app, issue_key, field_id, new_value, client, tx);
+        }
+        ActionState::CommittingCommentEdit {
+            issue_key,
+            comment_id,
+            new_body,
+        } => {
+            dispatch_committing_comment_edit(app, issue_key, comment_id, new_body, client, tx);
+        }
+        ActionState::DeletingComment {
+            issue_key,
+            comment_id,
+        } => {
+            dispatch_deleting_comment(app, issue_key, comment_id, client, tx);
+        }
+        ActionState::OpeningAttachment {
+            attachment_id,
+            content_url,
+            filename,
+            issue_key,
+        } => {
+            dispatch_opening_attachment(
+                app,
+                attachment_id,
+                content_url,
+                filename,
+                issue_key,
+                client,
+                tx,
+            );
         }
         _ => {}
     }
     Ok(())
+}
+
+fn dispatch_opening_attachment(
+    app: &mut AppState,
+    attachment_id: String,
+    content_url: String,
+    filename: String,
+    issue_key: String,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    app.action_state = ActionState::AwaitingAction {
+        description: "Fetching attachment…".into(),
+    };
+    let req = AttachmentFetchRequest {
+        attachment_id,
+        content_url,
+        filename,
+        issue_key,
+    };
+    spawn_cache_attachment(req, true, client.clone(), tx.clone());
+}
+
+fn dispatch_committing_field_edit(
+    app: &mut AppState,
+    issue_key: String,
+    field_id: String,
+    new_value: serde_json::Value,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    app.action_state = ActionState::AwaitingAction {
+        description: "Updating field…".into(),
+    };
+    spawn_commit_field_edit(issue_key, field_id, new_value, client.clone(), tx.clone());
+}
+
+fn dispatch_committing_comment_edit(
+    app: &mut AppState,
+    issue_key: String,
+    comment_id: String,
+    new_body: String,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    app.action_state = ActionState::AwaitingAction {
+        description: "Updating comment…".into(),
+    };
+    spawn_commit_comment_edit(issue_key, comment_id, new_body, client.clone(), tx.clone());
+}
+
+fn dispatch_deleting_comment(
+    app: &mut AppState,
+    issue_key: String,
+    comment_id: String,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    app.action_state = ActionState::AwaitingAction {
+        description: "Deleting comment…".into(),
+    };
+    spawn_delete_comment(issue_key, comment_id, client.clone(), tx.clone());
+}
+
+fn spawn_cache_attachment(
+    req: AttachmentFetchRequest,
+    open_after: bool,
+    client: JiraClient,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let cache_path = cache_path_for(&req.issue_key, &req.attachment_id, &req.filename);
+        if !cache_path.exists() {
+            if let Some(parent) = cache_path.parent()
+                && let Err(e) = tokio::fs::create_dir_all(parent).await
+            {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::Error(e.into())));
+                return;
+            }
+            match client.download_attachment(&req.content_url).await {
+                Ok(bytes) => {
+                    if let Err(e) = tokio::fs::write(&cache_path, &bytes).await {
+                        let _ = tx.send(AppEvent::ActionDone(ActionResult::Error(e.into())));
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::ActionDone(ActionResult::Error(e)));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(AppEvent::ActionDone(ActionResult::AttachmentCached {
+            attachment_id: req.attachment_id,
+            cache_path,
+            open_after,
+        }));
+    });
+}
+
+fn dispatch_load_field_options(
+    app: &mut AppState,
+    req: FieldOptionsRequest,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    app.action_state = ActionState::AwaitingAction {
+        description: "Fetching options…".into(),
+    };
+    spawn_load_field_options(req, client.clone(), tx.clone());
 }
 
 struct FieldOptionsRequest {
@@ -470,6 +619,94 @@ fn spawn_transition(key: String, tid: String, client: JiraClient, tx: UnboundedS
                 let _ = tx.send(AppEvent::ActionDone(ActionResult::TransitionApplied {
                     issue_key: key,
                     new_status: name,
+                }));
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::Error(e)));
+            }
+        }
+    });
+}
+
+fn handle_pending_comment_edit(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut AppState,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    input_task: &mut tokio::task::JoinHandle<()>,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let ActionState::PendingCommentEdit {
+        ref issue_key,
+        ref comment_id,
+        ref original_body,
+    } = app.action_state
+    else {
+        return;
+    };
+    let (key, cid, original) = (issue_key.clone(), comment_id.clone(), original_body.clone());
+    app.action_state = ActionState::None;
+    input_task.abort();
+    let editor_result = open_editor_with_content(terminal, &original);
+    *input_task = spawn_input_task(tx.clone());
+    drain_input_events(rx);
+    match editor_result {
+        Ok(Some(new_text)) => {
+            if new_text == original.trim() {
+                // No change
+            } else {
+                app.action_state = ActionState::ConfirmingCommentEdit {
+                    issue_key: key,
+                    comment_id: cid,
+                    old_text: original,
+                    new_text,
+                    tab: 0,
+                };
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            app.action_state = ActionState::Error(std::sync::Arc::new(e));
+        }
+    }
+}
+
+fn spawn_commit_comment_edit(
+    issue_key: String,
+    comment_id: String,
+    new_body: String,
+    client: JiraClient,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match client
+            .update_comment(&issue_key, &comment_id, &new_body)
+            .await
+        {
+            Ok(updated) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::CommentEdited {
+                    issue_key,
+                    updated_comment: updated,
+                }));
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::Error(e)));
+            }
+        }
+    });
+}
+
+fn spawn_delete_comment(
+    issue_key: String,
+    comment_id: String,
+    client: JiraClient,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match client.delete_comment(&issue_key, &comment_id).await {
+            Ok(()) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::CommentDeleted {
+                    issue_key,
+                    comment_id,
                 }));
             }
             Err(e) => {

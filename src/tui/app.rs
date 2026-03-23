@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 
 use crate::config::types::{Config, SourceConfig};
 use crate::events::{ActionResult, AppEvent};
-use crate::jira::types::{FieldOption, Issue};
+use crate::jira::types::{Comment, FieldOption, Issue};
 
 /// A navigable item in the list (issue or error row).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +48,23 @@ pub enum ViewMode {
     Postmortem,
     Review,
     Comments,
+    Attachments,
+}
+
+/// Which item has focus inside the postmortem detail view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostmortemFocus {
+    Comments,
+    Attachments,
+    /// 0-based config-field index.
+    Field(usize),
+}
+
+/// A sub-view shown as a popup overlay on top of the postmortem view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubView {
+    Comments,
+    Attachments,
 }
 
 /// Current overlay / action being performed.
@@ -146,6 +163,46 @@ pub enum ActionState {
         /// Active tab: 0 = Preview, 1 = Diff
         tab: usize,
     },
+    /// Waiting for $EDITOR to close with edited comment body.
+    PendingCommentEdit {
+        issue_key: String,
+        comment_id: String,
+        original_body: String,
+    },
+    /// Showing a diff/preview for the edited comment; waiting for confirm or cancel.
+    ConfirmingCommentEdit {
+        issue_key: String,
+        comment_id: String,
+        old_text: String,
+        new_text: String,
+        /// Active tab: 0 = Preview, 1 = Diff
+        tab: usize,
+    },
+    /// Sending updated comment to Jira.
+    CommittingCommentEdit {
+        issue_key: String,
+        comment_id: String,
+        new_body: String,
+    },
+    /// Yes/No popup confirming comment deletion. `selected` 0=Yes 1=No.
+    ConfirmingCommentDelete {
+        issue_key: String,
+        comment_id: String,
+        /// Default 1 (No) for safety.
+        selected: usize,
+    },
+    /// Sending delete to Jira.
+    DeletingComment {
+        issue_key: String,
+        comment_id: String,
+    },
+    /// Fetching and caching an attachment, then opening with system default app.
+    OpeningAttachment {
+        attachment_id: String,
+        content_url: String,
+        filename: String,
+        issue_key: String,
+    },
     /// Interactive datetime picker overlay.
     EditingDatetimeField {
         issue_key: String,
@@ -180,10 +237,11 @@ pub struct AppState {
     pub detail_scroll: usize,
     /// Which panel currently has keyboard focus.
     pub focused_panel: FocusedPanel,
-    /// Index of the focused editable field when `ViewMode::Postmortem` && `FocusedPanel::Detail`.
-    pub postmortem_field_idx: usize,
-    /// Virtual (top, bottom) row for each editable postmortem field; written each render.
-    pub postmortem_field_offsets: Vec<(usize, usize)>,
+    /// Focused item when `ViewMode::Postmortem` && `FocusedPanel::Detail`.
+    pub postmortem_focus: PostmortemFocus,
+    /// Virtual (top, bottom) row for each focusable postmortem item; written each render.
+    /// Index: Comments=0, Attachments=1, Field(i)=2+i.
+    pub postmortem_focus_offsets: Vec<(usize, usize)>,
     /// Height of the detail content viewport; written each render.
     pub last_detail_viewport_h: usize,
     /// API-fetched display names for postmortem fields: `field_id` → name.
@@ -196,6 +254,41 @@ pub struct AppState {
     pub pending_g: bool,
     /// Total content lines of the detail view; written each render.
     pub last_detail_content_h: usize,
+    /// Sub-view popup shown on top of the postmortem view (Comments or Attachments).
+    pub overlay: Option<SubView>,
+    /// Scroll offset for the sub-view overlay (independent of `detail_scroll`).
+    pub overlay_scroll: usize,
+    /// Content height (lines) of the sub-view overlay; written each render.
+    pub overlay_content_h: usize,
+    /// Viewport height of the sub-view overlay; written each render.
+    pub overlay_viewport_h: usize,
+    /// Index of the focused comment widget in the comments overlay.
+    pub overlay_focused_comment: usize,
+    /// Virtual (top, bottom) row for each comment widget; written each render.
+    pub overlay_comment_offsets: Vec<(usize, usize)>,
+    /// Index of the focused attachment in the attachments overlay.
+    pub overlay_focused_attachment: usize,
+    /// Cached file paths per `attachment_id`.
+    pub attachment_cache: HashMap<String, std::path::PathBuf>,
+    /// Decoded text content per `attachment_id`.
+    pub attachment_text_previews: HashMap<String, String>,
+    /// Decoded image protocol state per `attachment_id` (for ratatui-image).
+    pub attachment_images:
+        HashMap<String, std::cell::RefCell<ratatui_image::protocol::StatefulProtocol>>,
+    /// Attachment currently being fetched in the background (id).
+    pub attachment_fetching_id: Option<String>,
+    /// Pending silent background fetch (set by nav handlers, consumed by `dispatch_action`).
+    pub pending_attachment_fetch: Option<AttachmentFetchRequest>,
+    /// Terminal image protocol picker (created once at startup).
+    pub image_picker: Option<ratatui_image::picker::Picker>,
+}
+
+/// Request for a silent background attachment fetch.
+pub struct AttachmentFetchRequest {
+    pub attachment_id: String,
+    pub content_url: String,
+    pub filename: String,
+    pub issue_key: String,
 }
 
 impl AppState {
@@ -219,14 +312,27 @@ impl AppState {
             current_user: None,
             detail_scroll: 0,
             focused_panel: FocusedPanel::List,
-            postmortem_field_idx: 0,
-            postmortem_field_offsets: Vec::new(),
+            postmortem_focus: PostmortemFocus::Comments,
+            postmortem_focus_offsets: Vec::new(),
             last_detail_viewport_h: 0,
             postmortem_field_names: HashMap::new(),
             postmortem_field_schemas: HashMap::new(),
             postmortem_field_names_loading: false,
             pending_g: false,
             last_detail_content_h: 0,
+            overlay: None,
+            overlay_scroll: 0,
+            overlay_content_h: 0,
+            overlay_viewport_h: 0,
+            overlay_focused_comment: 0,
+            overlay_comment_offsets: Vec::new(),
+            overlay_focused_attachment: 0,
+            attachment_cache: HashMap::new(),
+            attachment_text_previews: HashMap::new(),
+            attachment_images: HashMap::new(),
+            attachment_fetching_id: None,
+            pending_attachment_fetch: None,
+            image_picker: None,
         }
     }
 
@@ -438,16 +544,7 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             };
         }
         ActionResult::AssignedToMe { ref issue_key } => {
-            // Mark assignee as current user in the list (best-effort display update)
-            if let Some(ref me) = app.current_user.clone()
-                && let Some(issue) = app.issues.iter_mut().find(|i| &i.key == issue_key)
-            {
-                issue.fields.assignee = Some(crate::jira::types::UserField {
-                    name: me.clone(),
-                    display_name: Some(me.clone()),
-                    account_id: None,
-                });
-            }
+            apply_assigned_to_me(app, issue_key);
             app.action_state = ActionState::None;
         }
         ActionResult::MovedToProject {
@@ -459,22 +556,18 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             }
             app.action_state = ActionState::None;
         }
-        ActionResult::CommentPosted { .. } => {
-            app.action_state = ActionState::None;
+        ActionResult::CommentPosted {
+            issue_key,
+            new_comment,
+        } => {
+            apply_comment_posted(app, &issue_key, new_comment);
         }
         ActionResult::FieldUpdated {
-            ref issue_key,
-            ref field_id,
-            ref new_value,
+            issue_key,
+            field_id,
+            new_value,
         } => {
-            // Update in-memory field value immediately (no re-fetch needed)
-            if let Some(issue) = app.issues.iter_mut().find(|i| &i.key == issue_key) {
-                issue
-                    .fields
-                    .extra
-                    .insert(field_id.clone(), new_value.clone());
-            }
-            app.action_state = ActionState::None;
+            apply_field_updated(app, &issue_key, &field_id, &new_value);
         }
         ActionResult::FieldOptionsLoaded {
             issue_key,
@@ -500,6 +593,135 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             app.postmortem_field_schemas.extend(schemas);
             app.postmortem_field_names_loading = false;
         }
+        ActionResult::CommentEdited {
+            issue_key,
+            updated_comment,
+        } => {
+            apply_comment_edit(app, &issue_key, &updated_comment);
+            app.action_state = ActionState::None;
+        }
+        ActionResult::CommentDeleted {
+            issue_key,
+            comment_id,
+        } => {
+            apply_comment_deleted(app, &issue_key, &comment_id);
+            app.action_state = ActionState::None;
+        }
+        ActionResult::AttachmentCached {
+            attachment_id,
+            cache_path,
+            open_after,
+        } => {
+            handle_attachment_cached(app, attachment_id, cache_path.as_path(), open_after);
+        }
+    }
+}
+
+fn handle_attachment_cached(
+    app: &mut AppState,
+    attachment_id: String,
+    cache_path: &std::path::Path,
+    open_after: bool,
+) {
+    app.attachment_fetching_id = None;
+    app.attachment_cache
+        .insert(attachment_id.clone(), cache_path.to_path_buf());
+    if open_after {
+        let _ = open::that_detached(cache_path);
+    } else if let Ok(bytes) = std::fs::read(cache_path) {
+        let ext = cache_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if is_text_extension(&ext) {
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            app.attachment_text_previews.insert(attachment_id, text);
+        } else if is_image_extension(&ext)
+            && let Some(picker) = &app.image_picker
+            && let Ok(dyn_img) = image::load_from_memory(&bytes)
+        {
+            let protocol = picker.new_resize_protocol(dyn_img);
+            app.attachment_images
+                .insert(attachment_id, std::cell::RefCell::new(protocol));
+        }
+    }
+    app.action_state = ActionState::None;
+}
+
+fn apply_comment_posted(app: &mut AppState, issue_key: &str, new_comment: Comment) {
+    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key) {
+        let list = issue
+            .fields
+            .comment
+            .get_or_insert_with(|| crate::jira::types::CommentList {
+                comments: vec![],
+                total: 0,
+            });
+        list.comments.push(new_comment);
+        list.total = u32::try_from(list.comments.len()).unwrap_or(0);
+    }
+    app.action_state = ActionState::None;
+}
+
+fn apply_field_updated(
+    app: &mut AppState,
+    issue_key: &str,
+    field_id: &str,
+    new_value: &serde_json::Value,
+) {
+    // Update in-memory field value immediately (no re-fetch needed)
+    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key) {
+        issue
+            .fields
+            .extra
+            .insert(field_id.to_owned(), new_value.clone());
+    }
+    app.action_state = ActionState::None;
+}
+
+fn apply_assigned_to_me(app: &mut AppState, issue_key: &str) {
+    // Mark assignee as current user in the list (best-effort display update)
+    if let Some(ref me) = app.current_user.clone()
+        && let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key)
+    {
+        issue.fields.assignee = Some(crate::jira::types::UserField {
+            name: me.clone(),
+            display_name: Some(me.clone()),
+            account_id: None,
+        });
+    }
+}
+
+fn apply_comment_edit(app: &mut AppState, issue_key: &str, updated_comment: &Comment) {
+    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key)
+        && let Some(list) = &mut issue.fields.comment
+        && let Some(c) = list
+            .comments
+            .iter_mut()
+            .find(|c| c.id == updated_comment.id)
+    {
+        c.body.clone_from(&updated_comment.body);
+        c.updated.clone_from(&updated_comment.updated);
+    }
+}
+
+fn apply_comment_deleted(app: &mut AppState, issue_key: &str, comment_id: &str) {
+    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key)
+        && let Some(list) = &mut issue.fields.comment
+    {
+        list.comments.retain(|c| c.id != comment_id);
+        list.total = u32::try_from(list.comments.len()).unwrap_or(0);
+    }
+    // Clamp focused comment index
+    let comment_count = app
+        .selected_issue()
+        .and_then(|i| i.fields.comment.as_ref())
+        .map_or(0, |l| l.comments.len());
+    if app.overlay_focused_comment >= comment_count && comment_count > 0 {
+        app.overlay_focused_comment = comment_count - 1;
+    } else if comment_count == 0 {
+        app.overlay_focused_comment = 0;
     }
 }
 
@@ -563,8 +785,407 @@ fn field_options_to_state(
     }
 }
 
+fn handle_overlay_input(app: &mut AppState, event: &crossterm::event::Event) {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let Event::Key(KeyEvent {
+        code, modifiers, ..
+    }) = *event
+    else {
+        return;
+    };
+
+    // Sub-modal: comment delete confirmation
+    if handle_comment_delete_confirm_input(app, code, modifiers) {
+        return;
+    }
+
+    // Sub-modal: comment edit confirmation/diff
+    if handle_comment_edit_confirm_input(app, code, modifiers) {
+        return;
+    }
+
+    // Normal overlay navigation and actions
+    let is_comments = matches!(app.overlay, Some(SubView::Comments));
+    let is_attachments = matches!(app.overlay, Some(SubView::Attachments));
+    match (code, modifiers) {
+        (KeyCode::Char('q') | KeyCode::Esc, m) if !matches!(m, KeyModifiers::CONTROL) => {
+            app.overlay = None;
+            app.overlay_scroll = 0;
+            app.overlay_focused_comment = 0;
+            app.overlay_focused_attachment = 0;
+        }
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        (KeyCode::Down | KeyCode::Char('j'), _) => {
+            if is_comments {
+                overlay_comment_nav_down(app);
+            } else {
+                overlay_attachment_nav_down(app);
+            }
+        }
+        (KeyCode::Up | KeyCode::Char('k'), _) => {
+            if is_comments {
+                overlay_comment_nav_up(app);
+            } else {
+                overlay_attachment_nav_up(app);
+            }
+        }
+        (KeyCode::PageDown, _) => {
+            app.overlay_scroll = app.overlay_scroll.saturating_add(10);
+        }
+        (KeyCode::PageUp, _) => {
+            app.overlay_scroll = app.overlay_scroll.saturating_sub(10);
+        }
+        // Comment actions (only in comments overlay)
+        (KeyCode::Char('n'), _) if is_comments => {
+            if let Some(issue) = app.selected_issue() {
+                app.action_state = ActionState::PendingComment {
+                    issue_key: issue.key.clone(),
+                };
+            }
+        }
+        (KeyCode::Char('e'), _) if is_comments => {
+            start_comment_edit(app);
+        }
+        (KeyCode::Char('d'), _) if is_comments => {
+            start_comment_delete(app);
+        }
+        (KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter, _) if is_attachments => {
+            trigger_attachment_open(app);
+        }
+        _ => {}
+    }
+    // Clamp: no scrolling past the end, and no scrolling when content fits
+    let max_scroll = app.overlay_content_h.saturating_sub(app.overlay_viewport_h);
+    app.overlay_scroll = app.overlay_scroll.min(max_scroll);
+}
+
+fn handle_comment_delete_confirm_input(
+    app: &mut AppState,
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ActionState::ConfirmingCommentDelete {
+        issue_key,
+        comment_id,
+        selected,
+    } = &app.action_state.clone()
+    else {
+        return false;
+    };
+    match (code, modifiers) {
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        (KeyCode::Esc | KeyCode::Char('q'), _) => {
+            app.action_state = ActionState::None;
+        }
+        (KeyCode::Left | KeyCode::Char('h' | 'l') | KeyCode::Right | KeyCode::Tab, _) => {
+            app.action_state = ActionState::ConfirmingCommentDelete {
+                issue_key: issue_key.clone(),
+                comment_id: comment_id.clone(),
+                selected: 1 - selected,
+            };
+        }
+        (KeyCode::Enter, _) => {
+            if *selected == 0 {
+                app.action_state = ActionState::DeletingComment {
+                    issue_key: issue_key.clone(),
+                    comment_id: comment_id.clone(),
+                };
+            } else {
+                app.action_state = ActionState::None;
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn handle_comment_edit_confirm_input(
+    app: &mut AppState,
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ActionState::ConfirmingCommentEdit {
+        issue_key,
+        comment_id,
+        old_text,
+        new_text,
+        tab,
+    } = &app.action_state.clone()
+    else {
+        return false;
+    };
+    match (code, modifiers) {
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        (KeyCode::Esc | KeyCode::Char('q'), _) => {
+            app.action_state = ActionState::None;
+        }
+        (KeyCode::Tab, _) => {
+            app.action_state = ActionState::ConfirmingCommentEdit {
+                issue_key: issue_key.clone(),
+                comment_id: comment_id.clone(),
+                old_text: old_text.clone(),
+                new_text: new_text.clone(),
+                tab: 1 - tab,
+            };
+        }
+        (KeyCode::Enter, _) => {
+            app.action_state = ActionState::CommittingCommentEdit {
+                issue_key: issue_key.clone(),
+                comment_id: comment_id.clone(),
+                new_body: new_text.clone(),
+            };
+        }
+        _ => {}
+    }
+    true
+}
+
+fn overlay_comment_nav_down(app: &mut AppState) {
+    let count = app
+        .selected_issue()
+        .and_then(|i| i.fields.comment.as_ref())
+        .map_or(0, |l| l.comments.len());
+    if count == 0 {
+        return;
+    }
+    if app.overlay_focused_comment + 1 < count {
+        app.overlay_focused_comment += 1;
+        auto_scroll_to_comment(app);
+    }
+}
+
+fn overlay_comment_nav_up(app: &mut AppState) {
+    if app.overlay_focused_comment > 0 {
+        app.overlay_focused_comment -= 1;
+        auto_scroll_to_comment(app);
+    }
+}
+
+fn auto_scroll_to_comment(app: &mut AppState) {
+    let idx = app.overlay_focused_comment;
+    let Some(&(top, bottom)) = app.overlay_comment_offsets.get(idx) else {
+        return;
+    };
+    let viewport_h = app.overlay_viewport_h;
+    if top < app.overlay_scroll {
+        app.overlay_scroll = top;
+    } else if bottom > app.overlay_scroll + viewport_h {
+        app.overlay_scroll = bottom.saturating_sub(viewport_h);
+    }
+}
+
+fn overlay_attachment_nav_down(app: &mut AppState) {
+    let count = app
+        .selected_issue()
+        .and_then(|i| i.fields.attachment.as_ref())
+        .map_or(0, std::vec::Vec::len);
+    if count == 0 {
+        return;
+    }
+    if app.overlay_focused_attachment + 1 < count {
+        app.overlay_focused_attachment += 1;
+        auto_scroll_to_attachment(app);
+        maybe_fetch_attachment_preview(app);
+    }
+}
+
+fn overlay_attachment_nav_up(app: &mut AppState) {
+    if app.overlay_focused_attachment > 0 {
+        app.overlay_focused_attachment -= 1;
+        auto_scroll_to_attachment(app);
+        maybe_fetch_attachment_preview(app);
+    }
+}
+
+const fn auto_scroll_to_attachment(app: &mut AppState) {
+    let idx = app.overlay_focused_attachment;
+    let viewport_h = app.overlay_viewport_h;
+    if viewport_h == 0 {
+        return;
+    }
+    if idx < app.overlay_scroll {
+        app.overlay_scroll = idx;
+    } else if idx >= app.overlay_scroll + viewport_h {
+        app.overlay_scroll = idx + 1 - viewport_h;
+    }
+}
+
+/// Compute the local cache path for an attachment.
+pub fn cache_path_for(issue_key: &str, attachment_id: &str, filename: &str) -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("do-next")
+        .join(issue_key)
+        .join(format!("{attachment_id}-{filename}"))
+}
+
+/// Schedule a silent background preview fetch for the currently focused attachment,
+/// unless it is already cached or already in flight.
+pub fn maybe_fetch_attachment_preview(app: &mut AppState) {
+    let Some(issue) = app.selected_issue() else {
+        return;
+    };
+    let attachments = issue.fields.attachment.as_deref().unwrap_or(&[]);
+    let Some(att) = attachments.get(app.overlay_focused_attachment) else {
+        return;
+    };
+    let Some(content_url) = att.content.clone() else {
+        return;
+    };
+    let att_id = att.id.clone();
+    let filename = att.filename.clone();
+    let issue_key = issue.key.clone();
+
+    if app.attachment_cache.contains_key(&att_id) {
+        return;
+    }
+    if app.attachment_fetching_id.as_deref() == Some(att_id.as_str()) {
+        return;
+    }
+
+    // If the file is already on disk from a previous run, pre-populate the cache so
+    // "fetching…" is not shown, and schedule a decode-only task (no HTTP request).
+    let cache_path = cache_path_for(&issue_key, &att_id, &filename);
+    if cache_path.exists() {
+        app.attachment_cache.insert(att_id.clone(), cache_path);
+        app.pending_attachment_fetch = Some(AttachmentFetchRequest {
+            attachment_id: att_id,
+            content_url,
+            filename,
+            issue_key,
+        });
+        return;
+    }
+
+    app.attachment_fetching_id = Some(att_id.clone());
+    app.pending_attachment_fetch = Some(AttachmentFetchRequest {
+        attachment_id: att_id,
+        content_url,
+        filename,
+        issue_key,
+    });
+}
+
+/// Trigger opening the focused attachment with the system default app.
+/// If already cached, opens immediately; otherwise sets `OpeningAttachment` action state.
+fn trigger_attachment_open(app: &mut AppState) {
+    let Some(issue) = app.selected_issue() else {
+        return;
+    };
+    let attachments = issue.fields.attachment.as_deref().unwrap_or(&[]);
+    let Some(att) = attachments.get(app.overlay_focused_attachment) else {
+        return;
+    };
+    let Some(content_url) = att.content.clone() else {
+        return;
+    };
+    let att_id = att.id.clone();
+
+    if let Some(path) = app.attachment_cache.get(&att_id) {
+        let _ = open::that_detached(path);
+        return;
+    }
+
+    app.action_state = ActionState::OpeningAttachment {
+        attachment_id: att_id,
+        content_url,
+        filename: att.filename.clone(),
+        issue_key: issue.key.clone(),
+    };
+}
+
+fn is_text_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "txt"
+            | "md"
+            | "log"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "xml"
+            | "html"
+            | "csv"
+            | "toml"
+            | "rs"
+            | "py"
+            | "js"
+            | "ts"
+            | "sh"
+            | "conf"
+            | "cfg"
+            | "ini"
+            | "sql"
+            | "diff"
+            | "patch"
+            | "env"
+            | "tf"
+            | "go"
+            | "rb"
+            | "java"
+            | "c"
+            | "cpp"
+            | "h"
+    )
+}
+
+fn is_image_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif" | "ico"
+    )
+}
+
+fn start_comment_edit(app: &mut AppState) {
+    let Some(issue) = app.selected_issue() else {
+        return;
+    };
+    let Some(list) = &issue.fields.comment else {
+        return;
+    };
+    let Some(comment) = list.comments.get(app.overlay_focused_comment) else {
+        return;
+    };
+    app.action_state = ActionState::PendingCommentEdit {
+        issue_key: issue.key.clone(),
+        comment_id: comment.id.clone(),
+        original_body: comment.body.clone(),
+    };
+}
+
+fn start_comment_delete(app: &mut AppState) {
+    let Some(issue) = app.selected_issue() else {
+        return;
+    };
+    let Some(list) = &issue.fields.comment else {
+        return;
+    };
+    let Some(comment) = list.comments.get(app.overlay_focused_comment) else {
+        return;
+    };
+    app.action_state = ActionState::ConfirmingCommentDelete {
+        issue_key: issue.key.clone(),
+        comment_id: comment.id.clone(),
+        selected: 1, // default to No
+    };
+}
+
 fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
     use crossterm::event::{Event, KeyEvent};
+
+    // Sub-view overlay captures all input
+    if app.overlay.is_some() {
+        handle_overlay_input(app, &event);
+        return;
+    }
 
     // Handle overlay-specific input first
     match &app.action_state {
@@ -618,7 +1239,13 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
         | ActionState::PendingComment { .. }
         | ActionState::PendingFieldEdit { .. }
         | ActionState::LoadingFieldOptions { .. }
-        | ActionState::CommittingFieldEdit { .. } => {
+        | ActionState::CommittingFieldEdit { .. }
+        | ActionState::PendingCommentEdit { .. }
+        | ActionState::CommittingCommentEdit { .. }
+        | ActionState::DeletingComment { .. }
+        | ActionState::ConfirmingCommentEdit { .. }
+        | ActionState::ConfirmingCommentDelete { .. }
+        | ActionState::OpeningAttachment { .. } => {
             // Ignore input while waiting
             return;
         }
@@ -657,36 +1284,8 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         (KeyCode::Right | KeyCode::Char('l'), _) => {
             app.focused_panel = FocusedPanel::Detail;
         }
-        (KeyCode::Down | KeyCode::Char('j'), _) => {
-            if app.focused_panel == FocusedPanel::Detail && app.view_mode == ViewMode::Postmortem {
-                let max_idx = crate::tui::views::postmortem::num_postmortem_fields(
-                    app.config.view_modes.postmortem.as_ref(),
-                )
-                .saturating_sub(1);
-                if app.postmortem_field_idx < max_idx {
-                    app.postmortem_field_idx += 1;
-                }
-                auto_scroll_to_field(app);
-            } else if app.focused_panel == FocusedPanel::Detail {
-                app.detail_scroll = app.detail_scroll.saturating_add(1);
-            } else if !app.nav_items.is_empty() {
-                app.nav_idx = (app.nav_idx + 1).min(app.nav_items.len() - 1);
-                update_view_mode_on_navigate(app);
-            }
-        }
-        (KeyCode::Up | KeyCode::Char('k'), _) => {
-            if app.focused_panel == FocusedPanel::Detail && app.view_mode == ViewMode::Postmortem {
-                if app.postmortem_field_idx > 0 {
-                    app.postmortem_field_idx -= 1;
-                }
-                auto_scroll_to_field(app);
-            } else if app.focused_panel == FocusedPanel::Detail {
-                app.detail_scroll = app.detail_scroll.saturating_sub(1);
-            } else if app.nav_idx > 0 {
-                app.nav_idx -= 1;
-                update_view_mode_on_navigate(app);
-            }
-        }
+        (KeyCode::Down | KeyCode::Char('j'), _) => key_nav_down(app),
+        (KeyCode::Up | KeyCode::Char('k'), _) => key_nav_up(app),
         (KeyCode::Enter, _) => {
             if app.focused_panel == FocusedPanel::Detail && app.view_mode == ViewMode::Postmortem {
                 key_edit_postmortem_field(app);
@@ -699,7 +1298,8 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
                 | ViewMode::Incident
                 | ViewMode::Postmortem
                 | ViewMode::Review => ViewMode::Comments,
-                ViewMode::Comments => ViewMode::Default,
+                ViewMode::Comments => ViewMode::Attachments,
+                ViewMode::Attachments => ViewMode::Default,
             };
             app.detail_scroll = 0;
         }
@@ -738,10 +1338,57 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
     }
 }
 
+fn key_nav_down(app: &mut AppState) {
+    if app.focused_panel == FocusedPanel::Detail && app.view_mode == ViewMode::Postmortem {
+        let num_cfg = crate::tui::views::postmortem::num_postmortem_fields(
+            app.config.view_modes.postmortem.as_ref(),
+        );
+        app.postmortem_focus = match &app.postmortem_focus {
+            PostmortemFocus::Comments => PostmortemFocus::Attachments,
+            PostmortemFocus::Attachments => {
+                if num_cfg > 0 {
+                    PostmortemFocus::Field(0)
+                } else {
+                    PostmortemFocus::Attachments
+                }
+            }
+            PostmortemFocus::Field(i) => {
+                if *i + 1 < num_cfg {
+                    PostmortemFocus::Field(i + 1)
+                } else {
+                    PostmortemFocus::Field(*i)
+                }
+            }
+        };
+        auto_scroll_to_field(app);
+    } else if app.focused_panel == FocusedPanel::Detail {
+        app.detail_scroll = app.detail_scroll.saturating_add(1);
+    } else if !app.nav_items.is_empty() {
+        app.nav_idx = (app.nav_idx + 1).min(app.nav_items.len() - 1);
+        update_view_mode_on_navigate(app);
+    }
+}
+
+fn key_nav_up(app: &mut AppState) {
+    if app.focused_panel == FocusedPanel::Detail && app.view_mode == ViewMode::Postmortem {
+        app.postmortem_focus = match &app.postmortem_focus {
+            PostmortemFocus::Comments | PostmortemFocus::Attachments => PostmortemFocus::Comments,
+            PostmortemFocus::Field(0) => PostmortemFocus::Attachments,
+            PostmortemFocus::Field(i) => PostmortemFocus::Field(i - 1),
+        };
+        auto_scroll_to_field(app);
+    } else if app.focused_panel == FocusedPanel::Detail {
+        app.detail_scroll = app.detail_scroll.saturating_sub(1);
+    } else if app.nav_idx > 0 {
+        app.nav_idx -= 1;
+        update_view_mode_on_navigate(app);
+    }
+}
+
 fn key_jump_first(app: &mut AppState) {
     if app.focused_panel == FocusedPanel::Detail {
         if app.view_mode == ViewMode::Postmortem {
-            app.postmortem_field_idx = 0;
+            app.postmortem_focus = PostmortemFocus::Comments;
             auto_scroll_to_field(app);
         } else {
             app.detail_scroll = 0;
@@ -755,11 +1402,14 @@ fn key_jump_first(app: &mut AppState) {
 fn key_jump_last(app: &mut AppState) {
     if app.focused_panel == FocusedPanel::Detail {
         if app.view_mode == ViewMode::Postmortem {
-            let max_idx = crate::tui::views::postmortem::num_postmortem_fields(
+            let num_cfg = crate::tui::views::postmortem::num_postmortem_fields(
                 app.config.view_modes.postmortem.as_ref(),
-            )
-            .saturating_sub(1);
-            app.postmortem_field_idx = max_idx;
+            );
+            app.postmortem_focus = if num_cfg > 0 {
+                PostmortemFocus::Field(num_cfg - 1)
+            } else {
+                PostmortemFocus::Attachments
+            };
             auto_scroll_to_field(app);
         } else {
             app.detail_scroll = app
@@ -829,8 +1479,9 @@ fn update_view_mode_on_navigate(app: &mut AppState) {
         app.view_mode = auto_view_mode(&issue, &app.config);
     }
     app.detail_scroll = 0;
-    app.postmortem_field_idx = 0;
-    app.postmortem_field_offsets.clear();
+    app.overlay = None;
+    app.postmortem_focus = PostmortemFocus::Comments;
+    app.postmortem_focus_offsets.clear();
     app.postmortem_field_names.clear();
     app.postmortem_field_schemas.clear();
     app.postmortem_field_names_loading = false;
@@ -841,7 +1492,28 @@ fn key_edit_postmortem_field(app: &mut AppState) {
         return;
     };
     let issue = issue.clone();
-    let field_idx = app.postmortem_field_idx;
+
+    // Nav widget: open as popup overlay (one layer deeper)
+    match &app.postmortem_focus {
+        PostmortemFocus::Comments => {
+            app.overlay = Some(SubView::Comments);
+            app.overlay_scroll = 0;
+            return;
+        }
+        PostmortemFocus::Attachments => {
+            app.overlay = Some(SubView::Attachments);
+            app.overlay_scroll = 0;
+            app.overlay_focused_attachment = 0;
+            maybe_fetch_attachment_preview(app);
+            return;
+        }
+        PostmortemFocus::Field(_) => {}
+    }
+
+    let field_idx = match &app.postmortem_focus {
+        PostmortemFocus::Field(i) => *i,
+        _ => return,
+    };
     let cfg = app.config.view_modes.postmortem.as_ref();
     let (field_id, original_json) =
         crate::tui::views::postmortem::postmortem_editable_field_spec(cfg, &issue, field_idx);
@@ -971,9 +1643,17 @@ fn set_postmortem_edit_state(
     }
 }
 
+fn focus_offset_idx(focus: &PostmortemFocus) -> usize {
+    match focus {
+        PostmortemFocus::Comments => 0,
+        PostmortemFocus::Attachments => 1,
+        PostmortemFocus::Field(i) => 2 + i,
+    }
+}
+
 fn auto_scroll_to_field(app: &mut AppState) {
-    let idx = app.postmortem_field_idx;
-    let Some(&(top, bottom)) = app.postmortem_field_offsets.get(idx) else {
+    let idx = focus_offset_idx(&app.postmortem_focus);
+    let Some(&(top, bottom)) = app.postmortem_focus_offsets.get(idx) else {
         return;
     };
     let viewport_h = app.last_detail_viewport_h;

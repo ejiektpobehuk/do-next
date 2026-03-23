@@ -425,6 +425,70 @@ impl JiraClient {
         Ok((names, schemas))
     }
 
+    /// Update the body of an existing comment.
+    pub async fn update_comment(
+        &self,
+        issue_key: &str,
+        comment_id: &str,
+        new_body: &str,
+    ) -> Result<Comment> {
+        let url = format!(
+            "{}/rest/api/2/issue/{issue_key}/comment/{comment_id}",
+            self.base_url
+        );
+        let body = serde_json::json!({ "body": new_body });
+        let resp = self
+            .apply_auth(self.client.put(&url))
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to update comment")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Update comment failed {status}: {body}");
+        }
+        resp.json().await.context("Failed to parse updated comment")
+    }
+
+    /// Delete a comment.
+    pub async fn delete_comment(&self, issue_key: &str, comment_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/rest/api/2/issue/{issue_key}/comment/{comment_id}",
+            self.base_url
+        );
+        let resp = self
+            .apply_auth(self.client.delete(&url))
+            .send()
+            .await
+            .context("Failed to delete comment")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Delete comment failed {status}: {body}");
+        }
+        Ok(())
+    }
+
+    /// Download the raw bytes of an attachment by its content URL.
+    pub async fn download_attachment(&self, url: &str) -> Result<Vec<u8>> {
+        let resp = self
+            .apply_auth(self.client.get(url))
+            .send()
+            .await
+            .context("Failed to download attachment")?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!(
+                "Failed to download {status}: {}",
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
     #[allow(dead_code)]
     pub fn base_url(&self) -> &str {
         &self.base_url

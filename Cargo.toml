@@ -32,4 +32,6 @@ dirs       = "6"
 open       = "5"
 chrono     = { version = "0.4", features = ["serde"] }
 futures    = "0.3"
-indexmap   = "2"
+indexmap      = "2"
+image         = "0.25"
+ratatui-image = { version = "10", features = ["crossterm", "image-defaults"], default-features = false }

@@ -14,12 +14,19 @@ use crate::tui::overlays;
 /// Side-channel data written during a render pass, consumed by the event loop.
 #[derive(Default)]
 pub struct RenderOut {
-    /// Virtual (top, bottom) row offsets for each editable postmortem field (index = `field_idx`).
-    pub postmortem_field_offsets: Vec<(usize, usize)>,
+    /// Virtual (top, bottom) row offsets for each focusable postmortem item.
+    /// Index: Comments=0, Attachments=1, Field(i)=2+i.
+    pub postmortem_focus_offsets: Vec<(usize, usize)>,
     /// Height of the detail content viewport (inside the detail panel border).
     pub detail_viewport_h: usize,
     /// Total content lines returned by the active detail view renderer.
     pub detail_content_h: usize,
+    /// Content height (lines) of the sub-view overlay; written each render.
+    pub overlay_content_h: usize,
+    /// Viewport height of the sub-view overlay; written each render.
+    pub overlay_viewport_h: usize,
+    /// Virtual (top, bottom) row offsets for each comment widget; written each render.
+    pub overlay_comment_offsets: Vec<(usize, usize)>,
 }
 
 pub fn render(
@@ -65,7 +72,16 @@ pub fn render(
     // Hint bar
     render_hints(f, root[2], app);
 
+    // Sub-view popup overlay (comments / attachments from postmortem)
+    if app.overlay.is_some() {
+        overlays::sub_view::render_sub_view_overlay(f, app, render_out);
+    }
+
     // Overlays (drawn on top)
+    render_action_overlays(f, app);
+}
+
+fn render_action_overlays(f: &mut Frame, app: &AppState) {
     match &app.action_state {
         ActionState::SelectingTransition { .. } => {
             overlays::transition::render_transition_overlay(f, &app.action_state);
@@ -91,7 +107,9 @@ pub fn render(
         ActionState::PendingMove { .. } => {
             overlays::await_spinner::render_await(f, "Moving…", app.tick_count);
         }
-        ActionState::PendingComment { .. } | ActionState::PendingFieldEdit { .. } => {
+        ActionState::PendingComment { .. }
+        | ActionState::PendingFieldEdit { .. }
+        | ActionState::PendingCommentEdit { .. } => {
             overlays::await_spinner::render_await(f, "Opening editor…", app.tick_count);
         }
         ActionState::LoadingFieldOptions { .. } => {
@@ -99,6 +117,15 @@ pub fn render(
         }
         ActionState::CommittingFieldEdit { .. } => {
             overlays::await_spinner::render_await(f, "Updating field…", app.tick_count);
+        }
+        ActionState::CommittingCommentEdit { .. } => {
+            overlays::await_spinner::render_await(f, "Updating comment…", app.tick_count);
+        }
+        ActionState::DeletingComment { .. } => {
+            overlays::await_spinner::render_await(f, "Deleting comment…", app.tick_count);
+        }
+        ActionState::OpeningAttachment { .. } => {
+            overlays::await_spinner::render_await(f, "Fetching attachment…", app.tick_count);
         }
         ActionState::ConfirmingFieldEdit { .. } => {
             overlays::field_edit_confirm::render_field_edit_confirm_overlay(f, &app.action_state);
@@ -111,6 +138,18 @@ pub fn render(
         }
         ActionState::EditingDatetimeField { .. } => {
             overlays::datetime_picker::render_datetime_picker_overlay(f, &app.action_state);
+        }
+        ActionState::ConfirmingCommentEdit { .. } => {
+            overlays::comment_edit_confirm::render_comment_edit_confirm_overlay(
+                f,
+                &app.action_state,
+            );
+        }
+        ActionState::ConfirmingCommentDelete { .. } => {
+            overlays::comment_delete_confirm::render_comment_delete_confirm_overlay(
+                f,
+                &app.action_state,
+            );
         }
         ActionState::InlineEditingField { .. } | ActionState::None => {
             // Rendered inline within the postmortem view — no overlay needed

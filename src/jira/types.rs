@@ -25,6 +25,7 @@ pub struct IssueFields {
     pub project: ProjectField,
     pub description: Option<serde_json::Value>,
     pub comment: Option<CommentList>,
+    pub attachment: Option<Vec<Attachment>>,
     /// All custom fields, keyed by field ID.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -97,6 +98,18 @@ pub struct Comment {
     pub body: String,
     pub created: String,
     pub updated: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Attachment {
+    pub id: String,
+    pub filename: String,
+    pub author: UserField,
+    pub created: String,
+    pub size: Option<u64>,
+    #[serde(rename = "mimeType")]
+    pub mime_type: Option<String>,
+    pub content: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

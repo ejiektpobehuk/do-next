@@ -24,14 +24,24 @@ const CORNERS_ONLY: BorderSet = BorderSet {
 
 use crate::config::types::{PostmortemFieldConfig, PostmortemViewConfig};
 use crate::jira::types::Issue;
-use crate::tui::app::{ActionState, AppState};
+use crate::tui::app::{ActionState, AppState, PostmortemFocus};
 use crate::tui::render::RenderOut;
 
 // ── Segment model ─────────────────────────────────────────────────────────────
 
+pub enum PostmortemNavKind {
+    Comments,
+    Attachments,
+}
+
 enum Segment {
     /// Plain read-only text lines — not focusable.
     ReadOnly { lines: Vec<Line<'static>> },
+    /// A navigable widget (Comments or Attachments count summary).
+    NavWidget {
+        nav: PostmortemNavKind,
+        content: String,
+    },
     /// A field with a bordered block. May be read-only or editable.
     EditableField {
         label: String,
@@ -131,11 +141,11 @@ pub fn render_postmortem(
     let viewport_h = area.height as usize;
     let mut virtual_y: usize = 0;
 
-    // Ensure field offsets vec is large enough for all editable fields
+    // Ensure offsets vec is large enough: Comments(0), Attachments(1), Field(i)=2+i
     let num_fields = num_postmortem_fields(cfg);
     render_out
-        .postmortem_field_offsets
-        .resize(num_fields, (0, 0));
+        .postmortem_focus_offsets
+        .resize(2 + num_fields, (0, 0));
 
     for seg in &segments {
         let seg_height = measure_segment(seg, w);
@@ -143,11 +153,26 @@ pub fn render_postmortem(
         let seg_bot = virtual_y + seg_height;
         virtual_y += seg_height;
 
-        // Always record field positions (used by auto-scroll, even for off-screen fields)
-        if let Segment::EditableField { field_idx, .. } = seg
-            && *field_idx < render_out.postmortem_field_offsets.len()
-        {
-            render_out.postmortem_field_offsets[*field_idx] = (seg_top, seg_bot);
+        // Always record positions (used by auto-scroll, even for off-screen items)
+        match seg {
+            Segment::NavWidget {
+                nav: PostmortemNavKind::Comments,
+                ..
+            } => {
+                render_out.postmortem_focus_offsets[0] = (seg_top, seg_bot);
+            }
+            Segment::NavWidget {
+                nav: PostmortemNavKind::Attachments,
+                ..
+            } => {
+                render_out.postmortem_focus_offsets[1] = (seg_top, seg_bot);
+            }
+            Segment::EditableField { field_idx, .. }
+                if 2 + *field_idx < render_out.postmortem_focus_offsets.len() =>
+            {
+                render_out.postmortem_focus_offsets[2 + *field_idx] = (seg_top, seg_bot);
+            }
+            _ => {}
         }
 
         // Skip rendering if outside viewport
@@ -198,6 +223,36 @@ fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, 
                 rect,
             );
         }
+        Segment::NavWidget { nav, content } => {
+            let selected = match nav {
+                PostmortemNavKind::Comments => {
+                    matches!(app.postmortem_focus, PostmortemFocus::Comments)
+                }
+                PostmortemNavKind::Attachments => {
+                    matches!(app.postmortem_focus, PostmortemFocus::Attachments)
+                }
+            };
+            let border_style = if selected {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_set(border::PLAIN)
+                .border_style(border_style);
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            if inner.height > 0 {
+                let inner_scroll = u16::try_from(clipped_top)
+                    .unwrap_or(u16::MAX)
+                    .saturating_sub(1);
+                f.render_widget(
+                    Paragraph::new(content.as_str()).scroll((inner_scroll, 0)),
+                    inner,
+                );
+            }
+        }
         Segment::EditableField {
             label,
             field_idx,
@@ -205,7 +260,8 @@ fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, 
             readonly,
             ..
         } => {
-            let selected = app.postmortem_field_idx == *field_idx;
+            let selected =
+                matches!(&app.postmortem_focus, PostmortemFocus::Field(fi) if *fi == *field_idx);
             let is_inline_edit = matches!(
                 &app.action_state,
                 ActionState::InlineEditingField { field_idx: fi, .. } if *fi == *field_idx
@@ -275,6 +331,18 @@ fn build_segments(
     // Header (read-only)
     segs.push(Segment::ReadOnly {
         lines: header_lines(issue),
+    });
+
+    // Nav widgets: Comments and Attachments
+    let comment_count = issue.fields.comment.as_ref().map_or(0, |c| c.total);
+    segs.push(Segment::NavWidget {
+        nav: PostmortemNavKind::Comments,
+        content: format!("Comments  ({comment_count})"),
+    });
+    let attachment_count = issue.fields.attachment.as_ref().map_or(0, Vec::len);
+    segs.push(Segment::NavWidget {
+        nav: PostmortemNavKind::Attachments,
+        content: format!("Attachments  ({attachment_count})"),
     });
 
     let sections = cfg.map_or(&[][..], |c| c.sections.as_slice());
@@ -374,6 +442,11 @@ fn measure_segment(seg: &Segment, width: u16) -> usize {
             .map(|l| measure_line(l, width))
             .sum::<usize>()
             .max(1),
+        Segment::NavWidget { content, .. } => {
+            // Single-line content inside a full-border block → always 3 rows
+            let _ = content; // content fits on one line
+            3
+        }
         Segment::EditableField { content, .. } => {
             let inner_w = (width as usize).saturating_sub(2).max(1);
             let content_h = if content.is_empty() {

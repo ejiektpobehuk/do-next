@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::jira::types::{FieldOption, Issue, Transition};
+use crate::jira::types::{Comment, FieldOption, Issue, Transition};
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -31,8 +31,8 @@ pub enum ActionResult {
         transitions: Vec<Transition>,
     },
     CommentPosted {
-        #[allow(dead_code)]
         issue_key: String,
+        new_comment: Comment,
     },
     AssignedToMe {
         issue_key: String,
@@ -62,6 +62,19 @@ pub enum ActionResult {
         names: HashMap<String, String>,
         /// Jira editmeta `schema.type` per `field_id` (e.g. `"date"`, `"datetime"`).
         schemas: HashMap<String, String>,
+    },
+    CommentEdited {
+        issue_key: String,
+        updated_comment: Comment,
+    },
+    CommentDeleted {
+        issue_key: String,
+        comment_id: String,
+    },
+    AttachmentCached {
+        attachment_id: String,
+        cache_path: std::path::PathBuf,
+        open_after: bool,
     },
     Error(anyhow::Error),
 }
