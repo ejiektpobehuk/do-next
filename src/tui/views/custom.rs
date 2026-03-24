@@ -22,14 +22,14 @@ const CORNERS_ONLY: BorderSet = BorderSet {
     horizontal_bottom: " ",
 };
 
-use crate::config::types::{PostmortemFieldConfig, PostmortemViewConfig};
+use crate::config::types::{CustomViewConfig, CustomViewFieldConfig};
 use crate::jira::types::Issue;
-use crate::tui::app::{ActionState, AppState, PostmortemFocus};
+use crate::tui::app::{ActionState, AppState, DetailFocus};
 use crate::tui::render::RenderOut;
 
 // ── Segment model ─────────────────────────────────────────────────────────────
 
-pub enum PostmortemNavKind {
+pub enum DetailNavKind {
     Comments,
     Attachments,
 }
@@ -39,7 +39,7 @@ enum Segment {
     ReadOnly { lines: Vec<Line<'static>> },
     /// A navigable widget (Comments or Attachments count summary).
     NavWidget {
-        nav: PostmortemNavKind,
+        nav: DetailNavKind,
         content: String,
     },
     /// A field with a bordered block. May be read-only or editable.
@@ -47,7 +47,7 @@ enum Segment {
         label: String,
         /// Text shown inside the block.
         content: String,
-        /// Flat index among all editable fields. Stable per config.
+        /// Flat index among all editable fields. Stable per config (or iteration order for default).
         field_idx: usize,
         /// If true, Enter opens a browser link (if URL) but never opens editing.
         readonly: bool,
@@ -56,31 +56,49 @@ enum Segment {
 
 // ── Public helpers ─────────────────────────────────────────────────────────────
 
-pub fn num_postmortem_fields(cfg: Option<&PostmortemViewConfig>) -> usize {
-    cfg.map_or(0, |c| c.sections.iter().map(|s| s.fields.len()).sum())
+/// Number of focusable fields in the view.
+/// For custom views: total configured fields. For the default view (cfg=None): all extra fields.
+pub fn num_view_fields(cfg: Option<&CustomViewConfig>, issue: Option<&Issue>) -> usize {
+    match cfg {
+        Some(c) => c.sections.iter().map(|s| s.fields.len()).sum(),
+        None => issue.map_or(0, |i| i.fields.extra.len()),
+    }
 }
 
-/// Flat-index into the sections to retrieve a field config.
-pub fn postmortem_field_cfg(
-    cfg: Option<&PostmortemViewConfig>,
+/// Retrieve the field config at flat index `idx`.
+/// For the default view (cfg=None), synthesizes a config from the issue's extra fields.
+pub fn view_field_cfg(
+    cfg: Option<&CustomViewConfig>,
+    issue: Option<&Issue>,
     idx: usize,
-) -> Option<&PostmortemFieldConfig> {
-    let cfg = cfg?;
-    let mut count = 0;
-    for section in &cfg.sections {
-        for field in &section.fields {
-            if count == idx {
-                return Some(field);
+) -> Option<CustomViewFieldConfig> {
+    if let Some(cfg) = cfg {
+        let mut count = 0;
+        for section in &cfg.sections {
+            for field in &section.fields {
+                if count == idx {
+                    return Some(field.clone());
+                }
+                count += 1;
             }
-            count += 1;
         }
+        None
+    } else if let Some(issue) = issue {
+        let mut keys: Vec<&String> = issue.fields.extra.keys().collect();
+        keys.sort();
+        let key = keys.into_iter().nth(idx)?;
+        Some(CustomViewFieldConfig {
+            field_id: key.clone(),
+            ..Default::default()
+        })
+    } else {
+        None
     }
-    None
 }
 
 /// Resolve the display label for a field, consulting API names as fallback.
 pub fn resolve_field_label(
-    field: &PostmortemFieldConfig,
+    field: &CustomViewFieldConfig,
     field_names: &HashMap<String, String>,
 ) -> String {
     field
@@ -91,25 +109,13 @@ pub fn resolve_field_label(
         .to_string()
 }
 
-/// Return the configured hint for editable field `idx`, if any.
-pub fn postmortem_field_hint(cfg: Option<&PostmortemViewConfig>, idx: usize) -> Option<String> {
-    postmortem_field_cfg(cfg, idx)?.hint.clone()
-}
-
-/// Return true if the field at `idx` is marked readonly.
-pub fn postmortem_field_is_readonly(cfg: Option<&PostmortemViewConfig>, idx: usize) -> bool {
-    postmortem_field_cfg(cfg, idx)
-        .and_then(|f| f.readonly)
-        .unwrap_or(false)
-}
-
 /// Public helper used by app.rs to get (`field_id`, current JSON value) for editing.
-pub fn postmortem_editable_field_spec(
-    cfg: Option<&PostmortemViewConfig>,
+pub fn view_editable_field_spec(
+    cfg: Option<&CustomViewConfig>,
     issue: &Issue,
     idx: usize,
 ) -> (String, serde_json::Value) {
-    let Some(field_cfg) = postmortem_field_cfg(cfg, idx) else {
+    let Some(field_cfg) = view_field_cfg(cfg, Some(issue), idx) else {
         return (String::new(), serde_json::Value::Null);
     };
     let field_id = field_cfg.field_id.clone();
@@ -124,27 +130,29 @@ pub fn postmortem_editable_field_spec(
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub fn render_postmortem(
+/// Render the detail view — either a configured custom view or the auto-generated default view.
+/// `cfg = None` activates the default view (all issue fields).
+pub fn render_detail_view(
     f: &mut Frame,
     area: Rect,
     issue: &Issue,
     app: &AppState,
     render_out: &mut RenderOut,
 ) -> usize {
-    let cfg = app.config.view_modes.postmortem.as_ref();
+    let cfg = current_view_config(app);
     let tz = resolve_tz(cfg);
     let w = area.width;
 
-    let segments = build_segments(issue, cfg, tz, w, &app.postmortem_field_names);
+    let segments = build_segments(issue, cfg, tz, w, &app.field_names);
 
     let scroll = app.detail_scroll;
     let viewport_h = area.height as usize;
     let mut virtual_y: usize = 0;
 
     // Ensure offsets vec is large enough: Comments(0), Attachments(1), Field(i)=2+i
-    let num_fields = num_postmortem_fields(cfg);
+    let num_fields = num_view_fields(cfg, Some(issue));
     render_out
-        .postmortem_focus_offsets
+        .detail_focus_offsets
         .resize(2 + num_fields, (0, 0));
 
     for seg in &segments {
@@ -156,21 +164,21 @@ pub fn render_postmortem(
         // Always record positions (used by auto-scroll, even for off-screen items)
         match seg {
             Segment::NavWidget {
-                nav: PostmortemNavKind::Comments,
+                nav: DetailNavKind::Comments,
                 ..
             } => {
-                render_out.postmortem_focus_offsets[0] = (seg_top, seg_bot);
+                render_out.detail_focus_offsets[0] = (seg_top, seg_bot);
             }
             Segment::NavWidget {
-                nav: PostmortemNavKind::Attachments,
+                nav: DetailNavKind::Attachments,
                 ..
             } => {
-                render_out.postmortem_focus_offsets[1] = (seg_top, seg_bot);
+                render_out.detail_focus_offsets[1] = (seg_top, seg_bot);
             }
             Segment::EditableField { field_idx, .. }
-                if 2 + *field_idx < render_out.postmortem_focus_offsets.len() =>
+                if 2 + *field_idx < render_out.detail_focus_offsets.len() =>
             {
-                render_out.postmortem_focus_offsets[2 + *field_idx] = (seg_top, seg_bot);
+                render_out.detail_focus_offsets[2 + *field_idx] = (seg_top, seg_bot);
             }
             _ => {}
         }
@@ -211,6 +219,14 @@ pub fn render_postmortem(
     virtual_y
 }
 
+/// Extract the current view config from app state, or None for the default view.
+pub fn current_view_config(app: &AppState) -> Option<&CustomViewConfig> {
+    match &app.view_mode {
+        crate::tui::app::ViewMode::Custom(id) => app.config.views.get(id.as_str()),
+        _ => None,
+    }
+}
+
 fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, app: &AppState) {
     match seg {
         Segment::ReadOnly { lines } => {
@@ -225,11 +241,11 @@ fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, 
         }
         Segment::NavWidget { nav, content } => {
             let selected = match nav {
-                PostmortemNavKind::Comments => {
-                    matches!(app.postmortem_focus, PostmortemFocus::Comments)
+                DetailNavKind::Comments => {
+                    matches!(app.detail_focus, DetailFocus::Comments)
                 }
-                PostmortemNavKind::Attachments => {
-                    matches!(app.postmortem_focus, PostmortemFocus::Attachments)
+                DetailNavKind::Attachments => {
+                    matches!(app.detail_focus, DetailFocus::Attachments)
                 }
             };
             let border_style = if selected {
@@ -261,7 +277,7 @@ fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, 
             ..
         } => {
             let selected =
-                matches!(&app.postmortem_focus, PostmortemFocus::Field(fi) if *fi == *field_idx);
+                matches!(&app.detail_focus, DetailFocus::Field(fi) if *fi == *field_idx);
             let is_inline_edit = matches!(
                 &app.action_state,
                 ActionState::InlineEditingField { field_idx: fi, .. } if *fi == *field_idx
@@ -321,34 +337,53 @@ fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, 
 
 fn build_segments(
     issue: &Issue,
-    cfg: Option<&PostmortemViewConfig>,
+    cfg: Option<&CustomViewConfig>,
     tz: FixedOffset,
     width: u16,
     field_names: &HashMap<String, String>,
 ) -> Vec<Segment> {
     let mut segs: Vec<Segment> = Vec::new();
 
-    // Header (read-only)
+    // Header (read-only) — expanded for default view
     segs.push(Segment::ReadOnly {
-        lines: header_lines(issue),
+        lines: header_lines(issue, cfg.is_none()),
     });
 
     // Nav widgets: Comments and Attachments
     let comment_count = issue.fields.comment.as_ref().map_or(0, |c| c.total);
     segs.push(Segment::NavWidget {
-        nav: PostmortemNavKind::Comments,
+        nav: DetailNavKind::Comments,
         content: format!("Comments  ({comment_count})"),
     });
     let attachment_count = issue.fields.attachment.as_ref().map_or(0, Vec::len);
     segs.push(Segment::NavWidget {
-        nav: PostmortemNavKind::Attachments,
+        nav: DetailNavKind::Attachments,
         content: format!("Attachments  ({attachment_count})"),
     });
 
-    let sections = cfg.map_or(&[][..], |c| c.sections.as_slice());
+    match cfg {
+        Some(cfg) => {
+            build_custom_segments(&mut segs, issue, cfg, tz, width, field_names);
+        }
+        None => {
+            build_default_segments(&mut segs, issue, width, field_names);
+        }
+    }
+
+    segs
+}
+
+fn build_custom_segments(
+    segs: &mut Vec<Segment>,
+    issue: &Issue,
+    cfg: &CustomViewConfig,
+    tz: FixedOffset,
+    width: u16,
+    field_names: &HashMap<String, String>,
+) {
     let mut field_flat_idx = 0usize;
 
-    for (sec_idx, section) in sections.iter().enumerate() {
+    for (sec_idx, section) in cfg.sections.iter().enumerate() {
         // Section separator — blank line before all but the first
         let sep_lines = if sec_idx == 0 {
             vec![section_sep(&section.title, width), Line::from("")]
@@ -410,11 +445,63 @@ fn build_segments(
             });
         }
     }
-
-    segs
 }
 
-fn get_field_content(issue: &Issue, field: &PostmortemFieldConfig, tz: FixedOffset) -> String {
+fn build_default_segments(
+    segs: &mut Vec<Segment>,
+    issue: &Issue,
+    width: u16,
+    field_names: &HashMap<String, String>,
+) {
+    // Description section
+    if let Some(ref desc) = issue.fields.description {
+        let text = json_to_text(desc);
+        if !text.is_empty() {
+            segs.push(Segment::ReadOnly {
+                lines: vec![
+                    Line::from(""),
+                    section_sep("Description", width),
+                    Line::from(""),
+                ],
+            });
+            let desc_lines: Vec<Line<'static>> = text
+                .replace('\r', "")
+                .lines()
+                .map(|l| Line::from(l.to_string()))
+                .collect();
+            segs.push(Segment::ReadOnly { lines: desc_lines });
+        }
+    }
+
+    // Extra fields section
+    if !issue.fields.extra.is_empty() {
+        segs.push(Segment::ReadOnly {
+            lines: vec![
+                Line::from(""),
+                section_sep("Fields", width),
+                Line::from(""),
+            ],
+        });
+        let mut extra_fields: Vec<(&String, &serde_json::Value)> =
+            issue.fields.extra.iter().collect();
+        extra_fields.sort_by_key(|(k, _)| k.as_str());
+        for (field_idx, (field_id, value)) in extra_fields.into_iter().enumerate() {
+            let label = field_names
+                .get(field_id)
+                .cloned()
+                .unwrap_or_else(|| field_id.clone());
+            let content = val_to_str(value);
+            segs.push(Segment::EditableField {
+                label,
+                content,
+                field_idx,
+                readonly: false,
+            });
+        }
+    }
+}
+
+fn get_field_content(issue: &Issue, field: &CustomViewFieldConfig, tz: FixedOffset) -> String {
     let Some(raw) = issue.fields.extra.get(&field.field_id) else {
         return String::new();
     };
@@ -481,18 +568,50 @@ fn measure_line(line: &Line, width: u16) -> usize {
 
 // ── Header section ────────────────────────────────────────────────────────────
 
-fn header_lines(issue: &Issue) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::raw(issue.fields.summary.clone()),
-            Span::raw("  "),
-            Span::styled(
-                issue.fields.status.name.clone(),
-                Style::default().add_modifier(Modifier::DIM),
+fn header_lines(issue: &Issue, full: bool) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::raw(issue.fields.summary.clone()),
+        Span::raw("  "),
+        Span::styled(
+            issue.fields.status.name.clone(),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ]));
+
+    if full {
+        let priority = issue
+            .fields
+            .priority
+            .as_ref()
+            .map_or_else(|| "—".to_string(), |p| format!("{} {}", p.symbol(), p.name));
+        lines.push(kv_line("Priority", &priority));
+
+        let assignee = issue
+            .fields
+            .assignee
+            .as_ref()
+            .map_or_else(|| "Unassigned".to_string(), |a| a.display().to_string());
+        lines.push(kv_line("Assignee", &assignee));
+
+        if let Some(ref reporter) = issue.fields.reporter {
+            lines.push(kv_line("Reporter", reporter.display()));
+        }
+
+        lines.push(kv_line("Type", &issue.fields.issuetype.name));
+        lines.push(kv_line(
+            "Project",
+            &format!(
+                "{} ({})",
+                issue.fields.project.name, issue.fields.project.key
             ),
-        ]),
-        Line::from(""),
-    ]
+        ));
+        lines.push(kv_line("Key", &issue.key));
+    }
+
+    lines.push(Line::from(""));
+    lines
 }
 
 // ── Duration row (read-only, computed from start + end) ──────────────────────
@@ -614,7 +733,7 @@ pub fn val_to_str(v: &serde_json::Value) -> String {
 
 // ── Timezone ─────────────────────────────────────────────────────────────────
 
-pub fn resolve_tz(cfg: Option<&PostmortemViewConfig>) -> FixedOffset {
+pub fn resolve_tz(cfg: Option<&CustomViewConfig>) -> FixedOffset {
     cfg.and_then(|c| c.timezone.as_deref())
         .and_then(parse_tz_offset)
         .unwrap_or_else(local_tz)
@@ -692,4 +811,29 @@ fn inline_cursor_line(input: &str, cursor_char: usize) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+// ── ADF / description text extraction ────────────────────────────────────────
+
+/// Best-effort plain text extraction from Jira description (string or ADF JSON).
+pub fn json_to_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(_) => extract_adf_text(value),
+        _ => String::new(),
+    }
+}
+
+fn extract_adf_text(node: &serde_json::Value) -> String {
+    let mut out = String::new();
+    if let Some(text) = node.get("text").and_then(|t| t.as_str()) {
+        out.push_str(text);
+    }
+    if let Some(content) = node.get("content").and_then(|c| c.as_array()) {
+        for child in content {
+            out.push_str(&extract_adf_text(child));
+        }
+        out.push('\n');
+    }
+    out
 }

@@ -14,9 +14,9 @@ use crate::tui::overlays;
 /// Side-channel data written during a render pass, consumed by the event loop.
 #[derive(Default)]
 pub struct RenderOut {
-    /// Virtual (top, bottom) row offsets for each focusable postmortem item.
+    /// Virtual (top, bottom) row offsets for each focusable detail view item.
     /// Index: Comments=0, Attachments=1, Field(i)=2+i.
-    pub postmortem_focus_offsets: Vec<(usize, usize)>,
+    pub detail_focus_offsets: Vec<(usize, usize)>,
     /// Height of the detail content viewport (inside the detail panel border).
     pub detail_viewport_h: usize,
     /// Total content lines returned by the active detail view renderer.
@@ -72,7 +72,7 @@ pub fn render(
     // Hint bar
     render_hints(f, root[2], app);
 
-    // Sub-view popup overlay (comments / attachments from postmortem)
+    // Sub-view popup overlay (comments / attachments)
     if app.overlay.is_some() {
         overlays::sub_view::render_sub_view_overlay(f, app, render_out);
     }
@@ -152,7 +152,7 @@ fn render_action_overlays(f: &mut Frame, app: &AppState) {
             );
         }
         ActionState::InlineEditingField { .. } | ActionState::None => {
-            // Rendered inline within the postmortem view — no overlay needed
+            // Rendered inline within the detail view — no overlay needed
         }
         ActionState::Error(msg) => {
             render_error_overlay(f, &msg.to_string());

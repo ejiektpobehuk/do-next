@@ -18,15 +18,15 @@ pub fn render_detail(
     render_out: &mut RenderOut,
 ) {
     let accent = if focused { Color::Yellow } else { Color::Reset };
-    let title = if app.view_mode == ViewMode::Postmortem {
-        app.selected_issue().map(|i| {
+    // Show issue key in panel border for detail views
+    let title = match &app.view_mode {
+        ViewMode::Default | ViewMode::Custom(_) => app.selected_issue().map(|i| {
             Span::styled(
                 format!(" {} ", i.key),
                 Style::default().add_modifier(Modifier::BOLD),
             )
-        })
-    } else {
-        None
+        }),
+        _ => None,
     };
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -77,12 +77,9 @@ fn render_detail_content(
             };
             let issue = issue.clone();
             match app.view_mode {
-                ViewMode::Default => views::default::render_default(f, area, &issue, app),
-                ViewMode::Incident => views::incident::render_incident(f, area, &issue, app),
-                ViewMode::Postmortem => {
-                    views::postmortem::render_postmortem(f, area, &issue, app, render_out)
+                ViewMode::Default | ViewMode::Custom(_) => {
+                    views::custom::render_detail_view(f, area, &issue, app, render_out)
                 }
-                ViewMode::Review => views::review::render_review(f, area, &issue, app),
                 ViewMode::Comments => views::comments::render_comments(f, area, &issue, app),
                 ViewMode::Attachments => {
                     views::attachments::render_attachments(f, area, &issue, app)

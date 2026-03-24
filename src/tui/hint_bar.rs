@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders},
 };
 
-use crate::tui::app::{ActionState, AppState, FocusedPanel, PostmortemFocus, ViewMode};
+use crate::tui::app::{ActionState, AppState, DetailFocus, FocusedPanel, ViewMode};
 
 /// Renders hints for modal action states. Returns `true` if a modal state was
 /// handled (caller should return early).
@@ -76,27 +76,33 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         if active { Color::Blue } else { Color::DarkGray }
     };
 
-    let in_postmortem_detail = app.focused_panel == FocusedPanel::Detail
-        && app.view_mode == ViewMode::Postmortem
+    let in_detail_view = app.focused_panel == FocusedPanel::Detail
+        && matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
         && app.selected_issue().is_some();
 
     let mut hints: Vec<Span> = vec![Span::raw("┤ ")];
-    if in_postmortem_detail {
-        let pm_cfg = app.config.view_modes.postmortem.as_ref();
-        let enter_label = match &app.postmortem_focus {
-            PostmortemFocus::Comments => Some("view comments"),
-            PostmortemFocus::Attachments => Some("view attachments"),
-            PostmortemFocus::Field(field_idx) => {
+    if in_detail_view {
+        let view_cfg = crate::tui::views::custom::current_view_config(app);
+        let selected_issue = app.selected_issue();
+        let enter_label = match &app.detail_focus {
+            DetailFocus::Comments => Some("view comments"),
+            DetailFocus::Attachments => Some("view attachments"),
+            DetailFocus::Field(field_idx) => {
                 let field_idx = *field_idx;
-                let is_readonly =
-                    crate::tui::views::postmortem::postmortem_field_is_readonly(pm_cfg, field_idx);
+                let field_cfg = crate::tui::views::custom::view_field_cfg(
+                    view_cfg,
+                    selected_issue,
+                    field_idx,
+                );
+                let is_readonly = field_cfg.as_ref().and_then(|f| f.readonly).unwrap_or(false);
                 if is_readonly {
-                    let field_id =
-                        crate::tui::views::postmortem::postmortem_field_cfg(pm_cfg, field_idx)
-                            .map_or("", |f| f.field_id.as_str());
+                    let field_id = field_cfg
+                        .as_ref()
+                        .map(|f| f.field_id.clone())
+                        .unwrap_or_default();
                     let is_link = app
                         .selected_issue()
-                        .and_then(|i| i.fields.extra.get(field_id))
+                        .and_then(|i| i.fields.extra.get(&field_id))
                         .and_then(|v| v.as_str())
                         .is_some_and(|s| s.starts_with("http://") || s.starts_with("https://"));
                     if is_link { Some("open link") } else { None }

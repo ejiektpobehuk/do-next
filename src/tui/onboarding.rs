@@ -338,7 +338,6 @@ fn template_config(
     //   display_name: "Incidents in progress",
     //   jql: "assignee = currentUser() AND type = Incident AND status = \"In Progress\"",
     //   expected_project: "{default_project}",
-    //   view_mode: "incident",
     //   indication: {{ symbol: "!", color: "red" }},
     // }},
     // {{
@@ -356,14 +355,13 @@ fn template_config(
     //   display_name: "Filling up the postmortem",
     //   jql: "assignee = currentUser() AND type = Incident AND status = \"Mitigated\"",
     //   expected_project: "{default_project}",
-    //   view_mode: "postmortem",
+    //   view_mode: "postmortem",   // references a key in the `views` map below
     //   indication: {{ symbol: "📋", color: "blue" }},
     // }},
     // {{
     //   id: "tasks_i_review",
     //   display_name: "Tasks I'm reviewing",
     //   jql: "filter = 12345",
-    //   view_mode: "review",
     //   indication: {{ symbol: "👀", color: "cyan" }},
     //   badges: ["assignee"],
     // }},
@@ -385,7 +383,6 @@ fn template_config(
     //   id: "teammate_tasks_to_review",
     //   display_name: "Teammate's tasks I can review",
     //   jql: "project = {default_project} AND status = \"Ready for review\"",
-    //   view_mode: "review",
     //   indication: {{ symbol: "✓", color: "cyan" }},
     //   subsources: [
     //     {{ jql_filter: "reviewer = currentUser()", badge: "reviewing" }},
@@ -416,17 +413,27 @@ fn template_config(
   //   ],
   // }},
 
-  // view_modes: {{
-  //   incident: {{ slack_thread_field: "customfield_12345" }},
+  // Custom views keyed by name. Sources reference these via `view_mode: "key"`.
+  // The default view (no view_mode) shows all issue fields automatically.
+  // views: {{
   //   postmortem: {{
-  //     sections: ["Summary", "Timeline", "Root cause", "Impact", "Action items"],
-  //     body_field: "description",
-  //   }},
-  //   review: {{
-  //     provider: "gitlab",
-  //     link_method: "branch_name",
-  //     base_url: "https://gitlab.example.com",
-  //     mr_field: "customfield_67890",
+  //     timezone: "+03",
+  //     sections: [
+  //       {{
+  //         title: "Timeline",
+  //         fields: [
+  //           {{ field_id: "customfield_10000", name: "Start time", datetime: true, duration_role: "start" }},
+  //           {{ field_id: "customfield_10001", name: "End time", datetime: true, duration_role: "end" }},
+  //           {{ field_id: "customfield_10002", name: "Duration (Jira)", duration_role: "jira_value" }},
+  //         ],
+  //       }},
+  //       {{
+  //         title: "Root cause",
+  //         fields: [
+  //           {{ field_id: "customfield_10003", name: "Root cause", use_editor: true }},
+  //         ],
+  //       }},
+  //     ],
   //   }},
   // }},
 

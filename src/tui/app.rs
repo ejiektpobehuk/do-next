@@ -43,24 +43,24 @@ pub enum FocusedPanel {
 /// Which view mode to use for the detail panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewMode {
+    /// Auto-generated view using all issue fields.
     Default,
-    Incident,
-    Postmortem,
-    Review,
+    /// Named custom view defined in `config.views`.
+    Custom(String),
     Comments,
     Attachments,
 }
 
-/// Which item has focus inside the postmortem detail view.
+/// Which item has focus inside the detail view.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PostmortemFocus {
+pub enum DetailFocus {
     Comments,
     Attachments,
-    /// 0-based config-field index.
+    /// 0-based field index.
     Field(usize),
 }
 
-/// A sub-view shown as a popup overlay on top of the postmortem view.
+/// A sub-view shown as a popup overlay on top of the detail view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubView {
     Comments,
@@ -237,24 +237,24 @@ pub struct AppState {
     pub detail_scroll: usize,
     /// Which panel currently has keyboard focus.
     pub focused_panel: FocusedPanel,
-    /// Focused item when `ViewMode::Postmortem` && `FocusedPanel::Detail`.
-    pub postmortem_focus: PostmortemFocus,
-    /// Virtual (top, bottom) row for each focusable postmortem item; written each render.
+    /// Focused item when in a detail view (`Default` or `Custom`) with `FocusedPanel::Detail`.
+    pub detail_focus: DetailFocus,
+    /// Virtual (top, bottom) row for each focusable detail item; written each render.
     /// Index: Comments=0, Attachments=1, Field(i)=2+i.
-    pub postmortem_focus_offsets: Vec<(usize, usize)>,
+    pub detail_focus_offsets: Vec<(usize, usize)>,
     /// Height of the detail content viewport; written each render.
     pub last_detail_viewport_h: usize,
-    /// API-fetched display names for postmortem fields: `field_id` → name.
-    pub postmortem_field_names: HashMap<String, String>,
-    /// API-fetched Jira schema types for postmortem fields: `field_id` → type string.
-    pub postmortem_field_schemas: HashMap<String, String>,
+    /// API-fetched display names for fields: `field_id` → name.
+    pub field_names: HashMap<String, String>,
+    /// API-fetched Jira schema types for fields: `field_id` → type string.
+    pub field_schemas: HashMap<String, String>,
     /// Set while a field-names fetch is in flight to prevent duplicate requests.
-    pub postmortem_field_names_loading: bool,
+    pub field_names_loading: bool,
     /// Tracks first `g` press for `gg` (jump to first) motion.
     pub pending_g: bool,
     /// Total content lines of the detail view; written each render.
     pub last_detail_content_h: usize,
-    /// Sub-view popup shown on top of the postmortem view (Comments or Attachments).
+    /// Sub-view popup shown on top of the detail view (Comments or Attachments).
     pub overlay: Option<SubView>,
     /// Scroll offset for the sub-view overlay (independent of `detail_scroll`).
     pub overlay_scroll: usize,
@@ -312,12 +312,12 @@ impl AppState {
             current_user: None,
             detail_scroll: 0,
             focused_panel: FocusedPanel::List,
-            postmortem_focus: PostmortemFocus::Comments,
-            postmortem_focus_offsets: Vec::new(),
+            detail_focus: DetailFocus::Comments,
+            detail_focus_offsets: Vec::new(),
             last_detail_viewport_h: 0,
-            postmortem_field_names: HashMap::new(),
-            postmortem_field_schemas: HashMap::new(),
-            postmortem_field_names_loading: false,
+            field_names: HashMap::new(),
+            field_schemas: HashMap::new(),
+            field_names_loading: false,
             pending_g: false,
             last_detail_content_h: 0,
             overlay: None,
@@ -460,10 +460,9 @@ fn auto_view_mode(issue: &Issue, config: &Config) -> ViewMode {
     let Some(source_id) = issue.source_id.as_deref() else {
         return ViewMode::Default;
     };
-    match source_config_for(config, source_id).and_then(|s| s.view_mode.as_deref()) {
-        Some("incident") => ViewMode::Incident,
-        Some("postmortem") => ViewMode::Postmortem,
-        Some("review") => ViewMode::Review,
+    let view_id = source_config_for(config, source_id).and_then(|s| s.view_mode.as_deref());
+    match view_id {
+        Some(id) if config.views.contains_key(id) => ViewMode::Custom(id.to_string()),
         _ => ViewMode::Default,
     }
 }
@@ -588,10 +587,10 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
                 multi,
             );
         }
-        ActionResult::PostmortemFieldNamesLoaded { names, schemas } => {
-            app.postmortem_field_names.extend(names);
-            app.postmortem_field_schemas.extend(schemas);
-            app.postmortem_field_names_loading = false;
+        ActionResult::FieldNamesLoaded { names, schemas } => {
+            app.field_names.extend(names);
+            app.field_schemas.extend(schemas);
+            app.field_names_loading = false;
         }
         ActionResult::CommentEdited {
             issue_key,
@@ -736,7 +735,7 @@ fn field_options_to_state(
 ) -> ActionState {
     if options.is_empty() {
         // No allowed values — fall back to $EDITOR
-        let current_value = crate::tui::views::postmortem::val_to_str(&original_json);
+        let current_value = crate::tui::views::custom::val_to_str(&original_json);
         ActionState::PendingFieldEdit {
             issue_key,
             field_id,
@@ -1287,19 +1286,25 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         (KeyCode::Down | KeyCode::Char('j'), _) => key_nav_down(app),
         (KeyCode::Up | KeyCode::Char('k'), _) => key_nav_up(app),
         (KeyCode::Enter, _) => {
-            if app.focused_panel == FocusedPanel::Detail && app.view_mode == ViewMode::Postmortem {
-                key_edit_postmortem_field(app);
+            if app.focused_panel == FocusedPanel::Detail
+                && matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
+            {
+                key_edit_detail_field(app);
             }
         }
         (KeyCode::Char('v'), _) => {
             // Cycle view modes manually
-            app.view_mode = match app.view_mode {
-                ViewMode::Default
-                | ViewMode::Incident
-                | ViewMode::Postmortem
-                | ViewMode::Review => ViewMode::Comments,
+            app.view_mode = match &app.view_mode {
+                ViewMode::Default | ViewMode::Custom(_) => ViewMode::Comments,
                 ViewMode::Comments => ViewMode::Attachments,
-                ViewMode::Attachments => ViewMode::Default,
+                ViewMode::Attachments => {
+                    // Return to the natural view for the current issue
+                    if let Some(issue) = app.selected_issue() {
+                        auto_view_mode(&issue.clone(), &app.config)
+                    } else {
+                        ViewMode::Default
+                    }
+                }
             };
             app.detail_scroll = 0;
         }
@@ -1339,24 +1344,26 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
 }
 
 fn key_nav_down(app: &mut AppState) {
-    if app.focused_panel == FocusedPanel::Detail && app.view_mode == ViewMode::Postmortem {
-        let num_cfg = crate::tui::views::postmortem::num_postmortem_fields(
-            app.config.view_modes.postmortem.as_ref(),
-        );
-        app.postmortem_focus = match &app.postmortem_focus {
-            PostmortemFocus::Comments => PostmortemFocus::Attachments,
-            PostmortemFocus::Attachments => {
-                if num_cfg > 0 {
-                    PostmortemFocus::Field(0)
+    if app.focused_panel == FocusedPanel::Detail
+        && matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
+    {
+        let view_cfg = crate::tui::views::custom::current_view_config(app);
+        let num_fields =
+            crate::tui::views::custom::num_view_fields(view_cfg, app.selected_issue());
+        app.detail_focus = match &app.detail_focus {
+            DetailFocus::Comments => DetailFocus::Attachments,
+            DetailFocus::Attachments => {
+                if num_fields > 0 {
+                    DetailFocus::Field(0)
                 } else {
-                    PostmortemFocus::Attachments
+                    DetailFocus::Attachments
                 }
             }
-            PostmortemFocus::Field(i) => {
-                if *i + 1 < num_cfg {
-                    PostmortemFocus::Field(i + 1)
+            DetailFocus::Field(i) => {
+                if *i + 1 < num_fields {
+                    DetailFocus::Field(i + 1)
                 } else {
-                    PostmortemFocus::Field(*i)
+                    DetailFocus::Field(*i)
                 }
             }
         };
@@ -1370,11 +1377,13 @@ fn key_nav_down(app: &mut AppState) {
 }
 
 fn key_nav_up(app: &mut AppState) {
-    if app.focused_panel == FocusedPanel::Detail && app.view_mode == ViewMode::Postmortem {
-        app.postmortem_focus = match &app.postmortem_focus {
-            PostmortemFocus::Comments | PostmortemFocus::Attachments => PostmortemFocus::Comments,
-            PostmortemFocus::Field(0) => PostmortemFocus::Attachments,
-            PostmortemFocus::Field(i) => PostmortemFocus::Field(i - 1),
+    if app.focused_panel == FocusedPanel::Detail
+        && matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
+    {
+        app.detail_focus = match &app.detail_focus {
+            DetailFocus::Comments | DetailFocus::Attachments => DetailFocus::Comments,
+            DetailFocus::Field(0) => DetailFocus::Attachments,
+            DetailFocus::Field(i) => DetailFocus::Field(i - 1),
         };
         auto_scroll_to_field(app);
     } else if app.focused_panel == FocusedPanel::Detail {
@@ -1387,8 +1396,8 @@ fn key_nav_up(app: &mut AppState) {
 
 fn key_jump_first(app: &mut AppState) {
     if app.focused_panel == FocusedPanel::Detail {
-        if app.view_mode == ViewMode::Postmortem {
-            app.postmortem_focus = PostmortemFocus::Comments;
+        if matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) {
+            app.detail_focus = DetailFocus::Comments;
             auto_scroll_to_field(app);
         } else {
             app.detail_scroll = 0;
@@ -1401,14 +1410,14 @@ fn key_jump_first(app: &mut AppState) {
 
 fn key_jump_last(app: &mut AppState) {
     if app.focused_panel == FocusedPanel::Detail {
-        if app.view_mode == ViewMode::Postmortem {
-            let num_cfg = crate::tui::views::postmortem::num_postmortem_fields(
-                app.config.view_modes.postmortem.as_ref(),
-            );
-            app.postmortem_focus = if num_cfg > 0 {
-                PostmortemFocus::Field(num_cfg - 1)
+        if matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) {
+            let view_cfg = crate::tui::views::custom::current_view_config(app);
+            let num_fields =
+                crate::tui::views::custom::num_view_fields(view_cfg, app.selected_issue());
+            app.detail_focus = if num_fields > 0 {
+                DetailFocus::Field(num_fields - 1)
             } else {
-                PostmortemFocus::Attachments
+                DetailFocus::Attachments
             };
             auto_scroll_to_field(app);
         } else {
@@ -1480,50 +1489,52 @@ fn update_view_mode_on_navigate(app: &mut AppState) {
     }
     app.detail_scroll = 0;
     app.overlay = None;
-    app.postmortem_focus = PostmortemFocus::Comments;
-    app.postmortem_focus_offsets.clear();
-    app.postmortem_field_names.clear();
-    app.postmortem_field_schemas.clear();
-    app.postmortem_field_names_loading = false;
+    app.detail_focus = DetailFocus::Comments;
+    app.detail_focus_offsets.clear();
+    app.field_names.clear();
+    app.field_schemas.clear();
+    app.field_names_loading = false;
 }
 
-fn key_edit_postmortem_field(app: &mut AppState) {
+fn key_edit_detail_field(app: &mut AppState) {
     let Some(issue) = app.selected_issue() else {
         return;
     };
     let issue = issue.clone();
 
     // Nav widget: open as popup overlay (one layer deeper)
-    match &app.postmortem_focus {
-        PostmortemFocus::Comments => {
+    match &app.detail_focus {
+        DetailFocus::Comments => {
             app.overlay = Some(SubView::Comments);
             app.overlay_scroll = 0;
             return;
         }
-        PostmortemFocus::Attachments => {
+        DetailFocus::Attachments => {
             app.overlay = Some(SubView::Attachments);
             app.overlay_scroll = 0;
             app.overlay_focused_attachment = 0;
             maybe_fetch_attachment_preview(app);
             return;
         }
-        PostmortemFocus::Field(_) => {}
+        DetailFocus::Field(_) => {}
     }
 
-    let field_idx = match &app.postmortem_focus {
-        PostmortemFocus::Field(i) => *i,
+    let field_idx = match &app.detail_focus {
+        DetailFocus::Field(i) => *i,
         _ => return,
     };
-    let cfg = app.config.view_modes.postmortem.as_ref();
+    let view_cfg = crate::tui::views::custom::current_view_config(app);
     let (field_id, original_json) =
-        crate::tui::views::postmortem::postmortem_editable_field_spec(cfg, &issue, field_idx);
+        crate::tui::views::custom::view_editable_field_spec(view_cfg, &issue, field_idx);
 
     if field_id.is_empty() {
         return;
     }
 
+    let field_cfg = crate::tui::views::custom::view_field_cfg(view_cfg, Some(&issue), field_idx);
+
     // Readonly fields: open URL in browser if the value is a link, otherwise do nothing
-    if crate::tui::views::postmortem::postmortem_field_is_readonly(cfg, field_idx) {
+    if field_cfg.as_ref().and_then(|f| f.readonly).unwrap_or(false) {
         if let serde_json::Value::String(s) = &original_json
             && (s.starts_with("http://") || s.starts_with("https://"))
         {
@@ -1532,27 +1543,24 @@ fn key_edit_postmortem_field(app: &mut AppState) {
         return;
     }
 
-    let label = crate::tui::views::postmortem::postmortem_field_cfg(cfg, field_idx)
-        .map(|f| crate::tui::views::postmortem::resolve_field_label(f, &app.postmortem_field_names))
+    let label = field_cfg
+        .as_ref()
+        .map(|f| crate::tui::views::custom::resolve_field_label(f, &app.field_names))
         .unwrap_or_default();
-    let description = crate::tui::views::postmortem::postmortem_field_hint(cfg, field_idx);
+    let description = field_cfg.as_ref().and_then(|f| f.hint.clone());
 
     // `use_editor: true` always opens $EDITOR regardless of field type
-    let use_editor = crate::tui::views::postmortem::postmortem_field_cfg(cfg, field_idx)
-        .and_then(|f| f.use_editor)
-        .unwrap_or(false);
+    let use_editor = field_cfg.as_ref().and_then(|f| f.use_editor).unwrap_or(false);
 
     // Datetime picker: triggered by `datetime: true` config flag or editmeta schema type
     if !use_editor {
-        let by_config = crate::tui::views::postmortem::postmortem_field_cfg(cfg, field_idx)
-            .and_then(|f| f.datetime)
-            .unwrap_or(false);
+        let by_config = field_cfg.as_ref().and_then(|f| f.datetime).unwrap_or(false);
         let by_schema = app
-            .postmortem_field_schemas
+            .field_schemas
             .get(&field_id)
             .is_some_and(|t| t == "date" || t == "datetime");
         if by_config || by_schema {
-            let tz = crate::tui::views::postmortem::resolve_tz(cfg);
+            let tz = crate::tui::views::custom::resolve_tz(view_cfg);
             let picker = crate::tui::overlays::datetime_picker::DatetimePicker::from_value(
                 &original_json,
                 tz,
@@ -1569,7 +1577,7 @@ fn key_edit_postmortem_field(app: &mut AppState) {
     }
 
     if use_editor {
-        let current_value = crate::tui::views::postmortem::val_to_str(&original_json);
+        let current_value = crate::tui::views::custom::val_to_str(&original_json);
         app.action_state = ActionState::PendingFieldEdit {
             issue_key: issue.key,
             field_id,
@@ -1579,18 +1587,10 @@ fn key_edit_postmortem_field(app: &mut AppState) {
         return;
     }
 
-    set_postmortem_edit_state(
-        app,
-        issue.key,
-        field_id,
-        field_idx,
-        label,
-        description,
-        original_json,
-    );
+    set_detail_edit_state(app, issue.key, field_id, field_idx, label, description, original_json);
 }
 
-fn set_postmortem_edit_state(
+fn set_detail_edit_state(
     app: &mut AppState,
     issue_key: String,
     field_id: String,
@@ -1621,7 +1621,7 @@ fn set_postmortem_edit_state(
             };
         }
         serde_json::Value::String(s) if s.contains('\n') => {
-            let current_value = crate::tui::views::postmortem::val_to_str(&original_json);
+            let current_value = crate::tui::views::custom::val_to_str(&original_json);
             app.action_state = ActionState::PendingFieldEdit {
                 issue_key,
                 field_id,
@@ -1630,7 +1630,7 @@ fn set_postmortem_edit_state(
             };
         }
         _ => {
-            let input = crate::tui::views::postmortem::val_to_str(&original_json);
+            let input = crate::tui::views::custom::val_to_str(&original_json);
             let cursor = input.chars().count();
             app.action_state = ActionState::InlineEditingField {
                 issue_key,
@@ -1643,17 +1643,17 @@ fn set_postmortem_edit_state(
     }
 }
 
-fn focus_offset_idx(focus: &PostmortemFocus) -> usize {
+fn focus_offset_idx(focus: &DetailFocus) -> usize {
     match focus {
-        PostmortemFocus::Comments => 0,
-        PostmortemFocus::Attachments => 1,
-        PostmortemFocus::Field(i) => 2 + i,
+        DetailFocus::Comments => 0,
+        DetailFocus::Attachments => 1,
+        DetailFocus::Field(i) => 2 + i,
     }
 }
 
 fn auto_scroll_to_field(app: &mut AppState) {
-    let idx = focus_offset_idx(&app.postmortem_focus);
-    let Some(&(top, bottom)) = app.postmortem_focus_offsets.get(idx) else {
+    let idx = focus_offset_idx(&app.detail_focus);
+    let Some(&(top, bottom)) = app.detail_focus_offsets.get(idx) else {
         return;
     };
     let viewport_h = app.last_detail_viewport_h;

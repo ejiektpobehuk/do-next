@@ -74,7 +74,7 @@ fn left_column() -> Vec<Line<'static>> {
         Line::raw(""),
         section_header("View"),
         key_line("v", "cycle view modes"),
-        key_line("Enter", "edit field (postmortem)"),
+        key_line("Enter", "edit field / open comments / attachments"),
         Line::raw(""),
         section_header("General"),
         key_line("?", "this help"),

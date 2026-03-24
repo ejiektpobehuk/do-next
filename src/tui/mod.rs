@@ -132,7 +132,7 @@ async fn run_inner(
 
         let mut render_out = RenderOut::default();
         terminal.draw(|f| render(f, &app, &mut list_state, &mut render_out))?;
-        app.postmortem_focus_offsets = std::mem::take(&mut render_out.postmortem_focus_offsets);
+        app.detail_focus_offsets = std::mem::take(&mut render_out.detail_focus_offsets);
         app.last_detail_viewport_h = render_out.detail_viewport_h;
         app.last_detail_content_h = render_out.detail_content_h;
         app.overlay_content_h = render_out.overlay_content_h;
@@ -761,41 +761,55 @@ pub fn open_editor_for_comment(
     open_editor_with_content(terminal, "")
 }
 
-/// Spawn a fetch for postmortem field display names if needed.
+/// Spawn a fetch for field display names if needed (for both default and custom views).
 fn maybe_spawn_field_names_fetch(
     app: &mut AppState,
     client: &JiraClient,
     tx: &UnboundedSender<AppEvent>,
 ) {
-    if app.view_mode != crate::tui::app::ViewMode::Postmortem {
+    use crate::tui::app::ViewMode;
+    if !matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) {
         return;
     }
-    if app.postmortem_field_names_loading || !app.postmortem_field_names.is_empty() {
+    if app.field_names_loading || !app.field_names.is_empty() {
         return;
     }
-    let Some(cfg) = app.config.view_modes.postmortem.as_ref() else {
-        return;
-    };
-    // Only fetch names for fields that don't have a name override
-    let field_ids: Vec<String> = cfg
-        .sections
-        .iter()
-        .flat_map(|s| s.fields.iter())
-        .filter(|f| f.name.is_none())
-        .map(|f| f.field_id.clone())
-        .collect();
-    if field_ids.is_empty() {
-        return;
+
+    match &app.view_mode {
+        ViewMode::Custom(id) => {
+            let Some(issue) = app.selected_issue() else {
+                return;
+            };
+            let Some(cfg) = app.config.views.get(id.as_str()) else {
+                return;
+            };
+            // Only fetch names for fields that don't have a name override
+            let field_ids: Vec<String> = cfg
+                .sections
+                .iter()
+                .flat_map(|s| s.fields.iter())
+                .filter(|f| f.name.is_none())
+                .map(|f| f.field_id.clone())
+                .collect();
+            if field_ids.is_empty() {
+                return;
+            }
+            let issue_key = issue.key.clone();
+            app.field_names_loading = true;
+            spawn_load_field_names_editmeta(issue_key, field_ids, client.clone(), tx.clone());
+        }
+        _ => {
+            // Default view: use the global field registry to get names for all fields.
+            // This covers readonly fields that don't appear in editmeta.
+            app.field_names_loading = true;
+            spawn_load_all_field_names(client.clone(), tx.clone());
+        }
     }
-    let Some(issue) = app.selected_issue() else {
-        return;
-    };
-    let issue_key = issue.key.clone();
-    app.postmortem_field_names_loading = true;
-    spawn_load_postmortem_field_names(issue_key, field_ids, client.clone(), tx.clone());
 }
 
-fn spawn_load_postmortem_field_names(
+/// Fetch field names via editmeta (issue-specific; returns names + schema types for editable fields).
+/// Used by custom views to also obtain schema types for the datetime picker.
+fn spawn_load_field_names_editmeta(
     issue_key: String,
     field_ids: Vec<String>,
     client: JiraClient,
@@ -805,18 +819,39 @@ fn spawn_load_postmortem_field_names(
         let ids_ref: Vec<&str> = field_ids.iter().map(String::as_str).collect();
         match client.get_field_labels(&issue_key, &ids_ref).await {
             Ok((names, schemas)) => {
-                let _ = tx.send(AppEvent::ActionDone(
-                    ActionResult::PostmortemFieldNamesLoaded { names, schemas },
-                ));
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::FieldNamesLoaded {
+                    names,
+                    schemas,
+                }));
             }
             Err(_) => {
                 // Best-effort: silently ignore failures, field IDs will be shown as fallback
-                let _ = tx.send(AppEvent::ActionDone(
-                    ActionResult::PostmortemFieldNamesLoaded {
-                        names: std::collections::HashMap::new(),
-                        schemas: std::collections::HashMap::new(),
-                    },
-                ));
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::FieldNamesLoaded {
+                    names: std::collections::HashMap::new(),
+                    schemas: std::collections::HashMap::new(),
+                }));
+            }
+        }
+    });
+}
+
+/// Fetch field names from the global Jira field registry (`GET /rest/api/2/field`).
+/// Returns names for ALL fields including readonly ones. Used by the default view.
+fn spawn_load_all_field_names(client: JiraClient, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        match client.get_all_fields().await {
+            Ok(fields) => {
+                let names = fields.into_iter().map(|f| (f.id, f.name)).collect();
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::FieldNamesLoaded {
+                    names,
+                    schemas: std::collections::HashMap::new(),
+                }));
+            }
+            Err(_) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::FieldNamesLoaded {
+                    names: std::collections::HashMap::new(),
+                    schemas: std::collections::HashMap::new(),
+                }));
             }
         }
     });

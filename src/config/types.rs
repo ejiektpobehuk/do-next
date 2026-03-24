@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Top-level config, merged from user config and optional project override.
@@ -11,8 +13,9 @@ pub struct Config {
     pub list: ListConfig,
     #[serde(default)]
     pub hide_for_a_day: HideForADayConfig,
+    /// Named custom views. Source `view_mode` references a key in this map.
     #[serde(default)]
-    pub view_modes: ViewModesConfig,
+    pub views: HashMap<String, CustomViewConfig>,
     #[serde(default)]
     pub cache: CacheConfig,
 }
@@ -41,7 +44,7 @@ pub struct SourceConfig {
     /// Whether "Hide for a day" is available for this source.
     #[serde(default)]
     pub allow_hide_for_a_day: bool,
-    /// Auto view mode: "incident" | "postmortem" | "review" (absent = Default view).
+    /// Custom view ID (key in `config.views`). Absent = Default view.
     pub view_mode: Option<String>,
     /// Display indication (symbol + color). Falls back to `list.default_indication`.
     pub indication: Option<SourceIndication>,
@@ -115,21 +118,9 @@ pub struct SuggestedSolution {
     pub copy_template: Option<String>,
 }
 
+/// Configuration for a single field in a custom view section.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct ViewModesConfig {
-    pub incident: Option<IncidentViewConfig>,
-    pub postmortem: Option<PostmortemViewConfig>,
-    pub review: Option<ReviewViewConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct IncidentViewConfig {
-    /// Jira field ID or name for the Slack thread link.
-    pub slack_thread_field: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct PostmortemFieldConfig {
+pub struct CustomViewFieldConfig {
     pub field_id: String,
     /// Override for the display name; if absent, name is fetched from Jira editmeta.
     pub name: Option<String>,
@@ -148,29 +139,21 @@ pub struct PostmortemFieldConfig {
     pub duration_role: Option<String>,
 }
 
+/// A section within a custom view.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct PostmortemSectionConfig {
+pub struct CustomViewSectionConfig {
     pub title: String,
     /// Optional subtitle shown below the section separator.
     pub description: Option<String>,
-    pub fields: Vec<PostmortemFieldConfig>,
+    pub fields: Vec<CustomViewFieldConfig>,
 }
 
+/// Configuration for a named custom view.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct PostmortemViewConfig {
+pub struct CustomViewConfig {
     /// Display timezone, e.g. "+03" or "-05". Defaults to system local timezone.
     pub timezone: Option<String>,
-    pub sections: Vec<PostmortemSectionConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ReviewViewConfig {
-    /// "gitlab", "github", "bitbucket"
-    pub provider: Option<String>,
-    /// "`branch_name`", "`custom_field`", "`mr_title`"
-    pub link_method: Option<String>,
-    pub base_url: Option<String>,
-    pub mr_field: Option<String>,
+    pub sections: Vec<CustomViewSectionConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

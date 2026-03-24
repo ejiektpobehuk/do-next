@@ -58,7 +58,7 @@ pub enum ActionResult {
         description: Option<String>,
         multi: bool,
     },
-    PostmortemFieldNamesLoaded {
+    FieldNamesLoaded {
         names: HashMap<String, String>,
         /// Jira editmeta `schema.type` per `field_id` (e.g. `"date"`, `"datetime"`).
         schemas: HashMap<String, String>,

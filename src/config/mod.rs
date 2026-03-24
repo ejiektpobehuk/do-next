@@ -66,4 +66,7 @@ fn merge_config(base: &mut Config, overlay: Config) {
     if overlay.list.default_indication.is_some() {
         base.list.default_indication = overlay.list.default_indication;
     }
+    if !overlay.views.is_empty() {
+        base.views.extend(overlay.views);
+    }
 }
