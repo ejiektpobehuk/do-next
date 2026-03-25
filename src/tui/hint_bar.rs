@@ -89,11 +89,8 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
             DetailFocus::Attachments => Some("view attachments"),
             DetailFocus::Field(field_idx) => {
                 let field_idx = *field_idx;
-                let field_cfg = crate::tui::views::custom::view_field_cfg(
-                    view_cfg,
-                    selected_issue,
-                    field_idx,
-                );
+                let field_cfg =
+                    crate::tui::views::custom::view_field_cfg(view_cfg, selected_issue, field_idx);
                 let is_readonly = field_cfg.as_ref().and_then(|f| f.readonly).unwrap_or(false);
                 if is_readonly {
                     let field_id = field_cfg

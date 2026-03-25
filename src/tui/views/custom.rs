@@ -38,10 +38,7 @@ enum Segment {
     /// Plain read-only text lines — not focusable.
     ReadOnly { lines: Vec<Line<'static>> },
     /// A navigable widget (Comments or Attachments count summary).
-    NavWidget {
-        nav: DetailNavKind,
-        content: String,
-    },
+    NavWidget { nav: DetailNavKind, content: String },
     /// A field with a bordered block. May be read-only or editable.
     EditableField {
         label: String,
@@ -59,10 +56,10 @@ enum Segment {
 /// Number of focusable fields in the view.
 /// For custom views: total configured fields. For the default view (cfg=None): all extra fields.
 pub fn num_view_fields(cfg: Option<&CustomViewConfig>, issue: Option<&Issue>) -> usize {
-    match cfg {
-        Some(c) => c.sections.iter().map(|s| s.fields.len()).sum(),
-        None => issue.map_or(0, |i| i.fields.extra.len()),
-    }
+    cfg.map_or_else(
+        || issue.map_or(0, |i| i.fields.extra.len()),
+        |c| c.sections.iter().map(|s| s.fields.len()).sum(),
+    )
 }
 
 /// Retrieve the field config at flat index `idx`.
@@ -118,7 +115,7 @@ pub fn view_editable_field_spec(
     let Some(field_cfg) = view_field_cfg(cfg, Some(issue), idx) else {
         return (String::new(), serde_json::Value::Null);
     };
-    let field_id = field_cfg.field_id.clone();
+    let field_id = field_cfg.field_id;
     let value = issue
         .fields
         .extra
@@ -269,66 +266,79 @@ fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, 
                 );
             }
         }
-        Segment::EditableField {
-            label,
-            field_idx,
-            content,
-            readonly,
-            ..
-        } => {
-            let selected =
-                matches!(&app.detail_focus, DetailFocus::Field(fi) if *fi == *field_idx);
-            let is_inline_edit = matches!(
-                &app.action_state,
-                ActionState::InlineEditingField { field_idx: fi, .. } if *fi == *field_idx
-            );
-            let border_style = if is_inline_edit {
-                Style::default().fg(Color::Yellow)
-            } else if selected && *readonly {
-                Style::default()
-            } else if selected {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let title = format!(" {label} ");
-            let block = if *readonly {
-                Block::default()
-                    .title(title.as_str())
-                    .borders(Borders::ALL)
-                    .border_set(CORNERS_ONLY)
-                    .border_style(border_style)
-            } else {
-                Block::default()
-                    .title(title.as_str())
-                    .borders(Borders::ALL)
-                    .border_set(border::PLAIN)
-                    .border_style(border_style)
-            };
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
+        Segment::EditableField { .. } => {
+            render_editable_field(f, rect, clipped_top, seg, app);
+        }
+    }
+}
 
-            // Scroll inner content: subtract 1 for top border (if clipped)
-            #[allow(clippy::cast_possible_truncation)]
-            let inner_scroll = (clipped_top as u16).saturating_sub(1);
-            if inner.height > 0 {
-                if is_inline_edit {
-                    if let ActionState::InlineEditingField {
-                        ref input, cursor, ..
-                    } = app.action_state
-                    {
-                        let line = inline_cursor_line(input, cursor);
-                        f.render_widget(Paragraph::new(line).scroll((inner_scroll, 0)), inner);
-                    }
-                } else {
-                    f.render_widget(
-                        Paragraph::new(content.as_str())
-                            .wrap(Wrap { trim: false })
-                            .scroll((inner_scroll, 0)),
-                        inner,
-                    );
-                }
+fn render_editable_field(
+    f: &mut Frame,
+    rect: Rect,
+    clipped_top: usize,
+    seg: &Segment,
+    app: &AppState,
+) {
+    let Segment::EditableField {
+        label,
+        field_idx,
+        content,
+        readonly,
+        ..
+    } = seg
+    else {
+        return;
+    };
+    let selected = matches!(&app.detail_focus, DetailFocus::Field(fi) if *fi == *field_idx);
+    let is_inline_edit = matches!(
+        &app.action_state,
+        ActionState::InlineEditingField { field_idx: fi, .. } if *fi == *field_idx
+    );
+    let border_style = if is_inline_edit {
+        Style::default().fg(Color::Yellow)
+    } else if selected && *readonly {
+        Style::default()
+    } else if selected {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let title = format!(" {label} ");
+    let block = if *readonly {
+        Block::default()
+            .title(title.as_str())
+            .borders(Borders::ALL)
+            .border_set(CORNERS_ONLY)
+            .border_style(border_style)
+    } else {
+        Block::default()
+            .title(title.as_str())
+            .borders(Borders::ALL)
+            .border_set(border::PLAIN)
+            .border_style(border_style)
+    };
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    // Scroll inner content: subtract 1 for top border (if clipped)
+    #[allow(clippy::cast_possible_truncation)]
+    let inner_scroll = (clipped_top as u16).saturating_sub(1);
+    if inner.height > 0 {
+        if is_inline_edit {
+            if let ActionState::InlineEditingField {
+                ref input, cursor, ..
+            } = app.action_state
+            {
+                let line = inline_cursor_line(input, cursor);
+                f.render_widget(Paragraph::new(line).scroll((inner_scroll, 0)), inner);
             }
+        } else {
+            f.render_widget(
+                Paragraph::new(content.as_str())
+                    .wrap(Wrap { trim: false })
+                    .scroll((inner_scroll, 0)),
+                inner,
+            );
         }
     }
 }
@@ -476,11 +486,7 @@ fn build_default_segments(
     // Extra fields section
     if !issue.fields.extra.is_empty() {
         segs.push(Segment::ReadOnly {
-            lines: vec![
-                Line::from(""),
-                section_sep("Fields", width),
-                Line::from(""),
-            ],
+            lines: vec![Line::from(""), section_sep("Fields", width), Line::from("")],
         });
         let mut extra_fields: Vec<(&String, &serde_json::Value)> =
             issue.fields.extra.iter().collect();

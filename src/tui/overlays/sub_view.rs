@@ -12,7 +12,7 @@ use ratatui_image::StatefulImage;
 use std::fmt::Write as _;
 
 use crate::jira::types::{Attachment, Comment, Issue};
-use crate::tui::app::{AppState, SubView};
+use crate::tui::app::{ActionState, AppState, SubView};
 use crate::tui::render::RenderOut;
 
 pub fn render_sub_view_overlay(f: &mut Frame, app: &AppState, render_out: &mut RenderOut) {
@@ -47,7 +47,9 @@ pub fn render_sub_view_overlay(f: &mut Frame, app: &AppState, render_out: &mut R
         .alignment(Alignment::Right)
     } else {
         Line::from(vec![
-            Span::raw("┤ "),
+            Span::raw("┤ ("),
+            Span::styled("n", Style::default().fg(Color::Blue)),
+            Span::raw(")ew | "),
             Span::styled("↕", Style::default().fg(Color::Blue)),
             Span::styled("→", Style::default().fg(Color::Green)),
             Span::raw(" | "),
@@ -86,10 +88,23 @@ fn render_attachments(
     issue: &Issue,
     render_out: &mut RenderOut,
 ) {
+    // When user is typing a path, carve out an input box (and optional completions) at the bottom.
+    let content_rect = if let ActionState::TypingAttachmentPath {
+        ref path,
+        ref completions,
+        completion_idx,
+        ..
+    } = app.action_state
+    {
+        render_attachment_input_overlay(f, inner, path, completions, completion_idx)
+    } else {
+        inner
+    };
+
     let panels = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(inner);
+        .split(content_rect);
     let left_rect = panels[0];
     let right_rect = panels[1];
 
@@ -191,6 +206,77 @@ fn render_attachments(
             }
         }
     }
+}
+
+fn render_attachment_input_overlay(
+    f: &mut Frame,
+    inner: Rect,
+    path: &str,
+    completions: &[String],
+    completion_idx: Option<usize>,
+) -> Rect {
+    let visible_n = completions.len().min(8);
+
+    let (content_rect, comp_rect, input_rect) = if completions.is_empty() {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(3)])
+            .split(inner);
+        (rows[0], None, rows[1])
+    } else {
+        let comp_height = u16::try_from(visible_n).unwrap_or(8) + 2;
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(comp_height),
+                Constraint::Length(3),
+            ])
+            .split(inner);
+        (rows[0], Some(rows[1]), rows[2])
+    };
+
+    // Render input box
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .title(" Upload file ");
+    let input_inner = input_block.inner(input_rect);
+    f.render_widget(input_block, input_rect);
+    let display = format!("{path}\u{2588}");
+    f.render_widget(Paragraph::new(display.as_str()), input_inner);
+
+    // Render completions list
+    if let Some(comp_area) = comp_rect {
+        let comp_block = Block::default().borders(Borders::ALL);
+        let comp_inner = comp_block.inner(comp_area);
+        f.render_widget(comp_block, comp_area);
+
+        // Scroll so that the selected item is visible (keep at bottom of window)
+        let scroll =
+            completion_idx.map_or(0, |idx| idx.saturating_sub(visible_n.saturating_sub(1)));
+
+        let lines: Vec<Line> = completions
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(visible_n)
+            .map(|(i, comp)| {
+                let is_dir = comp.ends_with('/');
+                let style = if Some(i) == completion_idx {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else if is_dir {
+                    Style::default().add_modifier(Modifier::DIM)
+                } else {
+                    Style::default()
+                };
+                Line::from(Span::styled(comp.as_str(), style))
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), comp_inner);
+    }
+
+    content_rect
 }
 
 fn build_meta_footer(att: &Attachment) -> String {

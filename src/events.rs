@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::jira::types::{Comment, FieldOption, Issue, Transition};
+use crate::jira::types::{Attachment, Comment, FieldOption, Issue, Transition};
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -18,6 +18,11 @@ pub enum AppEvent {
     CurrentUserResolved(String),
     /// Spinner animation frame — only sent while sources are loading.
     Tick,
+    /// Filesystem path completions ready (from debounced async fetch).
+    PathCompletions {
+        generation: u64,
+        completions: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -75,6 +80,10 @@ pub enum ActionResult {
         attachment_id: String,
         cache_path: std::path::PathBuf,
         open_after: bool,
+    },
+    AttachmentUploaded {
+        issue_key: String,
+        new_attachment: Attachment,
     },
     Error(anyhow::Error),
 }

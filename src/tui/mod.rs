@@ -25,7 +25,8 @@ use crate::events::{ActionResult, AppEvent};
 use crate::jira::JiraClient;
 use crate::sources::spawn_fetches;
 use crate::tui::app::{
-    ActionState, AppState, AttachmentFetchRequest, cache_path_for, update_state,
+    ActionState, AppState, AttachmentFetchRequest, cache_path_for, compute_completions_for,
+    update_state,
 };
 use crate::tui::render::{RenderOut, render};
 
@@ -270,6 +271,9 @@ fn dispatch_action(
         spawn_cache_attachment(req, false, client.clone(), tx.clone());
     }
 
+    // Debounced path completion fetch
+    spawn_debounced_completions(app, tx);
+
     match app.action_state.clone() {
         ActionState::LoadingTransitions { issue_key } => {
             app.action_state = ActionState::AwaitingAction {
@@ -287,30 +291,13 @@ fn dispatch_action(
             spawn_transition(issue_key, transition_id, client.clone(), tx.clone());
         }
         ActionState::PendingHide { issue_key } => {
-            app.action_state = ActionState::AwaitingAction {
-                description: "Hiding…".into(),
-            };
-            let duration = app.config.hide_for_a_day.duration_hours();
-            hidden.hide_for(&issue_key, duration);
-            hidden.save(hidden_file)?;
-            let _ = tx.send(AppEvent::ActionDone(ActionResult::Hidden { issue_key }));
+            dispatch_pending_hide(app, issue_key, tx, hidden, hidden_file)?;
         }
         ActionState::PendingAssign { issue_key } => {
-            app.action_state = ActionState::AwaitingAction {
-                description: "Assigning…".into(),
-            };
-            let username = app
-                .current_user
-                .clone()
-                .unwrap_or_else(|| "currentUser()".into());
-            spawn_assign(issue_key, username, client.clone(), tx.clone());
+            dispatch_pending_assign(app, issue_key, client, tx);
         }
         ActionState::PendingMove { issue_key } => {
-            app.action_state = ActionState::AwaitingAction {
-                description: "Moving…".into(),
-            };
-            let target = app.config.jira.default_project.clone();
-            spawn_move(issue_key, target, client.clone(), tx.clone());
+            dispatch_pending_move(app, issue_key, client, tx);
         }
         ActionState::LoadingFieldOptions {
             issue_key,
@@ -370,9 +357,111 @@ fn dispatch_action(
                 tx,
             );
         }
+        ActionState::PendingAttachmentUpload {
+            issue_key,
+            file_path,
+        } => {
+            dispatch_pending_attachment_upload(app, issue_key, file_path, client, tx);
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn spawn_debounced_completions(app: &mut AppState, tx: &UnboundedSender<AppEvent>) {
+    if let Some(g) = app.pending_completion_fetch.take()
+        && let ActionState::TypingAttachmentPath { ref path, .. } = app.action_state
+    {
+        let path = path.clone();
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let completions = compute_completions_for(&path);
+            let _ = tx2.send(AppEvent::PathCompletions {
+                generation: g,
+                completions,
+            });
+        });
+    }
+}
+
+fn dispatch_pending_hide(
+    app: &mut AppState,
+    issue_key: String,
+    tx: &UnboundedSender<AppEvent>,
+    hidden: &mut HiddenState,
+    hidden_file: &std::path::PathBuf,
+) -> Result<()> {
+    app.action_state = ActionState::AwaitingAction {
+        description: "Hiding…".into(),
+    };
+    let duration = app.config.hide_for_a_day.duration_hours();
+    hidden.hide_for(&issue_key, duration);
+    hidden.save(hidden_file)?;
+    let _ = tx.send(AppEvent::ActionDone(ActionResult::Hidden { issue_key }));
+    Ok(())
+}
+
+fn dispatch_pending_assign(
+    app: &mut AppState,
+    issue_key: String,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    app.action_state = ActionState::AwaitingAction {
+        description: "Assigning…".into(),
+    };
+    let username = app
+        .current_user
+        .clone()
+        .unwrap_or_else(|| "currentUser()".into());
+    spawn_assign(issue_key, username, client.clone(), tx.clone());
+}
+
+fn dispatch_pending_move(
+    app: &mut AppState,
+    issue_key: String,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    app.action_state = ActionState::AwaitingAction {
+        description: "Moving…".into(),
+    };
+    let target = app.config.jira.default_project.clone();
+    spawn_move(issue_key, target, client.clone(), tx.clone());
+}
+
+fn dispatch_pending_attachment_upload(
+    app: &mut AppState,
+    issue_key: String,
+    file_path: String,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    app.action_state = ActionState::AwaitingAction {
+        description: "Uploading…".into(),
+    };
+    let client2 = client.clone();
+    let tx2 = tx.clone();
+    tokio::spawn(async move {
+        let path = std::path::PathBuf::from(&file_path);
+        match client2.upload_attachment(&issue_key, &path).await {
+            Ok(mut attachments) if !attachments.is_empty() => {
+                let _ = tx2.send(AppEvent::ActionDone(ActionResult::AttachmentUploaded {
+                    issue_key,
+                    new_attachment: attachments.remove(0),
+                }));
+            }
+            Ok(_) => {
+                let _ = tx2.send(AppEvent::ActionDone(ActionResult::Error(anyhow::anyhow!(
+                    "Upload succeeded but Jira returned no attachment data"
+                ))));
+            }
+            Err(e) => {
+                let _ = tx2.send(AppEvent::ActionDone(ActionResult::Error(e)));
+            }
+        }
+    });
 }
 
 fn dispatch_opening_attachment(
@@ -775,35 +864,32 @@ fn maybe_spawn_field_names_fetch(
         return;
     }
 
-    match &app.view_mode {
-        ViewMode::Custom(id) => {
-            let Some(issue) = app.selected_issue() else {
-                return;
-            };
-            let Some(cfg) = app.config.views.get(id.as_str()) else {
-                return;
-            };
-            // Only fetch names for fields that don't have a name override
-            let field_ids: Vec<String> = cfg
-                .sections
-                .iter()
-                .flat_map(|s| s.fields.iter())
-                .filter(|f| f.name.is_none())
-                .map(|f| f.field_id.clone())
-                .collect();
-            if field_ids.is_empty() {
-                return;
-            }
-            let issue_key = issue.key.clone();
-            app.field_names_loading = true;
-            spawn_load_field_names_editmeta(issue_key, field_ids, client.clone(), tx.clone());
+    if let ViewMode::Custom(id) = &app.view_mode {
+        let Some(issue) = app.selected_issue() else {
+            return;
+        };
+        let Some(cfg) = app.config.views.get(id.as_str()) else {
+            return;
+        };
+        // Only fetch names for fields that don't have a name override
+        let field_ids: Vec<String> = cfg
+            .sections
+            .iter()
+            .flat_map(|s| s.fields.iter())
+            .filter(|f| f.name.is_none())
+            .map(|f| f.field_id.clone())
+            .collect();
+        if field_ids.is_empty() {
+            return;
         }
-        _ => {
-            // Default view: use the global field registry to get names for all fields.
-            // This covers readonly fields that don't appear in editmeta.
-            app.field_names_loading = true;
-            spawn_load_all_field_names(client.clone(), tx.clone());
-        }
+        let issue_key = issue.key.clone();
+        app.field_names_loading = true;
+        spawn_load_field_names_editmeta(issue_key, field_ids, client.clone(), tx.clone());
+    } else {
+        // Default view: use the global field registry to get names for all fields.
+        // This covers readonly fields that don't appear in editmeta.
+        app.field_names_loading = true;
+        spawn_load_all_field_names(client.clone(), tx.clone());
     }
 }
 

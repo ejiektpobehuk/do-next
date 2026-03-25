@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::jira::auth::Credentials;
 use crate::jira::types::{
-    Comment, FieldMeta, Issue, SearchResponse, Transition, TransitionsResponse,
+    Attachment, Comment, FieldMeta, Issue, SearchResponse, Transition, TransitionsResponse,
 };
 
 const MAX_RESULTS: u32 = 100;
@@ -166,6 +166,42 @@ impl JiraClient {
         resp.json()
             .await
             .context("Failed to parse comment response")
+    }
+
+    /// Upload a file as an attachment to an issue.
+    pub async fn upload_attachment(
+        &self,
+        issue_key: &str,
+        file_path: &std::path::Path,
+    ) -> Result<Vec<Attachment>> {
+        let url = format!("{}/rest/api/2/issue/{issue_key}/attachments", self.base_url);
+        let filename = file_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let bytes = tokio::fs::read(file_path)
+            .await
+            .context("Failed to read file for upload")?;
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let resp = self
+            .apply_auth(self.client.post(&url))
+            .header("X-Atlassian-Token", "no-check")
+            .multipart(form)
+            .send()
+            .await
+            .context("Failed to upload attachment")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Upload attachment failed {status}: {body}");
+        }
+
+        resp.json()
+            .await
+            .context("Failed to parse upload attachment response")
     }
 
     /// Assign an issue to the given username (use "`currentUser()`" or actual username).

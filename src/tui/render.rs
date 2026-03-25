@@ -151,8 +151,13 @@ fn render_action_overlays(f: &mut Frame, app: &AppState) {
                 &app.action_state,
             );
         }
-        ActionState::InlineEditingField { .. } | ActionState::None => {
-            // Rendered inline within the detail view — no overlay needed
+        ActionState::InlineEditingField { .. }
+        | ActionState::TypingAttachmentPath { .. }
+        | ActionState::None => {
+            // Rendered inline / within overlay — no separate overlay needed
+        }
+        ActionState::PendingAttachmentUpload { .. } => {
+            overlays::await_spinner::render_await(f, "Uploading…", app.tick_count);
         }
         ActionState::Error(msg) => {
             render_error_overlay(f, &msg.to_string());

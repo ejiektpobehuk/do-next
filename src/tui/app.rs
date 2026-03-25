@@ -196,6 +196,20 @@ pub enum ActionState {
         issue_key: String,
         comment_id: String,
     },
+    /// User is typing a file path to upload as a new attachment.
+    TypingAttachmentPath {
+        issue_key: String,
+        path: String,
+        cursor: usize,
+        completions: Vec<String>,
+        completion_idx: Option<usize>,
+        completion_generation: u64,
+    },
+    /// File path confirmed; ready to upload.
+    PendingAttachmentUpload {
+        issue_key: String,
+        file_path: String,
+    },
     /// Fetching and caching an attachment, then opening with system default app.
     OpeningAttachment {
         attachment_id: String,
@@ -279,6 +293,8 @@ pub struct AppState {
     pub attachment_fetching_id: Option<String>,
     /// Pending silent background fetch (set by nav handlers, consumed by `dispatch_action`).
     pub pending_attachment_fetch: Option<AttachmentFetchRequest>,
+    /// Pending path completion fetch generation (set by key handler, consumed by `dispatch_action`).
+    pub pending_completion_fetch: Option<u64>,
     /// Terminal image protocol picker (created once at startup).
     pub image_picker: Option<ratatui_image::picker::Picker>,
 }
@@ -332,6 +348,7 @@ impl AppState {
             attachment_images: HashMap::new(),
             attachment_fetching_id: None,
             pending_attachment_fetch: None,
+            pending_completion_fetch: None,
             image_picker: None,
         }
     }
@@ -510,6 +527,23 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
         AppEvent::Input(event) => {
             handle_input(app, event);
         }
+
+        AppEvent::PathCompletions {
+            generation,
+            completions,
+        } => {
+            if let ActionState::TypingAttachmentPath {
+                ref completion_generation,
+                completions: ref mut c,
+                ref mut completion_idx,
+                ..
+            } = app.action_state
+                && generation == *completion_generation
+            {
+                *c = completions;
+                *completion_idx = None;
+            }
+        }
     }
 }
 
@@ -527,10 +561,7 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             ref issue_key,
             ref new_status,
         } => {
-            if let Some(issue) = app.issues.iter_mut().find(|i| &i.key == issue_key) {
-                issue.fields.status.name.clone_from(new_status);
-            }
-            app.action_state = ActionState::None;
+            apply_transition_applied(app, issue_key, new_status);
         }
         ActionResult::TransitionsLoaded {
             issue_key,
@@ -550,10 +581,7 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             ref issue_key,
             ref project,
         } => {
-            if let Some(issue) = app.issues.iter_mut().find(|i| &i.key == issue_key) {
-                issue.fields.project.key.clone_from(project);
-            }
-            app.action_state = ActionState::None;
+            apply_moved_to_project(app, issue_key, project);
         }
         ActionResult::CommentPosted {
             issue_key,
@@ -613,7 +641,42 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
         } => {
             handle_attachment_cached(app, attachment_id, cache_path.as_path(), open_after);
         }
+        ActionResult::AttachmentUploaded {
+            issue_key,
+            new_attachment,
+        } => {
+            apply_attachment_uploaded(app, &issue_key, new_attachment);
+        }
     }
+}
+
+fn apply_transition_applied(app: &mut AppState, issue_key: &str, new_status: &str) {
+    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key) {
+        issue.fields.status.name = new_status.to_string();
+    }
+    app.action_state = ActionState::None;
+}
+
+fn apply_moved_to_project(app: &mut AppState, issue_key: &str, project: &str) {
+    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key) {
+        issue.fields.project.key = project.to_string();
+    }
+    app.action_state = ActionState::None;
+}
+
+fn apply_attachment_uploaded(
+    app: &mut AppState,
+    issue_key: &str,
+    new_attachment: crate::jira::types::Attachment,
+) {
+    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key) {
+        issue
+            .fields
+            .attachment
+            .get_or_insert_with(Vec::new)
+            .push(new_attachment);
+    }
+    app.action_state = ActionState::None;
 }
 
 fn handle_attachment_cached(
@@ -784,6 +847,106 @@ fn field_options_to_state(
     }
 }
 
+fn handle_attachment_path_input(app: &mut AppState, code: crossterm::event::KeyCode) -> bool {
+    use crossterm::event::KeyCode;
+    let mut pending_gen: Option<u64> = None;
+
+    if let ActionState::TypingAttachmentPath {
+        ref mut path,
+        ref mut cursor,
+        ref issue_key,
+        ref mut completions,
+        ref mut completion_idx,
+        ref mut completion_generation,
+    } = app.action_state
+    {
+        match code {
+            KeyCode::Esc => {
+                if completions.is_empty() {
+                    app.action_state = ActionState::None;
+                } else {
+                    *completions = vec![];
+                    *completion_idx = None;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(idx) = *completion_idx {
+                    if let Some(comp) = completions.get(idx).cloned() {
+                        let is_dir = comp.ends_with('/');
+                        path.clone_from(&comp);
+                        *cursor = comp.chars().count();
+                        *completions = vec![];
+                        *completion_idx = None;
+                        if is_dir {
+                            *completion_generation += 1;
+                            pending_gen = Some(*completion_generation);
+                        } else {
+                            let ik = issue_key.clone();
+                            app.action_state = ActionState::PendingAttachmentUpload {
+                                issue_key: ik,
+                                file_path: comp,
+                            };
+                        }
+                    }
+                } else if !path.is_empty() {
+                    let ik = issue_key.clone();
+                    let fp = path.clone();
+                    app.action_state = ActionState::PendingAttachmentUpload {
+                        issue_key: ik,
+                        file_path: fp,
+                    };
+                }
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                if !completions.is_empty() {
+                    let n = completions.len();
+                    *completion_idx = Some(completion_idx.map_or(0, |i| (i + 1) % n));
+                }
+            }
+            KeyCode::Up => {
+                if !completions.is_empty() {
+                    let n = completions.len();
+                    *completion_idx = Some(match *completion_idx {
+                        None | Some(0) => n - 1,
+                        Some(i) => i - 1,
+                    });
+                }
+            }
+            KeyCode::Backspace => {
+                if *cursor > 0 {
+                    let mut chars: Vec<char> = path.chars().collect();
+                    chars.remove(*cursor - 1);
+                    *path = chars.into_iter().collect();
+                    *cursor -= 1;
+                }
+                *completions = vec![];
+                *completion_idx = None;
+                *completion_generation += 1;
+                pending_gen = Some(*completion_generation);
+            }
+            KeyCode::Char(c) => {
+                let mut chars: Vec<char> = path.chars().collect();
+                chars.insert(*cursor, c);
+                *path = chars.into_iter().collect();
+                *cursor += 1;
+                *completions = vec![];
+                *completion_idx = None;
+                *completion_generation += 1;
+                pending_gen = Some(*completion_generation);
+            }
+            _ => {}
+        }
+        // borrow of app.action_state ends here
+    } else {
+        return false;
+    }
+
+    if let Some(g) = pending_gen {
+        app.pending_completion_fetch = Some(g);
+    }
+    true
+}
+
 fn handle_overlay_input(app: &mut AppState, event: &crossterm::event::Event) {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     let Event::Key(KeyEvent {
@@ -792,6 +955,11 @@ fn handle_overlay_input(app: &mut AppState, event: &crossterm::event::Event) {
     else {
         return;
     };
+
+    // Intercept all input while typing an attachment path
+    if handle_attachment_path_input(app, code) {
+        return;
+    }
 
     // Sub-modal: comment delete confirmation
     if handle_comment_delete_confirm_input(app, code, modifiers) {
@@ -852,6 +1020,18 @@ fn handle_overlay_input(app: &mut AppState, event: &crossterm::event::Event) {
         }
         (KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter, _) if is_attachments => {
             trigger_attachment_open(app);
+        }
+        (KeyCode::Char('n'), _) if is_attachments => {
+            if let Some(issue) = app.selected_issue() {
+                app.action_state = ActionState::TypingAttachmentPath {
+                    issue_key: issue.key.clone(),
+                    path: String::new(),
+                    cursor: 0,
+                    completions: vec![],
+                    completion_idx: None,
+                    completion_generation: 0,
+                };
+            }
         }
         _ => {}
     }
@@ -1244,8 +1424,10 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
         | ActionState::DeletingComment { .. }
         | ActionState::ConfirmingCommentEdit { .. }
         | ActionState::ConfirmingCommentDelete { .. }
-        | ActionState::OpeningAttachment { .. } => {
-            // Ignore input while waiting
+        | ActionState::OpeningAttachment { .. }
+        | ActionState::PendingAttachmentUpload { .. }
+        | ActionState::TypingAttachmentPath { .. } => {
+            // Ignore input while waiting / handled by overlay
             return;
         }
         ActionState::None => {}
@@ -1348,8 +1530,7 @@ fn key_nav_down(app: &mut AppState) {
         && matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
     {
         let view_cfg = crate::tui::views::custom::current_view_config(app);
-        let num_fields =
-            crate::tui::views::custom::num_view_fields(view_cfg, app.selected_issue());
+        let num_fields = crate::tui::views::custom::num_view_fields(view_cfg, app.selected_issue());
         app.detail_focus = match &app.detail_focus {
             DetailFocus::Comments => DetailFocus::Attachments,
             DetailFocus::Attachments => {
@@ -1550,7 +1731,10 @@ fn key_edit_detail_field(app: &mut AppState) {
     let description = field_cfg.as_ref().and_then(|f| f.hint.clone());
 
     // `use_editor: true` always opens $EDITOR regardless of field type
-    let use_editor = field_cfg.as_ref().and_then(|f| f.use_editor).unwrap_or(false);
+    let use_editor = field_cfg
+        .as_ref()
+        .and_then(|f| f.use_editor)
+        .unwrap_or(false);
 
     // Datetime picker: triggered by `datetime: true` config flag or editmeta schema type
     if !use_editor {
@@ -1587,7 +1771,15 @@ fn key_edit_detail_field(app: &mut AppState) {
         return;
     }
 
-    set_detail_edit_state(app, issue.key, field_id, field_idx, label, description, original_json);
+    set_detail_edit_state(
+        app,
+        issue.key,
+        field_id,
+        field_idx,
+        label,
+        description,
+        original_json,
+    );
 }
 
 fn set_detail_edit_state(
@@ -2103,4 +2295,70 @@ fn shape_array_value(
         .collect();
 
     serde_json::Value::Array(items)
+}
+
+/// Compute filesystem path completions for the given partial path.
+/// Expands a leading `~/` (or bare `~`) to the home directory.
+/// Returns full absolute paths; directories are suffixed with `/`.
+/// Results are sorted: directories first, then files, each group alphabetically.
+pub fn compute_completions_for(path: &str) -> Vec<String> {
+    // Tilde expansion
+    let expanded: String = path.strip_prefix("~/").map_or_else(
+        || {
+            if path == "~" {
+                dirs::home_dir()
+                    .map_or_else(|| path.to_string(), |h| h.to_string_lossy().to_string())
+            } else {
+                path.to_string()
+            }
+        },
+        |rest| {
+            dirs::home_dir().map_or_else(|| path.to_string(), |h| format!("{}/{rest}", h.display()))
+        },
+    );
+
+    // Split at last '/' to get (dir_part, prefix)
+    let (dir_str, prefix): (String, String) = if expanded.ends_with('/') {
+        let d = expanded.trim_end_matches('/');
+        let d = if d.is_empty() { "/" } else { d };
+        (d.to_string(), String::new())
+    } else if let Some(pos) = expanded.rfind('/') {
+        let d = &expanded[..pos];
+        let d = if d.is_empty() { "/" } else { d };
+        (d.to_string(), expanded[pos + 1..].to_string())
+    } else {
+        (".".to_string(), expanded)
+    };
+
+    let dir_path = std::path::Path::new(&dir_str);
+    let Ok(entries) = std::fs::read_dir(dir_path) else {
+        return vec![];
+    };
+
+    let mut dirs_vec: Vec<String> = vec![];
+    let mut files_vec: Vec<String> = vec![];
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !file_name.starts_with(prefix.as_str()) {
+            continue;
+        }
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        let full_path = dir_path.join(&file_name);
+        let full = if is_dir {
+            format!("{}/", full_path.display())
+        } else {
+            full_path.display().to_string()
+        };
+        if is_dir {
+            dirs_vec.push(full);
+        } else {
+            files_vec.push(full);
+        }
+    }
+
+    dirs_vec.sort();
+    files_vec.sort();
+    dirs_vec.extend(files_vec);
+    dirs_vec
 }
