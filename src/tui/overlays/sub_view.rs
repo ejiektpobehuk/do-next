@@ -49,7 +49,9 @@ pub fn render_sub_view_overlay(f: &mut Frame, app: &AppState, render_out: &mut R
         Line::from(vec![
             Span::raw("┤ ("),
             Span::styled("n", Style::default().fg(Color::Blue)),
-            Span::raw(")ew | "),
+            Span::raw(")ew ("),
+            Span::styled("d", Style::default().fg(Color::Blue)),
+            Span::raw(")el | "),
             Span::styled("↕", Style::default().fg(Color::Blue)),
             Span::styled("→", Style::default().fg(Color::Green)),
             Span::raw(" | "),

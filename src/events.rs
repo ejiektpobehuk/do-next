@@ -85,5 +85,9 @@ pub enum ActionResult {
         issue_key: String,
         new_attachment: Attachment,
     },
+    AttachmentDeleted {
+        issue_key: String,
+        attachment_id: String,
+    },
     Error(anyhow::Error),
 }

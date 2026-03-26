@@ -196,6 +196,18 @@ pub enum ActionState {
         issue_key: String,
         comment_id: String,
     },
+    /// Yes/No popup confirming attachment deletion. `selected` 0=Yes 1=No.
+    ConfirmingAttachmentDelete {
+        issue_key: String,
+        attachment_id: String,
+        /// Default 1 (No) for safety.
+        selected: usize,
+    },
+    /// Sending attachment delete to Jira.
+    DeletingAttachment {
+        issue_key: String,
+        attachment_id: String,
+    },
     /// User is typing a file path to upload as a new attachment.
     TypingAttachmentPath {
         issue_key: String,
@@ -567,11 +579,7 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             issue_key,
             transitions,
         } => {
-            app.action_state = ActionState::SelectingTransition {
-                issue_key,
-                transitions,
-                selected: 0,
-            };
+            apply_transitions_loaded(app, issue_key, transitions);
         }
         ActionResult::AssignedToMe { ref issue_key } => {
             apply_assigned_to_me(app, issue_key);
@@ -616,9 +624,7 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             );
         }
         ActionResult::FieldNamesLoaded { names, schemas } => {
-            app.field_names.extend(names);
-            app.field_schemas.extend(schemas);
-            app.field_names_loading = false;
+            apply_field_names_loaded(app, names, schemas);
         }
         ActionResult::CommentEdited {
             issue_key,
@@ -634,6 +640,10 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             apply_comment_deleted(app, &issue_key, &comment_id);
             app.action_state = ActionState::None;
         }
+        ActionResult::AttachmentDeleted {
+            issue_key,
+            attachment_id,
+        } => apply_attachment_deleted(app, &issue_key, &attachment_id),
         ActionResult::AttachmentCached {
             attachment_id,
             cache_path,
@@ -648,6 +658,28 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             apply_attachment_uploaded(app, &issue_key, new_attachment);
         }
     }
+}
+
+fn apply_transitions_loaded(
+    app: &mut AppState,
+    issue_key: String,
+    transitions: Vec<crate::jira::types::Transition>,
+) {
+    app.action_state = ActionState::SelectingTransition {
+        issue_key,
+        transitions,
+        selected: 0,
+    };
+}
+
+fn apply_field_names_loaded(
+    app: &mut AppState,
+    names: HashMap<String, String>,
+    schemas: HashMap<String, String>,
+) {
+    app.field_names.extend(names);
+    app.field_schemas.extend(schemas);
+    app.field_names_loading = false;
 }
 
 fn apply_transition_applied(app: &mut AppState, issue_key: &str, new_status: &str) {
@@ -785,6 +817,25 @@ fn apply_comment_deleted(app: &mut AppState, issue_key: &str, comment_id: &str) 
     } else if comment_count == 0 {
         app.overlay_focused_comment = 0;
     }
+}
+
+fn apply_attachment_deleted(app: &mut AppState, issue_key: &str, attachment_id: &str) {
+    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key)
+        && let Some(ref mut atts) = issue.fields.attachment
+    {
+        atts.retain(|a| a.id != attachment_id);
+    }
+    // Clamp focused attachment index
+    let att_count = app
+        .selected_issue()
+        .and_then(|i| i.fields.attachment.as_deref())
+        .map_or(0, <[_]>::len);
+    if app.overlay_focused_attachment >= att_count && att_count > 0 {
+        app.overlay_focused_attachment = att_count - 1;
+    } else if att_count == 0 {
+        app.overlay_focused_attachment = 0;
+    }
+    app.action_state = ActionState::None;
 }
 
 fn field_options_to_state(
@@ -966,6 +1017,11 @@ fn handle_overlay_input(app: &mut AppState, event: &crossterm::event::Event) {
         return;
     }
 
+    // Sub-modal: attachment delete confirmation
+    if handle_attachment_delete_confirm_input(app, code, modifiers) {
+        return;
+    }
+
     // Sub-modal: comment edit confirmation/diff
     if handle_comment_edit_confirm_input(app, code, modifiers) {
         return;
@@ -1021,6 +1077,9 @@ fn handle_overlay_input(app: &mut AppState, event: &crossterm::event::Event) {
         (KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter, _) if is_attachments => {
             trigger_attachment_open(app);
         }
+        (KeyCode::Char('d'), _) if is_attachments => {
+            start_attachment_delete(app);
+        }
         (KeyCode::Char('n'), _) if is_attachments => {
             if let Some(issue) = app.selected_issue() {
                 app.action_state = ActionState::TypingAttachmentPath {
@@ -1073,6 +1132,49 @@ fn handle_comment_delete_confirm_input(
                 app.action_state = ActionState::DeletingComment {
                     issue_key: issue_key.clone(),
                     comment_id: comment_id.clone(),
+                };
+            } else {
+                app.action_state = ActionState::None;
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn handle_attachment_delete_confirm_input(
+    app: &mut AppState,
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ActionState::ConfirmingAttachmentDelete {
+        issue_key,
+        attachment_id,
+        selected,
+    } = &app.action_state.clone()
+    else {
+        return false;
+    };
+    match (code, modifiers) {
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        (KeyCode::Esc | KeyCode::Char('q'), _) => {
+            app.action_state = ActionState::None;
+        }
+        (KeyCode::Left | KeyCode::Char('h' | 'l') | KeyCode::Right | KeyCode::Tab, _) => {
+            app.action_state = ActionState::ConfirmingAttachmentDelete {
+                issue_key: issue_key.clone(),
+                attachment_id: attachment_id.clone(),
+                selected: 1 - selected,
+            };
+        }
+        (KeyCode::Enter, _) => {
+            if *selected == 0 {
+                app.action_state = ActionState::DeletingAttachment {
+                    issue_key: issue_key.clone(),
+                    attachment_id: attachment_id.clone(),
                 };
             } else {
                 app.action_state = ActionState::None;
@@ -1357,6 +1459,21 @@ fn start_comment_delete(app: &mut AppState) {
     };
 }
 
+fn start_attachment_delete(app: &mut AppState) {
+    let Some(issue) = app.selected_issue() else {
+        return;
+    };
+    let attachments = issue.fields.attachment.as_deref().unwrap_or(&[]);
+    let Some(att) = attachments.get(app.overlay_focused_attachment) else {
+        return;
+    };
+    app.action_state = ActionState::ConfirmingAttachmentDelete {
+        issue_key: issue.key.clone(),
+        attachment_id: att.id.clone(),
+        selected: 1, // default to No
+    };
+}
+
 fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
     use crossterm::event::{Event, KeyEvent};
 
@@ -1424,6 +1541,8 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
         | ActionState::DeletingComment { .. }
         | ActionState::ConfirmingCommentEdit { .. }
         | ActionState::ConfirmingCommentDelete { .. }
+        | ActionState::ConfirmingAttachmentDelete { .. }
+        | ActionState::DeletingAttachment { .. }
         | ActionState::OpeningAttachment { .. }
         | ActionState::PendingAttachmentUpload { .. }
         | ActionState::TypingAttachmentPath { .. } => {

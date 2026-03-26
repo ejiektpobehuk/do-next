@@ -266,13 +266,7 @@ fn dispatch_action(
     hidden_file: &std::path::PathBuf,
     _project_override: bool,
 ) -> Result<()> {
-    // Silent background attachment fetch (not ActionState-driven)
-    if let Some(req) = app.pending_attachment_fetch.take() {
-        spawn_cache_attachment(req, false, client.clone(), tx.clone());
-    }
-
-    // Debounced path completion fetch
-    spawn_debounced_completions(app, tx);
+    dispatch_background_tasks(app, client, tx);
 
     match app.action_state.clone() {
         ActionState::LoadingTransitions { issue_key } => {
@@ -341,6 +335,12 @@ fn dispatch_action(
         } => {
             dispatch_deleting_comment(app, issue_key, comment_id, client, tx);
         }
+        ActionState::DeletingAttachment {
+            issue_key,
+            attachment_id,
+        } => {
+            dispatch_deleting_attachment(app, issue_key, attachment_id, client, tx);
+        }
         ActionState::OpeningAttachment {
             attachment_id,
             content_url,
@@ -366,6 +366,20 @@ fn dispatch_action(
         _ => {}
     }
     Ok(())
+}
+
+fn dispatch_background_tasks(
+    app: &mut AppState,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    // Silent background attachment fetch (not ActionState-driven)
+    if let Some(req) = app.pending_attachment_fetch.take() {
+        spawn_cache_attachment(req, false, client.clone(), tx.clone());
+    }
+
+    // Debounced path completion fetch
+    spawn_debounced_completions(app, tx);
 }
 
 fn spawn_debounced_completions(app: &mut AppState, tx: &UnboundedSender<AppEvent>) {
@@ -796,6 +810,40 @@ fn spawn_delete_comment(
                 let _ = tx.send(AppEvent::ActionDone(ActionResult::CommentDeleted {
                     issue_key,
                     comment_id,
+                }));
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::Error(e)));
+            }
+        }
+    });
+}
+
+fn dispatch_deleting_attachment(
+    app: &mut AppState,
+    issue_key: String,
+    attachment_id: String,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    app.action_state = ActionState::AwaitingAction {
+        description: "Deleting attachment…".into(),
+    };
+    spawn_delete_attachment(issue_key, attachment_id, client.clone(), tx.clone());
+}
+
+fn spawn_delete_attachment(
+    issue_key: String,
+    attachment_id: String,
+    client: JiraClient,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match client.delete_attachment(&attachment_id).await {
+            Ok(()) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::AttachmentDeleted {
+                    issue_key,
+                    attachment_id,
                 }));
             }
             Err(e) => {

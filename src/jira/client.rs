@@ -508,6 +508,22 @@ impl JiraClient {
         Ok(())
     }
 
+    /// Delete an attachment by its ID.
+    pub async fn delete_attachment(&self, attachment_id: &str) -> Result<()> {
+        let url = format!("{}/rest/api/2/attachment/{attachment_id}", self.base_url);
+        let resp = self
+            .apply_auth(self.client.delete(&url))
+            .send()
+            .await
+            .context("Failed to delete attachment")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Delete attachment failed {status}: {body}");
+        }
+        Ok(())
+    }
+
     /// Download the raw bytes of an attachment by its content URL.
     pub async fn download_attachment(&self, url: &str) -> Result<Vec<u8>> {
         let resp = self

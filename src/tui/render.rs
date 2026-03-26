@@ -124,6 +124,9 @@ fn render_action_overlays(f: &mut Frame, app: &AppState) {
         ActionState::DeletingComment { .. } => {
             overlays::await_spinner::render_await(f, "Deleting comment…", app.tick_count);
         }
+        ActionState::DeletingAttachment { .. } => {
+            overlays::await_spinner::render_await(f, "Deleting attachment…", app.tick_count);
+        }
         ActionState::OpeningAttachment { .. } => {
             overlays::await_spinner::render_await(f, "Fetching attachment…", app.tick_count);
         }
@@ -145,10 +148,18 @@ fn render_action_overlays(f: &mut Frame, app: &AppState) {
                 &app.action_state,
             );
         }
-        ActionState::ConfirmingCommentDelete { .. } => {
-            overlays::comment_delete_confirm::render_comment_delete_confirm_overlay(
+        ActionState::ConfirmingCommentDelete { selected, .. } => {
+            overlays::delete_confirm::render_delete_confirm_overlay(
                 f,
-                &app.action_state,
+                " Delete comment? ",
+                *selected,
+            );
+        }
+        ActionState::ConfirmingAttachmentDelete { selected, .. } => {
+            overlays::delete_confirm::render_delete_confirm_overlay(
+                f,
+                " Delete attachment? ",
+                *selected,
             );
         }
         ActionState::InlineEditingField { .. }
