@@ -32,33 +32,70 @@ pub fn render_sub_view_overlay(f: &mut Frame, app: &AppState, render_out: &mut R
     };
     let title = format!(" {} — {label} ", issue.key);
 
+    let has_items = match sub_view {
+        SubView::Comments => issue
+            .fields
+            .comment
+            .as_ref()
+            .is_some_and(|c| !c.comments.is_empty()),
+        SubView::Attachments => issue
+            .fields
+            .attachment
+            .as_deref()
+            .is_some_and(|a| !a.is_empty()),
+    };
+    // Returns spans for a "(k)ey" style hint.
+    // Active: only the letter is coloured; inactive: the whole hint is DarkGray.
+    let key_hint = |key: &'static str, rest: &'static str, active: bool| -> Vec<Span<'static>> {
+        if active {
+            vec![
+                Span::raw("("),
+                Span::styled(key, Style::default().fg(Color::Blue)),
+                Span::raw(format!("){rest}")),
+            ]
+        } else {
+            vec![Span::styled(
+                format!("({key}){rest}"),
+                Style::default().fg(Color::DarkGray),
+            )]
+        }
+    };
+
     let back_hint = if matches!(sub_view, SubView::Comments) {
-        Line::from(vec![
-            Span::raw("┤ ("),
-            Span::styled("n", Style::default().fg(Color::Blue)),
-            Span::raw(")ew | ("),
-            Span::styled("e", Style::default().fg(Color::Blue)),
-            Span::raw(")dit | ("),
-            Span::styled("d", Style::default().fg(Color::Blue)),
-            Span::raw(")el | "),
-            Span::styled("q", Style::default().fg(Color::Magenta)),
-            Span::raw(" ├──"),
-        ])
-        .alignment(Alignment::Right)
+        let mut spans = vec![Span::raw("┤ ")];
+        spans.extend(key_hint("n", "ew", true));
+        spans.push(Span::raw(" | "));
+        spans.extend(key_hint("e", "dit", has_items));
+        spans.push(Span::raw(" | "));
+        spans.extend(key_hint("d", "el", has_items));
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled("q", Style::default().fg(Color::Magenta)));
+        spans.push(Span::raw(" ├──"));
+        Line::from(spans).alignment(Alignment::Right)
     } else {
-        Line::from(vec![
-            Span::raw("┤ ("),
-            Span::styled("n", Style::default().fg(Color::Blue)),
-            Span::raw(")ew ("),
-            Span::styled("d", Style::default().fg(Color::Blue)),
-            Span::raw(")el | "),
-            Span::styled("↕", Style::default().fg(Color::Blue)),
-            Span::styled("→", Style::default().fg(Color::Green)),
-            Span::raw(" | "),
-            Span::styled("q", Style::default().fg(Color::Magenta)),
-            Span::raw(" ├──"),
-        ])
-        .alignment(Alignment::Right)
+        let nav_color = if has_items {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
+        let mut spans = vec![Span::raw("┤ ")];
+        spans.extend(key_hint("n", "ew", true));
+        spans.push(Span::raw(" | "));
+        spans.extend(key_hint("d", "el", has_items));
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(
+            "↕",
+            Style::default().fg(if has_items {
+                Color::Blue
+            } else {
+                Color::DarkGray
+            }),
+        ));
+        spans.push(Span::styled("→", Style::default().fg(nav_color)));
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled("q", Style::default().fg(Color::Magenta)));
+        spans.push(Span::raw(" ├──"));
+        Line::from(spans).alignment(Alignment::Right)
     };
 
     let block = Block::default()
