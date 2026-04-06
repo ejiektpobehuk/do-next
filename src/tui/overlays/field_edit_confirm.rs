@@ -142,12 +142,12 @@ fn diff_lines<'a>(old: &'a str, new: &'a str) -> Vec<DiffLine<'a>> {
             result.push(DiffLine::Same(old_lines[i]));
             i += 1;
             j += 1;
-        } else if j < n && (i >= m || dp[i + 1][j] >= dp[i][j + 1]) {
-            result.push(DiffLine::Added(new_lines[j]));
-            j += 1;
-        } else {
+        } else if i < m && (j >= n || dp[i + 1][j] >= dp[i][j + 1]) {
             result.push(DiffLine::Removed(old_lines[i]));
             i += 1;
+        } else {
+            result.push(DiffLine::Added(new_lines[j]));
+            j += 1;
         }
     }
     result
