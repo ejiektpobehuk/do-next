@@ -9,6 +9,7 @@ use ratatui::{
 use crate::jira::adf::json_to_text;
 use crate::jira::types::Issue;
 use crate::tui::app::AppState;
+use crate::tui::markdown::markdown_to_lines;
 
 pub fn render_comments(f: &mut Frame, area: Rect, issue: &Issue, app: &AppState) -> usize {
     let mut lines: Vec<Line> = Vec::new();
@@ -28,8 +29,9 @@ pub fn render_comments(f: &mut Frame, area: Rect, issue: &Issue, app: &AppState)
                     format!("{author} · {date}"),
                     Style::default().add_modifier(Modifier::BOLD),
                 )));
-                for body_line in json_to_text(&comment.body).lines() {
-                    lines.push(Line::from(format!("  {body_line}")));
+                for mut line in markdown_to_lines(&json_to_text(&comment.body)) {
+                    line.spans.insert(0, Span::raw("  "));
+                    lines.push(line);
                 }
                 lines.push(Line::from(""));
             }

@@ -2,6 +2,7 @@ pub mod app;
 pub mod detail;
 pub mod hint_bar;
 pub mod list;
+pub mod markdown;
 pub mod onboarding;
 pub mod overlays;
 pub mod render;

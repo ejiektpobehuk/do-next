@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 
 use crate::jira::adf::json_to_text;
 use crate::jira::types::{Attachment, Comment, Issue};
+use crate::tui::markdown::markdown_to_lines;
 use crate::tui::app::{ActionState, AppState, SubView};
 use crate::tui::render::RenderOut;
 
@@ -566,8 +567,9 @@ fn render_comment_widget(f: &mut Frame, area: Rect, comment: &Comment, focused: 
     }
 
     let body_text = json_to_text(&comment.body);
+    let styled_lines = markdown_to_lines(&body_text);
     f.render_widget(
-        Paragraph::new(body_text).wrap(Wrap { trim: false }),
+        Paragraph::new(styled_lines).wrap(Wrap { trim: false }),
         block_inner,
     );
 }

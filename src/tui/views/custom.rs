@@ -25,6 +25,7 @@ const CORNERS_ONLY: BorderSet = BorderSet {
 use crate::config::types::{CustomViewConfig, CustomViewFieldConfig};
 use crate::jira::types::Issue;
 use crate::tui::app::{ActionState, AppState, DetailFocus};
+use crate::tui::markdown::markdown_to_lines;
 use crate::tui::render::RenderOut;
 
 // ── Segment model ─────────────────────────────────────────────────────────────
@@ -48,6 +49,8 @@ enum Segment {
         field_idx: usize,
         /// If true, Enter opens a browser link (if URL) but never opens editing.
         readonly: bool,
+        /// If true, content is markdown and should be rendered with styling.
+        is_markdown: bool,
     },
 }
 
@@ -284,7 +287,7 @@ fn render_editable_field(
         field_idx,
         content,
         readonly,
-        ..
+        is_markdown,
     } = seg
     else {
         return;
@@ -332,6 +335,13 @@ fn render_editable_field(
                 let line = inline_cursor_line(input, cursor);
                 f.render_widget(Paragraph::new(line).scroll((inner_scroll, 0)), inner);
             }
+        } else if *is_markdown {
+            f.render_widget(
+                Paragraph::new(markdown_to_lines(content))
+                    .wrap(Wrap { trim: false })
+                    .scroll((inner_scroll, 0)),
+                inner,
+            );
         } else {
             f.render_widget(
                 Paragraph::new(content.as_str())
@@ -421,11 +431,17 @@ fn build_custom_segments(
             let label = resolve_field_label(field, field_names);
             let content = get_field_content(issue, field, tz);
             let readonly = field.readonly.unwrap_or(false);
+            let is_markdown = issue
+                .fields
+                .extra
+                .get(&field.field_id)
+                .is_some_and(is_adf);
             segs.push(Segment::EditableField {
                 label,
                 content,
                 field_idx: field_flat_idx,
                 readonly,
+                is_markdown,
             });
             field_flat_idx += 1;
         }
@@ -474,11 +490,7 @@ fn build_default_segments(
                     Line::from(""),
                 ],
             });
-            let desc_lines: Vec<Line<'static>> = text
-                .replace('\r', "")
-                .lines()
-                .map(|l| Line::from(l.to_string()))
-                .collect();
+            let desc_lines = markdown_to_lines(&text.replace('\r', ""));
             segs.push(Segment::ReadOnly { lines: desc_lines });
         }
     }
@@ -502,6 +514,7 @@ fn build_default_segments(
                 content,
                 field_idx,
                 readonly: false,
+                is_markdown: is_adf(value),
             });
         }
     }
@@ -709,6 +722,11 @@ fn parse_field_dt(issue: &Issue, field_id: Option<&str>) -> Option<DateTime<Fixe
         return None;
     }
     v.as_str().and_then(parse_dt)
+}
+
+/// Check if a JSON value is an ADF document (whose text representation is markdown).
+fn is_adf(v: &serde_json::Value) -> bool {
+    v.get("type").and_then(|t| t.as_str()) == Some("doc")
 }
 
 pub fn val_to_str(v: &serde_json::Value) -> String {

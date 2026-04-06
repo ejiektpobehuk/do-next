@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::tui::app::ActionState;
+use crate::tui::markdown::markdown_to_lines;
 
 pub fn render_comment_edit_confirm_overlay(f: &mut Frame, app_action: &ActionState) {
     let ActionState::ConfirmingCommentEdit {
@@ -84,7 +85,8 @@ pub fn render_comment_edit_confirm_overlay(f: &mut Frame, app_action: &ActionSta
 }
 
 fn render_preview(f: &mut Frame, area: Rect, new_text: &str) {
-    f.render_widget(Paragraph::new(new_text).wrap(Wrap { trim: false }), area);
+    let lines = markdown_to_lines(new_text);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_diff(f: &mut Frame, area: Rect, old_text: &str, new_text: &str) {
