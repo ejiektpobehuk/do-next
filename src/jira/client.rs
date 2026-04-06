@@ -31,10 +31,7 @@ impl JiraClient {
     }
 
     fn apply_auth(&self, req: RequestBuilder) -> RequestBuilder {
-        match &self.credentials {
-            Credentials::Token(token) => req.bearer_auth(token),
-            Credentials::Basic { username, password } => req.basic_auth(username, Some(password)),
-        }
+        req.basic_auth(&self.credentials.email, Some(&self.credentials.api_token))
     }
 
     /// Fetch all issues matching a JQL query, paginating automatically.
@@ -43,7 +40,7 @@ impl JiraClient {
         let mut start_at = 0u32;
 
         loop {
-            let url = format!("{}/rest/api/2/search", self.base_url);
+            let url = format!("{}/rest/api/3/search/jql", self.base_url);
             log::debug!("JQL request: startAt={start_at} jql={jql}");
             let resp = self
                 .apply_auth(self.client.get(&url))
@@ -79,9 +76,10 @@ impl JiraClient {
                 .await
                 .context("Failed to parse search response")?;
             let fetched = u32::try_from(page.issues.len()).unwrap_or(0);
+            let is_last = page.is_last;
             all_issues.extend(page.issues);
 
-            if start_at + fetched >= page.total || fetched == 0 {
+            if is_last || fetched == 0 {
                 break;
             }
             start_at += fetched;
@@ -92,7 +90,7 @@ impl JiraClient {
 
     /// Fetch a single issue by key.
     pub async fn get_issue(&self, key: &str) -> Result<Issue> {
-        let url = format!("{}/rest/api/2/issue/{key}", self.base_url);
+        let url = format!("{}/rest/api/3/issue/{key}", self.base_url);
         let resp = self
             .apply_auth(self.client.get(&url))
             .send()
@@ -110,7 +108,7 @@ impl JiraClient {
 
     /// Get available transitions for an issue.
     pub async fn get_transitions(&self, key: &str) -> Result<Vec<Transition>> {
-        let url = format!("{}/rest/api/2/issue/{key}/transitions", self.base_url);
+        let url = format!("{}/rest/api/3/issue/{key}/transitions", self.base_url);
         let resp = self
             .apply_auth(self.client.get(&url))
             .send()
@@ -129,7 +127,7 @@ impl JiraClient {
 
     /// Apply a transition to an issue.
     pub async fn post_transition(&self, key: &str, transition_id: &str) -> Result<()> {
-        let url = format!("{}/rest/api/2/issue/{key}/transitions", self.base_url);
+        let url = format!("{}/rest/api/3/issue/{key}/transitions", self.base_url);
         let body = json!({ "transition": { "id": transition_id } });
         let resp = self
             .apply_auth(self.client.post(&url))
@@ -148,8 +146,8 @@ impl JiraClient {
 
     /// Post a comment on an issue.
     pub async fn post_comment(&self, key: &str, body_text: &str) -> Result<Comment> {
-        let url = format!("{}/rest/api/2/issue/{key}/comment", self.base_url);
-        let body = json!({ "body": body_text });
+        let url = format!("{}/rest/api/3/issue/{key}/comment", self.base_url);
+        let body = json!({ "body": crate::jira::adf::plain_text_to_adf(body_text) });
         let resp = self
             .apply_auth(self.client.post(&url))
             .json(&body)
@@ -174,7 +172,7 @@ impl JiraClient {
         issue_key: &str,
         file_path: &std::path::Path,
     ) -> Result<Vec<Attachment>> {
-        let url = format!("{}/rest/api/2/issue/{issue_key}/attachments", self.base_url);
+        let url = format!("{}/rest/api/3/issue/{issue_key}/attachments", self.base_url);
         let filename = file_path
             .file_name()
             .unwrap_or_default()
@@ -204,11 +202,11 @@ impl JiraClient {
             .context("Failed to parse upload attachment response")
     }
 
-    /// Assign an issue to the given username (use "`currentUser()`" or actual username).
+    /// Assign an issue to the given account ID.
     #[allow(dead_code)]
-    pub async fn set_assignee(&self, key: &str, username: &str) -> Result<()> {
-        let url = format!("{}/rest/api/2/issue/{key}/assignee", self.base_url);
-        let body = json!({ "name": username });
+    pub async fn set_assignee(&self, key: &str, account_id: &str) -> Result<()> {
+        let url = format!("{}/rest/api/3/issue/{key}/assignee", self.base_url);
+        let body = json!({ "accountId": account_id });
         let resp = self
             .apply_auth(self.client.put(&url))
             .json(&body)
@@ -232,7 +230,7 @@ impl JiraClient {
         field_id: &str,
         value: serde_json::Value,
     ) -> Result<()> {
-        let url = format!("{}/rest/api/2/issue/{key}", self.base_url);
+        let url = format!("{}/rest/api/3/issue/{key}", self.base_url);
         let body = json!({ "fields": { field_id: value } });
         let resp = self
             .apply_auth(self.client.put(&url))
@@ -252,7 +250,7 @@ impl JiraClient {
     /// Move an issue to a different project by updating its project field.
     #[allow(dead_code)]
     pub async fn move_issue(&self, key: &str, target_project_key: &str) -> Result<()> {
-        let url = format!("{}/rest/api/2/issue/{key}", self.base_url);
+        let url = format!("{}/rest/api/3/issue/{key}", self.base_url);
         let body = json!({
             "fields": {
                 "project": { "key": target_project_key }
@@ -282,7 +280,7 @@ impl JiraClient {
             account_id: Option<String>,
         }
 
-        let url = format!("{}/rest/api/2/myself", self.base_url);
+        let url = format!("{}/rest/api/3/myself", self.base_url);
         let resp = self
             .apply_auth(self.client.get(&url))
             .send()
@@ -299,14 +297,14 @@ impl JiraClient {
             .json()
             .await
             .context("Failed to parse myself response")?;
-        me.name
-            .or(me.account_id)
+        me.account_id
+            .or(me.name)
             .ok_or_else(|| anyhow::anyhow!("Could not determine current user"))
     }
 
     /// Fetch all field definitions from this Jira instance.
     pub async fn get_all_fields(&self) -> Result<Vec<FieldMeta>> {
-        let url = format!("{}/rest/api/2/field", self.base_url);
+        let url = format!("{}/rest/api/3/field", self.base_url);
         let resp = self
             .apply_auth(self.client.get(&url))
             .send()
@@ -326,7 +324,7 @@ impl JiraClient {
 
     /// Fetch a single issue with all fields (`fields=*all`).
     pub async fn get_issue_all_fields(&self, key: &str) -> Result<serde_json::Value> {
-        let url = format!("{}/rest/api/2/issue/{key}", self.base_url);
+        let url = format!("{}/rest/api/3/issue/{key}", self.base_url);
         let resp = self
             .apply_auth(self.client.get(&url))
             .query(&[("fields", "*all")])
@@ -343,13 +341,13 @@ impl JiraClient {
         resp.json().await.context("Failed to parse issue response")
     }
 
-    /// Fetch allowed values for a field via `GET /rest/api/2/issue/{key}/editmeta`.
+    /// Fetch allowed values for a field via `GET /rest/api/3/issue/{key}/editmeta`.
     pub async fn get_field_options(
         &self,
         issue_key: &str,
         field_id: &str,
     ) -> Result<Vec<crate::jira::types::FieldOption>> {
-        let url = format!("{}/rest/api/2/issue/{issue_key}/editmeta", self.base_url);
+        let url = format!("{}/rest/api/3/issue/{issue_key}/editmeta", self.base_url);
         let resp = self
             .apply_auth(self.client.get(&url))
             .send()
@@ -396,7 +394,7 @@ impl JiraClient {
         issue_key: &str,
         field_id: &str,
     ) -> Result<serde_json::Value> {
-        let url = format!("{}/rest/api/2/issue/{issue_key}/editmeta", self.base_url);
+        let url = format!("{}/rest/api/3/issue/{issue_key}/editmeta", self.base_url);
         let resp = self
             .apply_auth(self.client.get(&url))
             .send()
@@ -420,7 +418,7 @@ impl JiraClient {
     }
 
     /// Fetch display names and schema types for a set of field IDs via
-    /// `GET /rest/api/2/issue/{key}/editmeta`.
+    /// `GET /rest/api/3/issue/{key}/editmeta`.
     /// Returns `(names, schemas)` where both are `field_id → value`.
     /// Unknown fields are silently omitted.
     pub async fn get_field_labels(
@@ -428,7 +426,7 @@ impl JiraClient {
         issue_key: &str,
         field_ids: &[&str],
     ) -> Result<(HashMap<String, String>, HashMap<String, String>)> {
-        let url = format!("{}/rest/api/2/issue/{issue_key}/editmeta", self.base_url);
+        let url = format!("{}/rest/api/3/issue/{issue_key}/editmeta", self.base_url);
         let resp = self
             .apply_auth(self.client.get(&url))
             .send()
@@ -469,10 +467,10 @@ impl JiraClient {
         new_body: &str,
     ) -> Result<Comment> {
         let url = format!(
-            "{}/rest/api/2/issue/{issue_key}/comment/{comment_id}",
+            "{}/rest/api/3/issue/{issue_key}/comment/{comment_id}",
             self.base_url
         );
-        let body = serde_json::json!({ "body": new_body });
+        let body = serde_json::json!({ "body": crate::jira::adf::plain_text_to_adf(new_body) });
         let resp = self
             .apply_auth(self.client.put(&url))
             .json(&body)
@@ -491,7 +489,7 @@ impl JiraClient {
     /// Delete a comment.
     pub async fn delete_comment(&self, issue_key: &str, comment_id: &str) -> Result<()> {
         let url = format!(
-            "{}/rest/api/2/issue/{issue_key}/comment/{comment_id}",
+            "{}/rest/api/3/issue/{issue_key}/comment/{comment_id}",
             self.base_url
         );
         let resp = self
@@ -510,7 +508,7 @@ impl JiraClient {
 
     /// Delete an attachment by its ID.
     pub async fn delete_attachment(&self, attachment_id: &str) -> Result<()> {
-        let url = format!("{}/rest/api/2/attachment/{attachment_id}", self.base_url);
+        let url = format!("{}/rest/api/3/attachment/{attachment_id}", self.base_url);
         let resp = self
             .apply_auth(self.client.delete(&url))
             .send()

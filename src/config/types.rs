@@ -24,7 +24,9 @@ pub struct Config {
 pub struct JiraConfig {
     pub base_url: String,
     pub default_project: String,
-    /// Shell command whose stdout yields a PAT or "username:password".
+    /// Jira account email used for API authentication.
+    pub email: Option<String>,
+    /// Shell command whose stdout yields a Jira API token.
     pub credential_command: Option<String>,
     /// Use OS keyring for credentials.
     pub credential_store: Option<String>,

@@ -59,7 +59,8 @@ impl PriorityField {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UserField {
-    pub name: String,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(rename = "displayName")]
     pub display_name: Option<String>,
     #[serde(rename = "accountId")]
@@ -68,7 +69,11 @@ pub struct UserField {
 
 impl UserField {
     pub fn display(&self) -> &str {
-        self.display_name.as_deref().unwrap_or(&self.name)
+        self.display_name
+            .as_deref()
+            .or(self.name.as_deref())
+            .or(self.account_id.as_deref())
+            .unwrap_or("Unknown")
     }
 }
 
@@ -95,7 +100,7 @@ pub struct CommentList {
 pub struct Comment {
     pub id: String,
     pub author: UserField,
-    pub body: String,
+    pub body: serde_json::Value,
     pub created: String,
     pub updated: String,
 }
@@ -119,17 +124,12 @@ pub struct Transition {
     pub to: StatusField,
 }
 
-/// Jira REST API search response envelope.
+/// Jira Cloud REST API v3 search response envelope.
 #[derive(Debug, Deserialize)]
 pub struct SearchResponse {
     pub issues: Vec<Issue>,
-    pub total: u32,
-    #[serde(rename = "startAt")]
-    #[allow(dead_code)]
-    pub start_at: u32,
-    #[serde(rename = "maxResults")]
-    #[allow(dead_code)]
-    pub max_results: u32,
+    #[serde(rename = "isLast", default)]
+    pub is_last: bool,
 }
 
 /// Jira REST API transitions response envelope.
@@ -138,7 +138,7 @@ pub struct TransitionsResponse {
     pub transitions: Vec<Transition>,
 }
 
-/// Metadata for a single Jira field (from `/rest/api/2/field`).
+/// Metadata for a single Jira field (from `/rest/api/3/field`).
 #[derive(Debug, Deserialize)]
 pub struct FieldMeta {
     pub id: String,

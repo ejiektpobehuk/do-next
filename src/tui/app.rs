@@ -780,9 +780,9 @@ fn apply_assigned_to_me(app: &mut AppState, issue_key: &str) {
         && let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key)
     {
         issue.fields.assignee = Some(crate::jira::types::UserField {
-            name: me.clone(),
+            name: None,
             display_name: Some(me.clone()),
-            account_id: None,
+            account_id: Some(me.clone()),
         });
     }
 }
@@ -1438,7 +1438,7 @@ fn start_comment_edit(app: &mut AppState) {
     app.action_state = ActionState::PendingCommentEdit {
         issue_key: issue.key.clone(),
         comment_id: comment.id.clone(),
-        original_body: comment.body.clone(),
+        original_body: crate::jira::adf::json_to_text(&comment.body),
     };
 }
 

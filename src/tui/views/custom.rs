@@ -819,27 +819,5 @@ fn inline_cursor_line(input: &str, cursor_char: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-// ── ADF / description text extraction ────────────────────────────────────────
-
-/// Best-effort plain text extraction from Jira description (string or ADF JSON).
-pub fn json_to_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Object(_) => extract_adf_text(value),
-        _ => String::new(),
-    }
-}
-
-fn extract_adf_text(node: &serde_json::Value) -> String {
-    let mut out = String::new();
-    if let Some(text) = node.get("text").and_then(|t| t.as_str()) {
-        out.push_str(text);
-    }
-    if let Some(content) = node.get("content").and_then(|c| c.as_array()) {
-        for child in content {
-            out.push_str(&extract_adf_text(child));
-        }
-        out.push('\n');
-    }
-    out
-}
+// Re-export for local use.
+pub use crate::jira::adf::json_to_text;

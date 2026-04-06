@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
 };
 
+use crate::jira::adf::json_to_text;
 use crate::jira::types::Issue;
 use crate::tui::app::AppState;
 
@@ -27,7 +28,7 @@ pub fn render_comments(f: &mut Frame, area: Rect, issue: &Issue, app: &AppState)
                     format!("{author} · {date}"),
                     Style::default().add_modifier(Modifier::BOLD),
                 )));
-                for body_line in comment.body.lines() {
+                for body_line in json_to_text(&comment.body).lines() {
                     lines.push(Line::from(format!("  {body_line}")));
                 }
                 lines.push(Line::from(""));

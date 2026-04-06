@@ -50,6 +50,9 @@ fn merge_config(base: &mut Config, overlay: Config) {
     if !overlay.jira.default_project.is_empty() {
         base.jira.default_project = overlay.jira.default_project;
     }
+    if overlay.jira.email.is_some() {
+        base.jira.email = overlay.jira.email;
+    }
     if overlay.jira.credential_command.is_some() {
         base.jira.credential_command = overlay.jira.credential_command;
     }

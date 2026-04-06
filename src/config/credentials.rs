@@ -4,26 +4,42 @@ use std::process::Command;
 use crate::config::types::JiraConfig;
 use crate::jira::auth::Credentials;
 
-/// Resolve Jira credentials using the precedence chain:
-/// 1. Environment variables
-/// 2. `credential_command` (shell exec)
+/// Resolve Jira credentials (email + API token).
+///
+/// Email precedence: `DO_NEXT_JIRA_EMAIL` env → `config.jira.email`.
+///
+/// API token precedence:
+/// 1. `DO_NEXT_JIRA_API_TOKEN` env
+/// 2. `credential_command` (shell exec, stdout = API token)
 /// 3. OS keyring
-/// 4. credentials file (~/.config/do-next/credentials.json5)
+/// 4. credentials file (`~/.config/do-next/credentials.json5`)
 pub fn resolve_credentials(jira: &JiraConfig) -> Result<Credentials> {
-    // 1. Environment variables
-    if let Ok(token) = std::env::var("DO_NEXT_JIRA_TOKEN") {
-        log::debug!("credentials: using DO_NEXT_JIRA_TOKEN env var");
-        return Ok(Credentials::Token(token));
+    let email = resolve_email(jira)?;
+    let api_token = resolve_api_token(jira)?;
+    Ok(Credentials { email, api_token })
+}
+
+fn resolve_email(jira: &JiraConfig) -> Result<String> {
+    if let Ok(email) = std::env::var("DO_NEXT_JIRA_EMAIL") {
+        log::debug!("credentials: using DO_NEXT_JIRA_EMAIL env var");
+        return Ok(email);
     }
-    if let (Ok(user), Ok(pass)) = (
-        std::env::var("DO_NEXT_JIRA_USERNAME"),
-        std::env::var("DO_NEXT_JIRA_PASSWORD"),
-    ) {
-        log::debug!("credentials: using DO_NEXT_JIRA_USERNAME/PASSWORD env vars");
-        return Ok(Credentials::Basic {
-            username: user,
-            password: pass,
-        });
+    if let Some(email) = &jira.email {
+        log::debug!("credentials: using email from config");
+        return Ok(email.clone());
+    }
+    bail!(
+        "No Jira email configured.\n\
+         Set DO_NEXT_JIRA_EMAIL env var or add `email` to your Jira config.\n\
+         Run `do-next auth` to reconfigure."
+    )
+}
+
+fn resolve_api_token(jira: &JiraConfig) -> Result<String> {
+    // 1. Environment variable
+    if let Ok(token) = std::env::var("DO_NEXT_JIRA_API_TOKEN") {
+        log::debug!("credentials: using DO_NEXT_JIRA_API_TOKEN env var");
+        return Ok(token);
     }
 
     // 2. credential_command
@@ -37,9 +53,9 @@ pub fn resolve_credentials(jira: &JiraConfig) -> Result<Credentials> {
         if !output.status.success() {
             bail!("credential_command exited with non-zero status");
         }
-        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
         log::debug!("credentials: credential_command succeeded");
-        return Ok(parse_credential_output(raw));
+        return Ok(token);
     }
 
     // 3. Keyring
@@ -51,7 +67,7 @@ pub fn resolve_credentials(jira: &JiraConfig) -> Result<Credentials> {
         match entry.get_password() {
             Ok(secret) => {
                 log::debug!("credentials: keyring lookup succeeded");
-                return Ok(parse_credential_output(secret));
+                return Ok(secret);
             }
             Err(keyring::Error::NoEntry) => {
                 log::debug!("credentials: no keyring entry found, falling through");
@@ -65,7 +81,7 @@ pub fn resolve_credentials(jira: &JiraConfig) -> Result<Credentials> {
                      Possible fixes:\n\
                      • Ensure your keyring daemon is running (gnome-keyring-daemon, kwallet, pass-secret-service)\n\
                      • Unlock the keyring or GPG agent and try again\n\
-                     • Set the DO_NEXT_JIRA_TOKEN environment variable\n\
+                     • Set the DO_NEXT_JIRA_API_TOKEN environment variable\n\
                      • Add credentials to ~/.config/do-next/credentials.json5\n\
                      \n\
                      Run with --log <file> for details."
@@ -79,8 +95,8 @@ pub fn resolve_credentials(jira: &JiraConfig) -> Result<Credentials> {
                      \n\
                      Possible fixes:\n\
                      • Unlock your keyring or GPG agent and try again\n\
-                     • Re-run `do-next auth` to store a fresh token\n\
-                     • Set the DO_NEXT_JIRA_TOKEN environment variable\n\
+                     • Re-run `do-next auth` to store a fresh API token\n\
+                     • Set the DO_NEXT_JIRA_API_TOKEN environment variable\n\
                      • Add credentials to ~/.config/do-next/credentials.json5\n\
                      \n\
                      Run with --log <file> for details."
@@ -92,8 +108,8 @@ pub fn resolve_credentials(jira: &JiraConfig) -> Result<Credentials> {
                     "Unexpected keyring error (key={key}): {e}\n\
                      \n\
                      Possible fixes:\n\
-                     • Re-run `do-next auth` to store a fresh token\n\
-                     • Set the DO_NEXT_JIRA_TOKEN environment variable\n\
+                     • Re-run `do-next auth` to store a fresh API token\n\
+                     • Set the DO_NEXT_JIRA_API_TOKEN environment variable\n\
                      • Add credentials to ~/.config/do-next/credentials.json5"
                 );
             }
@@ -102,24 +118,15 @@ pub fn resolve_credentials(jira: &JiraConfig) -> Result<Credentials> {
 
     // 4. Credentials file
     log::debug!("credentials: checking credentials file");
-    if let Some(creds) = load_credentials_file()? {
+    if let Some(token) = load_credentials_file()? {
         log::debug!("credentials: loaded from credentials file");
-        return Ok(creds);
+        return Ok(token);
     }
 
-    bail!("No Jira credentials found. Set DO_NEXT_JIRA_TOKEN env var or configure credentials.")
-}
-
-/// Parse a credential string: either a bare PAT or "username:password".
-fn parse_credential_output(s: String) -> Credentials {
-    if let Some((user, pass)) = s.split_once(':') {
-        Credentials::Basic {
-            username: user.to_string(),
-            password: pass.to_string(),
-        }
-    } else {
-        Credentials::Token(s)
-    }
+    bail!(
+        "No Jira API token found.\n\
+         Set DO_NEXT_JIRA_API_TOKEN env var or run `do-next auth` to configure credentials."
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -129,12 +136,10 @@ struct CredentialsFile {
 
 #[derive(serde::Deserialize)]
 struct CredentialsFileJira {
-    token: Option<String>,
-    username: Option<String>,
-    password: Option<String>,
+    api_token: Option<String>,
 }
 
-fn load_credentials_file() -> Result<Option<Credentials>> {
+fn load_credentials_file() -> Result<Option<String>> {
     let path = dirs::config_dir()
         .context("Cannot determine config directory")?
         .join("do-next")
@@ -153,26 +158,5 @@ fn load_credentials_file() -> Result<Option<Credentials>> {
         return Ok(None);
     };
 
-    if let Some(token) = jira.token {
-        return Ok(Some(Credentials::Token(token)));
-    }
-    if let (Some(user), Some(pass)) = (jira.username, jira.password) {
-        return Ok(Some(Credentials::Basic {
-            username: user,
-            password: pass,
-        }));
-    }
-
-    Ok(None)
-}
-
-/// Store a token in the OS keyring (called during onboarding).
-#[allow(dead_code)]
-pub fn store_in_keyring(base_url: &str, key: Option<&str>, token: &str) -> Result<()> {
-    let key = key.unwrap_or(base_url);
-    let entry = keyring::Entry::new("do-next", key).context("Failed to create keyring entry")?;
-    entry
-        .set_password(token)
-        .context("Failed to store token in keyring")?;
-    Ok(())
+    Ok(jira.api_token)
 }

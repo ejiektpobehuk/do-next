@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 
+use crate::jira::adf::json_to_text;
 use crate::jira::JiraClient;
 
 /// `do-next comment [ISSUE_KEY]`
@@ -25,7 +26,7 @@ pub async fn run(client: &JiraClient, issue_key: Option<&str>, no_history: bool)
             for c in &cl.comments {
                 let date = &c.created[..10];
                 println!("{} · {}", c.author.display(), date);
-                for line in c.body.lines() {
+                for line in json_to_text(&c.body).lines() {
                     println!("  {line}");
                 }
                 println!();

@@ -33,8 +33,9 @@ enum ConfigStyle {
 pub fn run_onboarding() -> Result<Config> {
     println!("Welcome to do-next! Let's set up your configuration.\n");
 
-    let base_url = prompt("Jira base URL (e.g. https://jira.example.com): ", None)?;
+    let base_url = prompt("Jira base URL (e.g. https://mycompany.atlassian.net): ", None)?;
     let default_project = prompt("Default project key (e.g. PTMT): ", None)?;
+    let email = prompt("Jira account email: ", None)?;
 
     println!();
     let choice = prompt_credential_choice(None, None)?;
@@ -42,6 +43,7 @@ pub fn run_onboarding() -> Result<Config> {
     let mut jira_config = JiraConfig {
         base_url: base_url.clone(),
         default_project,
+        email: Some(email),
         ..Default::default()
     };
 
@@ -52,11 +54,11 @@ pub fn run_onboarding() -> Result<Config> {
 
     match choice {
         CredentialChoice::File => {
-            print_pat_instructions(&base_url);
-            let token = prompt_masked("Personal Access Token: ")?;
+            print_api_token_instructions(&base_url);
+            let token = prompt_masked("API token: ")?;
 
             let creds_path = config_dir.join("credentials.json5");
-            let creds_content = format!("{{ jira: {{ token: \"{token}\" }} }}\n");
+            let creds_content = format!("{{ jira: {{ api_token: \"{token}\" }} }}\n");
             std::fs::write(&creds_path, &creds_content)?;
             #[cfg(unix)]
             {
@@ -78,30 +80,30 @@ pub fn run_onboarding() -> Result<Config> {
             };
 
             if already_exists {
-                println!("A token is already stored in the keyring for this URL.");
+                println!("An API token is already stored in the keyring for this URL.");
                 let reuse = prompt_yes_no("Use the existing token? [Y/n]: ", true)?;
                 if !reuse {
-                    print_pat_instructions(&base_url);
-                    let token = prompt_masked("Personal Access Token: ")?;
+                    print_api_token_instructions(&base_url);
+                    let token = prompt_masked("API token: ")?;
                     entry
                         .set_password(&token)
                         .map_err(|e| anyhow::anyhow!("Failed to store token in keyring: {e}"))?;
-                    println!("Token updated in system keyring.");
+                    println!("API token updated in system keyring.");
                 }
             } else {
-                print_pat_instructions(&base_url);
-                let token = prompt_masked("Personal Access Token: ")?;
+                print_api_token_instructions(&base_url);
+                let token = prompt_masked("API token: ")?;
                 entry
                     .set_password(&token)
                     .map_err(|e| anyhow::anyhow!("Failed to store token in keyring: {e}"))?;
-                println!("Token stored in system keyring.");
+                println!("API token stored in system keyring.");
             }
 
             jira_config.credential_store = Some("keyring".into());
         }
 
         CredentialChoice::Command => {
-            println!("Enter the shell command whose stdout is your Jira token.");
+            println!("Enter the shell command whose stdout is your Jira API token.");
             println!("Examples:  pass show jira/do-next");
             println!("           op read 'op://Private/Jira/credential'");
             println!();
@@ -111,8 +113,9 @@ pub fn run_onboarding() -> Result<Config> {
 
         CredentialChoice::Skip => {
             println!();
-            println!("Set the following environment variable before running do-next:");
-            println!("  DO_NEXT_JIRA_TOKEN=<your-token>");
+            println!("Set the following environment variables before running do-next:");
+            println!("  DO_NEXT_JIRA_EMAIL=<your-email>");
+            println!("  DO_NEXT_JIRA_API_TOKEN=<your-api-token>");
             println!();
         }
     }
@@ -139,6 +142,7 @@ pub fn run_onboarding() -> Result<Config> {
 }
 
 /// Reconfigure authentication for an existing install without overwriting other config.
+#[allow(clippy::too_many_lines)]
 pub fn run_auth_reset(config: &mut Config) -> Result<()> {
     if config.jira.base_url.is_empty() {
         return Err(anyhow::anyhow!(
@@ -150,6 +154,16 @@ pub fn run_auth_reset(config: &mut Config) -> Result<()> {
         "Reconfiguring Jira authentication for {}",
         config.jira.base_url
     );
+    println!();
+
+    let current_email = config.jira.email.as_deref().unwrap_or("");
+    let email_prompt = if current_email.is_empty() {
+        "Jira account email: ".to_string()
+    } else {
+        format!("Jira account email [{current_email}]: ")
+    };
+    let email = prompt(&email_prompt, Some(current_email))?;
+    config.jira.email = Some(email);
     println!();
 
     let status = probe_credential_status(&config.jira);
@@ -166,11 +180,11 @@ pub fn run_auth_reset(config: &mut Config) -> Result<()> {
 
     match choice {
         CredentialChoice::File => {
-            print_pat_instructions(&config.jira.base_url);
-            let token = prompt_masked("Personal Access Token: ")?;
+            print_api_token_instructions(&config.jira.base_url);
+            let token = prompt_masked("API token: ")?;
 
             let creds_path = config_dir.join("credentials.json5");
-            let creds_content = format!("{{ jira: {{ token: \"{token}\" }} }}\n");
+            let creds_content = format!("{{ jira: {{ api_token: \"{token}\" }} }}\n");
             std::fs::write(&creds_path, &creds_content)?;
             #[cfg(unix)]
             {
@@ -198,30 +212,30 @@ pub fn run_auth_reset(config: &mut Config) -> Result<()> {
             };
 
             if already_exists {
-                println!("A token is already stored in the keyring for this URL.");
+                println!("An API token is already stored in the keyring for this URL.");
                 let reuse = prompt_yes_no("Use the existing token? [Y/n]: ", true)?;
                 if !reuse {
-                    print_pat_instructions(&config.jira.base_url.clone());
-                    let token = prompt_masked("Personal Access Token: ")?;
+                    print_api_token_instructions(&config.jira.base_url.clone());
+                    let token = prompt_masked("API token: ")?;
                     entry
                         .set_password(&token)
                         .map_err(|e| anyhow::anyhow!("Failed to store token in keyring: {e}"))?;
-                    println!("Token updated in system keyring.");
+                    println!("API token updated in system keyring.");
                 }
             } else {
-                print_pat_instructions(&config.jira.base_url.clone());
-                let token = prompt_masked("Personal Access Token: ")?;
+                print_api_token_instructions(&config.jira.base_url.clone());
+                let token = prompt_masked("API token: ")?;
                 entry
                     .set_password(&token)
                     .map_err(|e| anyhow::anyhow!("Failed to store token in keyring: {e}"))?;
-                println!("Token stored in system keyring.");
+                println!("API token stored in system keyring.");
             }
 
             config.jira.credential_store = Some("keyring".into());
         }
 
         CredentialChoice::Command => {
-            println!("Enter the shell command whose stdout is your Jira token.");
+            println!("Enter the shell command whose stdout is your Jira API token.");
             println!("Examples:  pass show jira/do-next");
             println!("           op read 'op://Private/Jira/credential'");
             println!();
@@ -231,8 +245,9 @@ pub fn run_auth_reset(config: &mut Config) -> Result<()> {
 
         CredentialChoice::Skip => {
             println!();
-            println!("Set the following environment variable before running do-next:");
-            println!("  DO_NEXT_JIRA_TOKEN=<your-token>");
+            println!("Set the following environment variables before running do-next:");
+            println!("  DO_NEXT_JIRA_EMAIL=<your-email>");
+            println!("  DO_NEXT_JIRA_API_TOKEN=<your-api-token>");
             println!();
         }
     }
@@ -301,6 +316,8 @@ fn template_config(
     default_project: &str,
     jira_config: &crate::config::types::JiraConfig,
 ) -> String {
+    let email = jira_config.email.as_deref().unwrap_or("you@example.com");
+
     let cred_line = match &jira_config.credential_command {
         Some(cmd) => format!("    credential_command: \"{cmd}\",\n"),
         None if jira_config.credential_store.as_deref() == Some("keyring") => {
@@ -314,7 +331,7 @@ fn template_config(
     } else if jira_config.credential_store.as_deref() == Some("keyring") {
         "    // credential_key: \"jira.example.com\",  // optional label\n    // credential_command: \"pass show jira/do-next\",\n".to_string()
     } else {
-        "    // credential_store: \"keyring\",\n    // credential_command: \"pass show jira/do-next\",\n    // Env: DO_NEXT_JIRA_TOKEN=<your-token>\n".to_string()
+        "    // credential_store: \"keyring\",\n    // credential_command: \"pass show jira/do-next\",\n    // Env: DO_NEXT_JIRA_API_TOKEN=<your-api-token>\n".to_string()
     };
 
     format!(
@@ -322,12 +339,14 @@ fn template_config(
   jira: {{
     base_url: "{base_url}",
     default_project: "{default_project}",
+    email: "{email}",
 
-    // Authentication (first found wins):
-    //   1. Env:              DO_NEXT_JIRA_TOKEN=<token>
+    // Authentication — API token resolution (first found wins):
+    //   1. Env:              DO_NEXT_JIRA_API_TOKEN=<api-token>
     //   2. External command: credential_command: "..."
     //   3. System keyring:   credential_store: "keyring"
     //   4. Credentials file: ~/.config/do-next/credentials.json5
+    // Email override:        DO_NEXT_JIRA_EMAIL=<email>
 {cred_line}{cred_comments}  }},
 
   // Sources in priority order (first = highest priority).
@@ -446,16 +465,13 @@ fn template_config(
     )
 }
 
-fn print_pat_instructions(base_url: &str) {
+fn print_api_token_instructions(_base_url: &str) {
     println!();
-    println!("Personal Access Token");
-    println!("  A PAT lets do-next read and act on Jira issues on your behalf.");
-    println!("  To create one, open this URL in your browser:");
-    println!(
-        "    {}/secure/ViewProfile.jspa",
-        base_url.trim_end_matches('/')
-    );
-    println!("  Then navigate to \"Personal Access Tokens\" and click \"Create token\".");
+    println!("Jira API Token");
+    println!("  An API token lets do-next read and act on Jira issues on your behalf.");
+    println!("  To create one, go to:");
+    println!("    https://id.atlassian.com/manage-profile/security/api-tokens");
+    println!("  Click \"Create API token\", give it a label, and copy the value.");
     println!();
     println!("  Input masked with *. Backspace on an empty field hides the input.");
     println!();
@@ -471,8 +487,7 @@ fn check_keyring_available(key: &str) -> Result<()> {
 }
 
 fn probe_credential_status(jira: &JiraConfig) -> CredentialStatus {
-    let env_set = std::env::var("DO_NEXT_JIRA_TOKEN").is_ok()
-        || std::env::var("DO_NEXT_JIRA_USERNAME").is_ok();
+    let env_set = std::env::var("DO_NEXT_JIRA_API_TOKEN").is_ok();
 
     let file_exists =
         dirs::config_dir().is_some_and(|d| d.join("do-next").join("credentials.json5").exists());
@@ -518,7 +533,7 @@ const KEYRING_DESCRIPTION: &str = if cfg!(target_os = "macos") {
 const CRED_DESCRIPTIONS: [&str; 4] = [
     KEYRING_DESCRIPTION,
     "fetch via shell command (pass, bitwarden CLI, …)",
-    "set DO_NEXT_JIRA_TOKEN env manually",
+    "set DO_NEXT_JIRA_API_TOKEN env manually",
     "~/.config/do-next/credentials.json5 (chmod 600)",
 ];
 

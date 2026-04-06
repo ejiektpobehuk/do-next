@@ -11,6 +11,7 @@ use ratatui_image::StatefulImage;
 
 use std::fmt::Write as _;
 
+use crate::jira::adf::json_to_text;
 use crate::jira::types::{Attachment, Comment, Issue};
 use crate::tui::app::{ActionState, AppState, SubView};
 use crate::tui::render::RenderOut;
@@ -386,8 +387,8 @@ fn render_attachment_detail(f: &mut Frame, att: &Attachment, right_rect: Rect) {
 /// Height of a comment widget: top border (1) + header (1) + body lines + bottom border (1).
 fn measure_comment_block(comment: &Comment, width: u16) -> usize {
     let usable = if width > 2 { (width - 2) as usize } else { 1 };
-    let body_lines: usize = comment
-        .body
+    let text = json_to_text(&comment.body);
+    let body_lines: usize = text
         .lines()
         .map(|line| {
             let chars = line.chars().count();
@@ -564,8 +565,9 @@ fn render_comment_widget(f: &mut Frame, area: Rect, comment: &Comment, focused: 
         return;
     }
 
+    let body_text = json_to_text(&comment.body);
     f.render_widget(
-        Paragraph::new(comment.body.as_str()).wrap(Wrap { trim: false }),
+        Paragraph::new(body_text).wrap(Wrap { trim: false }),
         block_inner,
     );
 }
