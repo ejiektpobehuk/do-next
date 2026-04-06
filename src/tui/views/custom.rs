@@ -714,14 +714,20 @@ fn parse_field_dt(issue: &Issue, field_id: Option<&str>) -> Option<DateTime<Fixe
 pub fn val_to_str(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.replace('\r', ""),
-        serde_json::Value::Object(_) => ["value", "name", "displayName"]
-            .iter()
-            .find_map(|k| {
-                v.get(k)
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.replace('\r', ""))
-            })
-            .unwrap_or_else(|| v.to_string()),
+        serde_json::Value::Object(_) => {
+            // Detect ADF documents and convert to markdown
+            if v.get("type").and_then(|t| t.as_str()) == Some("doc") {
+                return json_to_text(v).replace('\r', "");
+            }
+            ["value", "name", "displayName"]
+                .iter()
+                .find_map(|k| {
+                    v.get(k)
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.replace('\r', ""))
+                })
+                .unwrap_or_else(|| v.to_string())
+        }
         serde_json::Value::Array(a) => a
             .iter()
             .map(|item| {

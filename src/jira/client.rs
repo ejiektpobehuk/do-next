@@ -147,7 +147,7 @@ impl JiraClient {
     /// Post a comment on an issue.
     pub async fn post_comment(&self, key: &str, body_text: &str) -> Result<Comment> {
         let url = format!("{}/rest/api/3/issue/{key}/comment", self.base_url);
-        let body = json!({ "body": crate::jira::adf::plain_text_to_adf(body_text) });
+        let body = json!({ "body": crate::jira::adf::markdown_to_adf(body_text) });
         let resp = self
             .apply_auth(self.client.post(&url))
             .json(&body)
@@ -470,7 +470,7 @@ impl JiraClient {
             "{}/rest/api/3/issue/{issue_key}/comment/{comment_id}",
             self.base_url
         );
-        let body = serde_json::json!({ "body": crate::jira::adf::plain_text_to_adf(new_body) });
+        let body = serde_json::json!({ "body": crate::jira::adf::markdown_to_adf(new_body) });
         let resp = self
             .apply_auth(self.client.put(&url))
             .json(&body)

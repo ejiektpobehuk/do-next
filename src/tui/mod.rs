@@ -994,6 +994,10 @@ fn spawn_load_all_field_names(client: JiraClient, tx: UnboundedSender<AppEvent>)
 /// Shape the user's edited text into the correct JSON value for a Jira field update.
 /// Object fields with a "value" key are Jira select fields; all others are plain strings.
 fn shape_field_value(user_text: &str, original: &serde_json::Value) -> serde_json::Value {
+    // ADF document — convert markdown back to ADF
+    if original.get("type").and_then(|t| t.as_str()) == Some("doc") {
+        return crate::jira::adf::markdown_to_adf(user_text);
+    }
     if let serde_json::Value::Object(map) = original
         && map.contains_key("value")
     {
