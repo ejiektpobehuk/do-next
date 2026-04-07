@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Best-effort conversion from a Jira rich-text field to markdown.
 /// Handles plain strings (v2 API) and ADF JSON documents (v3 API).
@@ -155,7 +155,14 @@ fn emit_text(out: &mut String, node: &Value) {
 }
 
 #[allow(clippy::fn_params_excessive_bools)]
-fn push_marked_text(out: &mut String, text: &str, strong: bool, em: bool, code: bool, strike: bool) {
+fn push_marked_text(
+    out: &mut String,
+    text: &str,
+    strong: bool,
+    em: bool,
+    code: bool,
+    strike: bool,
+) {
     if code {
         out.push('`');
         out.push_str(text);
@@ -380,7 +387,11 @@ pub fn markdown_to_adf(markdown: &str) -> Value {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => stack.push(("paragraph".into(), None, vec![])),
                 Tag::Heading { level, .. } => {
-                    stack.push(("heading".into(), Some(json!({ "level": level as u8 })), vec![]));
+                    stack.push((
+                        "heading".into(),
+                        Some(json!({ "level": level as u8 })),
+                        vec![],
+                    ));
                 }
                 Tag::BlockQuote(_) => stack.push(("blockquote".into(), None, vec![])),
                 Tag::CodeBlock(kind) => {
@@ -393,7 +404,11 @@ pub fn markdown_to_adf(markdown: &str) -> Value {
                     stack.push(("codeBlock".into(), lang, vec![]));
                 }
                 Tag::List(start) => {
-                    let name = if start.is_some() { "orderedList" } else { "bulletList" };
+                    let name = if start.is_some() {
+                        "orderedList"
+                    } else {
+                        "bulletList"
+                    };
                     stack.push((name.into(), None, vec![]));
                 }
                 Tag::Item => stack.push(("listItem".into(), None, vec![])),
@@ -401,9 +416,7 @@ pub fn markdown_to_adf(markdown: &str) -> Value {
                 Tag::Strong => marks.push(json!({ "type": "strong" })),
                 Tag::Strikethrough => marks.push(json!({ "type": "strike" })),
                 Tag::Link { dest_url, .. } => {
-                    marks.push(
-                        json!({ "type": "link", "attrs": { "href": dest_url.as_ref() } }),
-                    );
+                    marks.push(json!({ "type": "link", "attrs": { "href": dest_url.as_ref() } }));
                 }
                 _ => {}
             },
@@ -416,12 +429,13 @@ pub fn markdown_to_adf(markdown: &str) -> Value {
                     // Strip trailing newline that pulldown-cmark adds to code text
                     if let Some(top) = stack.last_mut()
                         && let Some(last_child) = top.2.last_mut()
-                            && let Some(text) = last_child.get("text").and_then(|t| t.as_str()) {
-                                let trimmed = text.trim_end_matches('\n');
-                                if trimmed != text {
-                                    last_child["text"] = Value::String(trimmed.to_string());
-                                }
-                            }
+                        && let Some(text) = last_child.get("text").and_then(|t| t.as_str())
+                    {
+                        let trimmed = text.trim_end_matches('\n');
+                        if trimmed != text {
+                            last_child["text"] = Value::String(trimmed.to_string());
+                        }
+                    }
                     md_pop_container(&mut stack);
                 }
                 TagEnd::Item => {
@@ -506,11 +520,7 @@ fn md_pop_container(stack: &mut Vec<(String, Option<Value>, Vec<Value>)>) {
     }
 }
 
-fn md_add_text(
-    stack: &mut [(String, Option<Value>, Vec<Value>)],
-    marks: &[Value],
-    text: &str,
-) {
+fn md_add_text(stack: &mut [(String, Option<Value>, Vec<Value>)], marks: &[Value], text: &str) {
     if text.is_empty() {
         return;
     }
@@ -713,9 +723,9 @@ mod tests {
     fn adf_to_md_nested_bullet_list() {
         let adf = adf_doc(vec![adf_bullet_list(vec![adf_list_item(vec![
             adf_paragraph(vec![adf_text("parent")]),
-            adf_bullet_list(vec![
-                adf_list_item(vec![adf_paragraph(vec![adf_text("child")])]),
-            ]),
+            adf_bullet_list(vec![adf_list_item(vec![adf_paragraph(vec![adf_text(
+                "child",
+            )])])]),
         ])])]);
         assert_eq!(adf_to_markdown(&adf), "- parent\n  - child\n");
     }
@@ -723,10 +733,7 @@ mod tests {
     #[test]
     fn adf_to_md_code_block_with_language() {
         let adf = adf_doc(vec![adf_code_block(Some("rust"), "fn main() {}")]);
-        assert_eq!(
-            adf_to_markdown(&adf),
-            "```rust\nfn main() {}\n```\n"
-        );
+        assert_eq!(adf_to_markdown(&adf), "```rust\nfn main() {}\n```\n");
     }
 
     #[test]
@@ -918,7 +925,10 @@ mod tests {
     #[test]
     fn md_to_adf_code_block_with_language() {
         let result = markdown_to_adf("```rust\nfn main() {}\n```");
-        assert_eq!(result, adf_doc(vec![adf_code_block(Some("rust"), "fn main() {}")]));
+        assert_eq!(
+            result,
+            adf_doc(vec![adf_code_block(Some("rust"), "fn main() {}")])
+        );
     }
 
     #[test]

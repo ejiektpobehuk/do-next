@@ -91,9 +91,7 @@ fn format_value(v: &serde_json::Value) -> String {
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => truncate(&s.replace('\n', "↵"), 80),
-        serde_json::Value::Object(_)
-            if v.get("type").and_then(|t| t.as_str()) == Some("doc") =>
-        {
+        serde_json::Value::Object(_) if v.get("type").and_then(|t| t.as_str()) == Some("doc") => {
             truncate(&crate::jira::adf::json_to_text(v).replace('\n', "↵"), 80)
         }
         serde_json::Value::Array(a) => {

@@ -626,7 +626,11 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
                 multi,
             );
         }
-        ActionResult::FieldNamesLoaded { names, schemas, all_fields } => {
+        ActionResult::FieldNamesLoaded {
+            names,
+            schemas,
+            all_fields,
+        } => {
             apply_field_names_loaded(app, names, schemas, all_fields);
         }
         ActionResult::CommentEdited {

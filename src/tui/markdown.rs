@@ -113,8 +113,7 @@ pub fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
                             );
                         }
                         if !code_line.is_empty() {
-                            current_spans
-                                .push(Span::styled(format!("  {code_line}"), style));
+                            current_spans.push(Span::styled(format!("  {code_line}"), style));
                         }
                     }
                 } else {
@@ -319,10 +318,7 @@ fn flush_line(
     // Blockquote prefix
     if blockquote_depth > 0 {
         let prefix = "│ ".repeat(blockquote_depth);
-        final_spans.push(Span::styled(
-            prefix,
-            Style::default().fg(Color::DarkGray),
-        ));
+        final_spans.push(Span::styled(prefix, Style::default().fg(Color::DarkGray)));
     }
 
     final_spans.append(spans);
@@ -406,10 +402,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(
             lines[0].spans[0],
-            Span::styled(
-                "click",
-                Style::default().add_modifier(Modifier::UNDERLINED)
-            )
+            Span::styled("click", Style::default().add_modifier(Modifier::UNDERLINED))
         );
         assert_eq!(
             lines[0].spans[1],
@@ -526,7 +519,12 @@ mod tests {
         // Should have heading, gap, paragraph, gap, list item
         assert!(lines.len() >= 3);
         // First line is the heading
-        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
     }
 }

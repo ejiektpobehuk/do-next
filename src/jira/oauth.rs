@@ -70,11 +70,13 @@ pub fn run_oauth_flow(
     let request = server
         .recv_timeout(Duration::from_secs(120))
         .context("Error waiting for OAuth callback")?
-        .ok_or_else(|| anyhow::anyhow!(
-            "Timed out waiting for authorization.\n\
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Timed out waiting for authorization.\n\
              Make sure you complete the authorization in your browser within 2 minutes.\n\
              Run `do-next auth` to try again."
-        ))?;
+            )
+        })?;
 
     let url = request.url().to_string();
     let (code, callback_state) = parse_callback_params(&url)?;
@@ -314,8 +316,8 @@ fn load_oauth_from_keyring() -> Result<Option<OAuthCredentials>> {
     // We need the cloud_id to build the key, but we don't know it before loading.
     // Try loading from a well-known probe key first; if the user has tokens in the
     // keyring, we stored a pointer under "oauth:_index" with the cloud_id.
-    let index_entry = keyring::Entry::new("do-next", "oauth:_index")
-        .context("Failed to access keyring")?;
+    let index_entry =
+        keyring::Entry::new("do-next", "oauth:_index").context("Failed to access keyring")?;
     let cloud_id = match index_entry.get_password() {
         Ok(id) => id,
         Err(keyring::Error::NoEntry) => return Ok(None),
@@ -326,8 +328,7 @@ fn load_oauth_from_keyring() -> Result<Option<OAuthCredentials>> {
     };
 
     let key = format!("oauth:{cloud_id}");
-    let entry = keyring::Entry::new("do-next", &key)
-        .context("Failed to access keyring")?;
+    let entry = keyring::Entry::new("do-next", &key).context("Failed to access keyring")?;
     let json = match entry.get_password() {
         Ok(s) => s,
         Err(keyring::Error::NoEntry) => return Ok(None),
@@ -436,9 +437,7 @@ fn urlencoded(s: &str) -> String {
 
 /// Parse `code` and `state` from the OAuth callback URL query string.
 fn parse_callback_params(url: &str) -> Result<(String, String)> {
-    let query = url
-        .split_once('?')
-        .map_or("", |(_, q)| q);
+    let query = url.split_once('?').map_or("", |(_, q)| q);
 
     let mut code = None;
     let mut state = None;
@@ -453,11 +452,14 @@ fn parse_callback_params(url: &str) -> Result<(String, String)> {
         }
     }
 
-    let code = code.ok_or_else(|| anyhow::anyhow!(
-        "Authorization callback missing 'code' parameter.\n\
+    let code = code.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Authorization callback missing 'code' parameter.\n\
          The authorization may have been denied. Run `do-next auth` to try again."
-    ))?;
-    let state = state.ok_or_else(|| anyhow::anyhow!("Authorization callback missing 'state' parameter"))?;
+        )
+    })?;
+    let state =
+        state.ok_or_else(|| anyhow::anyhow!("Authorization callback missing 'state' parameter"))?;
 
     Ok((code, state))
 }

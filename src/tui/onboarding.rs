@@ -19,10 +19,7 @@ enum AuthMethod {
 
 const AUTH_METHOD_COUNT: usize = 2;
 
-const AUTH_METHOD_LABELS: [&str; AUTH_METHOD_COUNT] = [
-    "Personal API token",
-    "OAuth (browser)   ",
-];
+const AUTH_METHOD_LABELS: [&str; AUTH_METHOD_COUNT] = ["Personal API token", "OAuth (browser)   "];
 
 const AUTH_METHOD_DESCRIPTIONS: [&str; AUTH_METHOD_COUNT] = [
     "create a token at id.atlassian.com (recommended)",
@@ -42,10 +39,7 @@ enum StorageChoice {
 // OAuth storage options (2).
 const OAUTH_STORAGE_COUNT: usize = 2;
 
-const OAUTH_STORAGE_LABELS: [&str; OAUTH_STORAGE_COUNT] = [
-    "System keyring  ",
-    "Credentials file",
-];
+const OAUTH_STORAGE_LABELS: [&str; OAUTH_STORAGE_COUNT] = ["System keyring  ", "Credentials file"];
 
 const OAUTH_STORAGE_DESCRIPTIONS: [&str; OAUTH_STORAGE_COUNT] = [
     KEYRING_DESCRIPTION,
@@ -99,7 +93,10 @@ enum ConfigStyle {
 pub fn run_onboarding() -> Result<Config> {
     println!("Welcome to do-next! Let's set up your configuration.\n");
 
-    let base_url = prompt("Jira base URL (e.g. https://mycompany.atlassian.net): ", None)?;
+    let base_url = prompt(
+        "Jira base URL (e.g. https://mycompany.atlassian.net): ",
+        None,
+    )?;
     let default_project = prompt("Default project key (e.g. PTMT): ", None)?;
 
     // Step 1: auth method.
@@ -134,8 +131,7 @@ pub fn run_onboarding() -> Result<Config> {
 
     match auth_method {
         AuthMethod::OAuth => {
-            let (client_id, client_secret) =
-                resolve_oauth_client_credentials(&jira_config)?;
+            let (client_id, client_secret) = resolve_oauth_client_credentials(&jira_config)?;
             let store = match storage {
                 StorageChoice::Keyring => OAuthStore::Keyring,
                 _ => OAuthStore::File,
@@ -199,9 +195,7 @@ pub fn run_auth_reset(config: &mut Config) -> Result<()> {
     let current_storage = detect_storage_method(&config.jira);
     let storage = match auth_method {
         AuthMethod::OAuth => prompt_oauth_storage(Some(&current_storage))?,
-        AuthMethod::PersonalToken => {
-            prompt_token_storage(Some(&current_storage), Some(&status))?
-        }
+        AuthMethod::PersonalToken => prompt_token_storage(Some(&current_storage), Some(&status))?,
     };
 
     // Clear existing auth fields; each branch sets only what it needs.
@@ -215,8 +209,7 @@ pub fn run_auth_reset(config: &mut Config) -> Result<()> {
 
     match auth_method {
         AuthMethod::OAuth => {
-            let (client_id, client_secret) =
-                resolve_oauth_client_credentials(&config.jira)?;
+            let (client_id, client_secret) = resolve_oauth_client_credentials(&config.jira)?;
             let store = match storage {
                 StorageChoice::Keyring => OAuthStore::Keyring,
                 _ => OAuthStore::File,

@@ -431,11 +431,7 @@ fn build_custom_segments(
             let label = resolve_field_label(field, field_names);
             let content = get_field_content(issue, field, tz);
             let readonly = field.readonly.unwrap_or(false);
-            let is_markdown = issue
-                .fields
-                .extra
-                .get(&field.field_id)
-                .is_some_and(is_adf);
+            let is_markdown = issue.fields.extra.get(&field.field_id).is_some_and(is_adf);
             segs.push(Segment::EditableField {
                 label,
                 content,

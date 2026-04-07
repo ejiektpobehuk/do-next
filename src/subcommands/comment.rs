@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 
-use crate::jira::adf::json_to_text;
 use crate::jira::JiraClient;
+use crate::jira::adf::json_to_text;
 
 /// `do-next comment [ISSUE_KEY]`
 /// If `issue_key` is None, tries to determine the "current" task (not yet implemented).

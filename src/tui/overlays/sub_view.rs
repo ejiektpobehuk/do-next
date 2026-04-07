@@ -13,8 +13,8 @@ use std::fmt::Write as _;
 
 use crate::jira::adf::json_to_text;
 use crate::jira::types::{Attachment, Comment, Issue};
-use crate::tui::markdown::markdown_to_lines;
 use crate::tui::app::{ActionState, AppState, SubView};
+use crate::tui::markdown::markdown_to_lines;
 use crate::tui::render::RenderOut;
 
 pub fn render_sub_view_overlay(f: &mut Frame, app: &AppState, render_out: &mut RenderOut) {
