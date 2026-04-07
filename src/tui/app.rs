@@ -276,6 +276,8 @@ pub struct AppState {
     pub field_schemas: HashMap<String, String>,
     /// Set while a field-names fetch is in flight to prevent duplicate requests.
     pub field_names_loading: bool,
+    /// Set once the global field registry has been fetched (default view).
+    pub all_field_names_loaded: bool,
     /// Tracks first `g` press for `gg` (jump to first) motion.
     pub pending_g: bool,
     /// Total content lines of the detail view; written each render.
@@ -346,6 +348,7 @@ impl AppState {
             field_names: HashMap::new(),
             field_schemas: HashMap::new(),
             field_names_loading: false,
+            all_field_names_loaded: false,
             pending_g: false,
             last_detail_content_h: 0,
             overlay: None,
@@ -623,8 +626,8 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
                 multi,
             );
         }
-        ActionResult::FieldNamesLoaded { names, schemas } => {
-            apply_field_names_loaded(app, names, schemas);
+        ActionResult::FieldNamesLoaded { names, schemas, all_fields } => {
+            apply_field_names_loaded(app, names, schemas, all_fields);
         }
         ActionResult::CommentEdited {
             issue_key,
@@ -676,10 +679,14 @@ fn apply_field_names_loaded(
     app: &mut AppState,
     names: HashMap<String, String>,
     schemas: HashMap<String, String>,
+    all_fields: bool,
 ) {
     app.field_names.extend(names);
     app.field_schemas.extend(schemas);
     app.field_names_loading = false;
+    if all_fields {
+        app.all_field_names_loaded = true;
+    }
 }
 
 fn apply_transition_applied(app: &mut AppState, issue_key: &str, new_status: &str) {
@@ -1791,8 +1798,6 @@ fn update_view_mode_on_navigate(app: &mut AppState) {
     app.overlay = None;
     app.detail_focus = DetailFocus::Comments;
     app.detail_focus_offsets.clear();
-    app.field_names.clear();
-    app.field_schemas.clear();
     app.field_names_loading = false;
 }
 

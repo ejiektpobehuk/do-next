@@ -67,6 +67,8 @@ pub enum ActionResult {
         names: HashMap<String, String>,
         /// Jira editmeta `schema.type` per `field_id` (e.g. `"date"`, `"datetime"`).
         schemas: HashMap<String, String>,
+        /// True when this came from the global field registry (all fields loaded).
+        all_fields: bool,
     },
     CommentEdited {
         issue_key: String,

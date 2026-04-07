@@ -909,7 +909,7 @@ fn maybe_spawn_field_names_fetch(
     if !matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) {
         return;
     }
-    if app.field_names_loading || !app.field_names.is_empty() {
+    if app.field_names_loading {
         return;
     }
 
@@ -920,12 +920,16 @@ fn maybe_spawn_field_names_fetch(
         let Some(cfg) = app.config.views.get(id.as_str()) else {
             return;
         };
-        // Only fetch names for fields that don't have a name override
+        // Only fetch names for fields that don't have a name override and aren't cached yet
         let field_ids: Vec<String> = cfg
             .sections
             .iter()
             .flat_map(|s| s.fields.iter())
             .filter(|f| f.name.is_none())
+            .filter(|f| {
+                !app.field_names.contains_key(&f.field_id)
+                    || !app.field_schemas.contains_key(&f.field_id)
+            })
             .map(|f| f.field_id.clone())
             .collect();
         if field_ids.is_empty() {
@@ -937,6 +941,9 @@ fn maybe_spawn_field_names_fetch(
     } else {
         // Default view: use the global field registry to get names for all fields.
         // This covers readonly fields that don't appear in editmeta.
+        if app.all_field_names_loaded {
+            return;
+        }
         app.field_names_loading = true;
         spawn_load_all_field_names(client.clone(), tx.clone());
     }
@@ -957,6 +964,7 @@ fn spawn_load_field_names_editmeta(
                 let _ = tx.send(AppEvent::ActionDone(ActionResult::FieldNamesLoaded {
                     names,
                     schemas,
+                    all_fields: false,
                 }));
             }
             Err(_) => {
@@ -964,6 +972,7 @@ fn spawn_load_field_names_editmeta(
                 let _ = tx.send(AppEvent::ActionDone(ActionResult::FieldNamesLoaded {
                     names: std::collections::HashMap::new(),
                     schemas: std::collections::HashMap::new(),
+                    all_fields: false,
                 }));
             }
         }
@@ -980,12 +989,14 @@ fn spawn_load_all_field_names(client: JiraClient, tx: UnboundedSender<AppEvent>)
                 let _ = tx.send(AppEvent::ActionDone(ActionResult::FieldNamesLoaded {
                     names,
                     schemas: std::collections::HashMap::new(),
+                    all_fields: true,
                 }));
             }
             Err(_) => {
                 let _ = tx.send(AppEvent::ActionDone(ActionResult::FieldNamesLoaded {
                     names: std::collections::HashMap::new(),
                     schemas: std::collections::HashMap::new(),
+                    all_fields: true,
                 }));
             }
         }
