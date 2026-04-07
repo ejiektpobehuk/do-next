@@ -70,12 +70,12 @@ async fn main() -> Result<()> {
         config = tui::onboarding::run_onboarding().context("Onboarding failed")?;
     }
 
-    // Resolve credentials
-    let credentials = config::credentials::resolve_credentials(&config.jira)
-        .context("Failed to resolve Jira credentials")?;
+    // Resolve authentication
+    let auth = config::credentials::resolve_auth(&config.jira)
+        .context("Failed to resolve Jira authentication")?;
 
     // Build Jira client
-    let client = jira::JiraClient::new(config.jira.base_url.clone(), credentials)
+    let client = jira::JiraClient::new(config.jira.base_url.clone(), auth)
         .context("Failed to create Jira client")?;
 
     match cli.command {

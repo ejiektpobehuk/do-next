@@ -2,9 +2,13 @@ use anyhow::{Context, Result, bail};
 use std::process::Command;
 
 use crate::config::types::JiraConfig;
-use crate::jira::auth::Credentials;
+use crate::jira::auth::{Auth, BasicCredentials};
+use crate::jira::oauth;
 
-/// Resolve Jira credentials (email + API token).
+/// Resolve Jira authentication (basic auth or OAuth).
+///
+/// If `auth_method` is `"oauth"`, loads saved OAuth tokens.
+/// Otherwise falls back to basic auth (email + API token).
 ///
 /// Email precedence: `DO_NEXT_JIRA_EMAIL` env → `config.jira.email`.
 ///
@@ -13,10 +17,27 @@ use crate::jira::auth::Credentials;
 /// 2. `credential_command` (shell exec, stdout = API token)
 /// 3. OS keyring
 /// 4. credentials file (`~/.config/do-next/credentials.json5`)
-pub fn resolve_credentials(jira: &JiraConfig) -> Result<Credentials> {
+pub fn resolve_auth(jira: &JiraConfig) -> Result<Auth> {
+    if jira.auth_method.as_deref() == Some("oauth") {
+        return resolve_oauth();
+    }
+    resolve_basic(jira)
+}
+
+fn resolve_oauth() -> Result<Auth> {
+    match oauth::load_oauth_tokens()? {
+        Some(creds) => Ok(Auth::OAuth(creds)),
+        None => bail!(
+            "No OAuth tokens found.\n\
+             Run `do-next auth` to authenticate with your browser."
+        ),
+    }
+}
+
+fn resolve_basic(jira: &JiraConfig) -> Result<Auth> {
     let email = resolve_email(jira)?;
     let api_token = resolve_api_token(jira)?;
-    Ok(Credentials { email, api_token })
+    Ok(Auth::Basic(BasicCredentials { email, api_token }))
 }
 
 fn resolve_email(jira: &JiraConfig) -> Result<String> {

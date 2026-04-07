@@ -62,6 +62,15 @@ fn merge_config(base: &mut Config, overlay: Config) {
     if overlay.jira.credential_key.is_some() {
         base.jira.credential_key = overlay.jira.credential_key;
     }
+    if overlay.jira.auth_method.is_some() {
+        base.jira.auth_method = overlay.jira.auth_method;
+    }
+    if overlay.jira.oauth_client_id.is_some() {
+        base.jira.oauth_client_id = overlay.jira.oauth_client_id;
+    }
+    if overlay.jira.oauth_client_secret.is_some() {
+        base.jira.oauth_client_secret = overlay.jira.oauth_client_secret;
+    }
     // If project override defines sources, replace entirely; otherwise keep base sources.
     if !overlay.sources.is_empty() {
         base.sources = overlay.sources;

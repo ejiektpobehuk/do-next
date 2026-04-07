@@ -32,6 +32,12 @@ pub struct JiraConfig {
     pub credential_store: Option<String>,
     /// Key label for keyring lookup (defaults to `base_url`).
     pub credential_key: Option<String>,
+    /// Authentication method: "basic" (default) or "oauth".
+    pub auth_method: Option<String>,
+    /// OAuth client ID from your Atlassian Developer Console app.
+    pub oauth_client_id: Option<String>,
+    /// OAuth client secret from your Atlassian Developer Console app.
+    pub oauth_client_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

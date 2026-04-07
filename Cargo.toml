@@ -36,3 +36,7 @@ indexmap      = "2"
 image         = "0.25"
 ratatui-image = { version = "10", features = ["crossterm", "image-defaults"], default-features = false }
 pulldown-cmark = "0.13"
+tiny_http      = "0.12"
+rand           = "0.9"
+base64         = "0.22"
+sha2           = "0.10"

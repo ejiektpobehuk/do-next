@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use reqwest::{Client, RequestBuilder};
 use serde_json::json;
+use tokio::sync::RwLock;
 
-use crate::jira::auth::Credentials;
+use crate::jira::auth::Auth;
+use crate::jira::oauth;
 use crate::jira::types::{
     Attachment, Comment, FieldMeta, Issue, SearchResponse, Transition, TransitionsResponse,
 };
@@ -15,23 +19,56 @@ const MAX_RESULTS: u32 = 100;
 pub struct JiraClient {
     client: Client,
     base_url: String,
-    credentials: Credentials,
+    auth: Arc<RwLock<Auth>>,
 }
 
 impl JiraClient {
-    pub fn new(base_url: String, credentials: Credentials) -> Result<Self> {
+    pub fn new(site_url: String, auth: Auth) -> Result<Self> {
+        let base_url = match &auth {
+            Auth::Basic(_) => site_url,
+            Auth::OAuth(o) => format!("https://api.atlassian.com/ex/jira/{}", o.cloud_id),
+        };
         let client = Client::builder()
             .build()
             .context("Failed to build HTTP client")?;
         Ok(Self {
             client,
             base_url,
-            credentials,
+            auth: Arc::new(RwLock::new(auth)),
         })
     }
 
-    fn apply_auth(&self, req: RequestBuilder) -> RequestBuilder {
-        req.basic_auth(&self.credentials.email, Some(&self.credentials.api_token))
+    async fn maybe_refresh(&self) -> Result<()> {
+        let needs_refresh = {
+            let auth = self.auth.read().await;
+            match &*auth {
+                Auth::OAuth(o) => o.expires_at - Utc::now() < chrono::Duration::seconds(60),
+                Auth::Basic(_) => false,
+            }
+        };
+
+        if needs_refresh {
+            let mut auth = self.auth.write().await;
+            // Double-check after acquiring write lock (another task may have refreshed).
+            if let Auth::OAuth(o) = &*auth
+                && o.expires_at - Utc::now() < chrono::Duration::seconds(60)
+            {
+                log::debug!("OAuth token expiring soon, refreshing");
+                let refreshed = oauth::refresh_access_token(o).await?;
+                oauth::save_oauth_tokens(&refreshed)?;
+                *auth = Auth::OAuth(refreshed);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn apply_auth(&self, req: RequestBuilder) -> RequestBuilder {
+        let auth = self.auth.read().await;
+        match &*auth {
+            Auth::Basic(creds) => req.basic_auth(&creds.email, Some(&creds.api_token)),
+            Auth::OAuth(creds) => req.bearer_auth(&creds.access_token),
+        }
     }
 
     /// Fetch all issues matching a JQL query, paginating automatically.
@@ -42,8 +79,11 @@ impl JiraClient {
         loop {
             let url = format!("{}/rest/api/3/search/jql", self.base_url);
             log::debug!("JQL request: startAt={start_at} jql={jql}");
+
+            self.maybe_refresh().await?;
             let resp = self
                 .apply_auth(self.client.get(&url))
+                .await
                 .query(&[
                     ("jql", jql),
                     ("maxResults", &MAX_RESULTS.to_string()),
@@ -91,8 +131,10 @@ impl JiraClient {
     /// Fetch a single issue by key.
     pub async fn get_issue(&self, key: &str) -> Result<Issue> {
         let url = format!("{}/rest/api/3/issue/{key}", self.base_url);
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.get(&url))
+            .await
             .send()
             .await
             .context("Failed to fetch issue")?;
@@ -109,8 +151,10 @@ impl JiraClient {
     /// Get available transitions for an issue.
     pub async fn get_transitions(&self, key: &str) -> Result<Vec<Transition>> {
         let url = format!("{}/rest/api/3/issue/{key}/transitions", self.base_url);
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.get(&url))
+            .await
             .send()
             .await
             .context("Failed to fetch transitions")?;
@@ -129,8 +173,10 @@ impl JiraClient {
     pub async fn post_transition(&self, key: &str, transition_id: &str) -> Result<()> {
         let url = format!("{}/rest/api/3/issue/{key}/transitions", self.base_url);
         let body = json!({ "transition": { "id": transition_id } });
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.post(&url))
+            .await
             .json(&body)
             .send()
             .await
@@ -148,8 +194,10 @@ impl JiraClient {
     pub async fn post_comment(&self, key: &str, body_text: &str) -> Result<Comment> {
         let url = format!("{}/rest/api/3/issue/{key}/comment", self.base_url);
         let body = json!({ "body": crate::jira::adf::markdown_to_adf(body_text) });
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.post(&url))
+            .await
             .json(&body)
             .send()
             .await
@@ -183,8 +231,10 @@ impl JiraClient {
             .context("Failed to read file for upload")?;
         let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
         let form = reqwest::multipart::Form::new().part("file", part);
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.post(&url))
+            .await
             .header("X-Atlassian-Token", "no-check")
             .multipart(form)
             .send()
@@ -207,8 +257,10 @@ impl JiraClient {
     pub async fn set_assignee(&self, key: &str, account_id: &str) -> Result<()> {
         let url = format!("{}/rest/api/3/issue/{key}/assignee", self.base_url);
         let body = json!({ "accountId": account_id });
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.put(&url))
+            .await
             .json(&body)
             .send()
             .await
@@ -232,8 +284,10 @@ impl JiraClient {
     ) -> Result<()> {
         let url = format!("{}/rest/api/3/issue/{key}", self.base_url);
         let body = json!({ "fields": { field_id: value } });
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.put(&url))
+            .await
             .json(&body)
             .send()
             .await
@@ -256,8 +310,10 @@ impl JiraClient {
                 "project": { "key": target_project_key }
             }
         });
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.put(&url))
+            .await
             .json(&body)
             .send()
             .await
@@ -281,8 +337,10 @@ impl JiraClient {
         }
 
         let url = format!("{}/rest/api/3/myself", self.base_url);
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.get(&url))
+            .await
             .send()
             .await
             .context("Failed to fetch current user")?;
@@ -305,8 +363,10 @@ impl JiraClient {
     /// Fetch all field definitions from this Jira instance.
     pub async fn get_all_fields(&self) -> Result<Vec<FieldMeta>> {
         let url = format!("{}/rest/api/3/field", self.base_url);
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.get(&url))
+            .await
             .send()
             .await
             .context("Failed to fetch field definitions")?;
@@ -325,8 +385,10 @@ impl JiraClient {
     /// Fetch a single issue with all fields (`fields=*all`).
     pub async fn get_issue_all_fields(&self, key: &str) -> Result<serde_json::Value> {
         let url = format!("{}/rest/api/3/issue/{key}", self.base_url);
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.get(&url))
+            .await
             .query(&[("fields", "*all")])
             .send()
             .await
@@ -348,8 +410,10 @@ impl JiraClient {
         field_id: &str,
     ) -> Result<Vec<crate::jira::types::FieldOption>> {
         let url = format!("{}/rest/api/3/issue/{issue_key}/editmeta", self.base_url);
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.get(&url))
+            .await
             .send()
             .await
             .context("Failed to fetch editmeta")?;
@@ -395,8 +459,10 @@ impl JiraClient {
         field_id: &str,
     ) -> Result<serde_json::Value> {
         let url = format!("{}/rest/api/3/issue/{issue_key}/editmeta", self.base_url);
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.get(&url))
+            .await
             .send()
             .await
             .context("Failed to fetch editmeta")?;
@@ -427,8 +493,10 @@ impl JiraClient {
         field_ids: &[&str],
     ) -> Result<(HashMap<String, String>, HashMap<String, String>)> {
         let url = format!("{}/rest/api/3/issue/{issue_key}/editmeta", self.base_url);
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.get(&url))
+            .await
             .send()
             .await
             .context("Failed to fetch editmeta")?;
@@ -471,8 +539,10 @@ impl JiraClient {
             self.base_url
         );
         let body = serde_json::json!({ "body": crate::jira::adf::markdown_to_adf(new_body) });
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.put(&url))
+            .await
             .json(&body)
             .send()
             .await
@@ -492,8 +562,10 @@ impl JiraClient {
             "{}/rest/api/3/issue/{issue_key}/comment/{comment_id}",
             self.base_url
         );
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.delete(&url))
+            .await
             .send()
             .await
             .context("Failed to delete comment")?;
@@ -509,8 +581,10 @@ impl JiraClient {
     /// Delete an attachment by its ID.
     pub async fn delete_attachment(&self, attachment_id: &str) -> Result<()> {
         let url = format!("{}/rest/api/3/attachment/{attachment_id}", self.base_url);
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.delete(&url))
+            .await
             .send()
             .await
             .context("Failed to delete attachment")?;
@@ -524,8 +598,10 @@ impl JiraClient {
 
     /// Download the raw bytes of an attachment by its content URL.
     pub async fn download_attachment(&self, url: &str) -> Result<Vec<u8>> {
+        self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.get(url))
+            .await
             .send()
             .await
             .context("Failed to download attachment")?;
