@@ -1,7 +1,7 @@
 [package]
 name = "do-next"
 description = "Pick your next Jira task & manage it from the terminal"
-version = "0.0.0-2026.3.19"
+version = "0.0.0-2026.4.8"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ejiektpobehuk/do-next"
