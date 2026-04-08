@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
@@ -35,24 +35,49 @@ pub fn render(
     list_state: &mut ratatui::widgets::ListState,
     render_out: &mut RenderOut,
 ) {
-    // Layout: top bar (1) | main area (rest) | hint bar (1)
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // title bar
-            Constraint::Min(0),    // main
-            Constraint::Length(1), // hint bar
-        ])
-        .split(f.area());
+    let show_tabs = app.resolved_teams.len() > 1;
+
+    // Layout: top bar (1) | [tab bar (1)] | main area (rest) | hint bar (1)
+    let root = if show_tabs {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // title bar
+                Constraint::Length(1), // tab bar
+                Constraint::Min(0),    // main
+                Constraint::Length(1), // hint bar
+            ])
+            .split(f.area())
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // title bar
+                Constraint::Min(0),    // main
+                Constraint::Length(1), // hint bar
+            ])
+            .split(f.area())
+    };
+
+    let (title_area, main_area, hint_area) = if show_tabs {
+        (root[0], root[2], root[3])
+    } else {
+        (root[0], root[1], root[2])
+    };
 
     // Title bar
-    render_title(f, root[0], app);
+    render_title(f, title_area, app);
+
+    // Tab bar (only when multiple teams)
+    if show_tabs {
+        render_tab_bar(f, root[1], app);
+    }
 
     // Main: list (30%) | detail (70%)
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(root[1]);
+        .split(main_area);
 
     crate::tui::list::render_list(
         f,
@@ -70,7 +95,7 @@ pub fn render(
     );
 
     // Hint bar
-    render_hints(f, root[2], app);
+    render_hints(f, hint_area, app);
 
     // Sub-view popup overlay (comments / attachments)
     if app.overlay.is_some() {
@@ -87,7 +112,7 @@ fn render_action_overlays(f: &mut Frame, app: &AppState) {
             overlays::transition::render_transition_overlay(f, &app.action_state);
         }
         ActionState::HidePopup { .. } => {
-            overlays::hide::render_hide_overlay(f, &app.action_state, &app.config);
+            overlays::hide::render_hide_overlay(f, &app.action_state, app.team_config());
         }
         ActionState::AwaitingAction { description } => {
             overlays::await_spinner::render_await(f, description, app.tick_count);
@@ -193,13 +218,39 @@ fn render_title(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
             Style::default().fg(Color::DarkGray),
         )
     };
-    let title = Line::from(vec![
-        Span::raw("──── do-next "),
-        version_span,
-        Span::raw(" "),
-    ]);
+    let mut spans = vec![Span::raw("──── do-next "), version_span, Span::raw(" ")];
+    if !app.update_warnings.is_empty() {
+        let msg = app.update_warnings.join("; ");
+        spans.push(Span::styled(
+            format!("│ {msg} "),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let title = Line::from(spans);
     let block = Block::default().borders(Borders::TOP).title_top(title);
     f.render_widget(block, area);
+}
+
+fn render_tab_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
+    let mut spans = Vec::new();
+    for (i, team) in app.resolved_teams.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let label = format!(" {} ", team.id);
+        if i == app.active_team_idx {
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_error_overlay(f: &mut Frame, msg: &str) {

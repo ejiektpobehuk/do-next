@@ -4,9 +4,22 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyModifiers};
 use indexmap::IndexMap;
 
-use crate::config::types::{Config, SourceConfig};
+use crate::config::types::{ResolvedTeam, SourceConfig, TeamConfig};
 use crate::events::{ActionResult, AppEvent};
 use crate::jira::types::{Comment, FieldOption, Issue};
+
+/// Per-team state that is saved/restored when switching tabs.
+#[derive(Debug, Clone)]
+pub struct PerTeamState {
+    pub sources: IndexMap<String, SourceState>,
+    pub issues: Vec<Issue>,
+    pub subsource_errors: IndexMap<String, Vec<(usize, Arc<anyhow::Error>)>>,
+    pub nav_items: Vec<NavItem>,
+    pub nav_idx: usize,
+    pub field_names: HashMap<String, String>,
+    pub field_schemas: HashMap<String, String>,
+    pub field_names_state: FieldNamesState,
+}
 
 /// A navigable item in the list (issue or error row).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,11 +40,7 @@ pub enum SourceState {
     Error(Arc<anyhow::Error>),
 }
 
-impl SourceState {
-    pub const fn is_terminal(&self) -> bool {
-        matches!(self, Self::Loaded(_) | Self::Error(_))
-    }
-}
+impl SourceState {}
 
 /// Which panel has keyboard focus.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,8 +251,30 @@ pub enum ActionState {
     KeybindingsHelp,
 }
 
+/// Progress of field name fetching from Jira API.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FieldNamesState {
+    #[default]
+    Idle,
+    Loading,
+    AllLoaded,
+}
+
+/// Miscellaneous app flags grouped to keep `AppState` bool count low.
+#[derive(Debug, Clone, Default)]
+pub struct AppFlags {
+    pub field_names: FieldNamesState,
+    /// Tracks first `g` press for `gg` (jump to first) motion.
+    pub pending_g: bool,
+    /// Set when a tab switch requires fetching sources for the new team.
+    pub pending_team_fetch: bool,
+}
+
 pub struct AppState {
-    pub config: Config,
+    pub resolved_teams: Vec<ResolvedTeam>,
+    pub active_team_idx: usize,
+    /// Saved per-team state for inactive tabs.
+    pub saved_team_states: HashMap<usize, PerTeamState>,
     pub sources: IndexMap<String, SourceState>,
     /// Flat ordered list of all visible issues (after dedup).
     pub issues: Vec<Issue>,
@@ -256,6 +287,7 @@ pub struct AppState {
     pub view_mode: ViewMode,
     pub action_state: ActionState,
     pub should_quit: bool,
+    pub flags: AppFlags,
     /// Spinner frame counter (incremented on each Tick).
     pub tick_count: u64,
     pub current_user: Option<String>,
@@ -274,12 +306,6 @@ pub struct AppState {
     pub field_names: HashMap<String, String>,
     /// API-fetched Jira schema types for fields: `field_id` → type string.
     pub field_schemas: HashMap<String, String>,
-    /// Set while a field-names fetch is in flight to prevent duplicate requests.
-    pub field_names_loading: bool,
-    /// Set once the global field registry has been fetched (default view).
-    pub all_field_names_loaded: bool,
-    /// Tracks first `g` press for `gg` (jump to first) motion.
-    pub pending_g: bool,
     /// Total content lines of the detail view; written each render.
     pub last_detail_content_h: usize,
     /// Sub-view popup shown on top of the detail view (Comments or Attachments).
@@ -305,6 +331,8 @@ pub struct AppState {
         HashMap<String, std::cell::RefCell<ratatui_image::protocol::StatefulProtocol>>,
     /// Attachment currently being fetched in the background (id).
     pub attachment_fetching_id: Option<String>,
+    /// Update warnings from git-based checks (shown at startup, dismissed on any key).
+    pub update_warnings: Vec<String>,
     /// Pending silent background fetch (set by nav handlers, consumed by `dispatch_action`).
     pub pending_attachment_fetch: Option<AttachmentFetchRequest>,
     /// Pending path completion fetch generation (set by key handler, consumed by `dispatch_action`).
@@ -322,14 +350,22 @@ pub struct AttachmentFetchRequest {
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
-        let sources = config
-            .sources
-            .iter()
-            .map(|s| (s.id.clone(), SourceState::Pending))
-            .collect();
+    pub fn new(resolved_teams: Vec<ResolvedTeam>) -> Self {
+        // Build source state from the first (active) team's sources.
+        let sources = resolved_teams
+            .first()
+            .map(|t| {
+                t.config
+                    .sources
+                    .iter()
+                    .map(|s| (s.id.clone(), SourceState::Pending))
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
-            config,
+            resolved_teams,
+            active_team_idx: 0,
+            saved_team_states: HashMap::new(),
             sources,
             issues: Vec::new(),
             subsource_errors: IndexMap::new(),
@@ -338,6 +374,7 @@ impl AppState {
             view_mode: ViewMode::Default,
             action_state: ActionState::None,
             should_quit: false,
+            flags: AppFlags::default(),
             tick_count: 0,
             current_user: None,
             detail_scroll: 0,
@@ -347,9 +384,6 @@ impl AppState {
             last_detail_viewport_h: 0,
             field_names: HashMap::new(),
             field_schemas: HashMap::new(),
-            field_names_loading: false,
-            all_field_names_loaded: false,
-            pending_g: false,
             last_detail_content_h: 0,
             overlay: None,
             overlay_scroll: 0,
@@ -362,14 +396,85 @@ impl AppState {
             attachment_text_previews: HashMap::new(),
             attachment_images: HashMap::new(),
             attachment_fetching_id: None,
+            update_warnings: Vec::new(),
             pending_attachment_fetch: None,
             pending_completion_fetch: None,
             image_picker: None,
         }
     }
 
-    pub fn all_sources_terminal(&self) -> bool {
-        self.sources.values().all(SourceState::is_terminal)
+    /// Switch to a different team tab.
+    pub fn switch_team(&mut self, new_idx: usize) {
+        if new_idx == self.active_team_idx || new_idx >= self.resolved_teams.len() {
+            return;
+        }
+        // Save current team state
+        let current_state = PerTeamState {
+            sources: std::mem::take(&mut self.sources),
+            issues: std::mem::take(&mut self.issues),
+            subsource_errors: std::mem::take(&mut self.subsource_errors),
+            nav_items: std::mem::take(&mut self.nav_items),
+            nav_idx: self.nav_idx,
+            field_names: std::mem::take(&mut self.field_names),
+            field_schemas: std::mem::take(&mut self.field_schemas),
+            field_names_state: self.flags.field_names.clone(),
+        };
+        self.saved_team_states
+            .insert(self.active_team_idx, current_state);
+
+        // Restore new team state
+        self.active_team_idx = new_idx;
+        if let Some(saved) = self.saved_team_states.remove(&new_idx) {
+            self.sources = saved.sources;
+            self.issues = saved.issues;
+            self.subsource_errors = saved.subsource_errors;
+            self.nav_items = saved.nav_items;
+            self.nav_idx = saved.nav_idx;
+            self.field_names = saved.field_names;
+            self.field_schemas = saved.field_schemas;
+            self.flags.field_names = saved.field_names_state;
+        } else {
+            // First time switching to this team — initialize from its config
+            self.sources = self.resolved_teams[new_idx]
+                .config
+                .sources
+                .iter()
+                .map(|s| (s.id.clone(), SourceState::Pending))
+                .collect();
+            self.issues = Vec::new();
+            self.subsource_errors = IndexMap::new();
+            self.nav_items = Vec::new();
+            self.nav_idx = 0;
+            self.field_names = HashMap::new();
+            self.field_schemas = HashMap::new();
+            self.flags.field_names = FieldNamesState::Idle;
+        }
+
+        // Reset UI state for the new tab
+        self.detail_scroll = 0;
+        self.view_mode = ViewMode::Default;
+        self.focused_panel = FocusedPanel::List;
+        self.action_state = ActionState::None;
+        self.overlay = None;
+
+        // Trigger source fetches if any sources are still pending
+        if self
+            .sources
+            .values()
+            .any(|s| matches!(s, SourceState::Pending))
+        {
+            self.flags.pending_team_fetch = true;
+        }
+    }
+
+    /// The active team's config.
+    pub fn team_config(&self) -> &TeamConfig {
+        &self.resolved_teams[self.active_team_idx].config
+    }
+
+    /// The active team's effective Jira config (user default + team override).
+    pub fn team_jira(&self) -> &crate::config::types::JiraConfig {
+        &self.resolved_teams[self.active_team_idx].jira
     }
 
     pub fn any_source_loading(&self) -> bool {
@@ -483,18 +588,18 @@ impl AppState {
 }
 
 /// Look up a `SourceConfig` by ID.
-pub fn source_config_for<'a>(config: &'a Config, id: &str) -> Option<&'a SourceConfig> {
-    config.sources.iter().find(|s| s.id == id)
+pub fn source_config_for<'a>(team_config: &'a TeamConfig, id: &str) -> Option<&'a SourceConfig> {
+    team_config.sources.iter().find(|s| s.id == id)
 }
 
 /// Determine the auto view mode for an issue based on its source config.
-fn auto_view_mode(issue: &Issue, config: &Config) -> ViewMode {
+fn auto_view_mode(issue: &Issue, team_config: &TeamConfig) -> ViewMode {
     let Some(source_id) = issue.source_id.as_deref() else {
         return ViewMode::Default;
     };
-    let view_id = source_config_for(config, source_id).and_then(|s| s.view_mode.as_deref());
+    let view_id = source_config_for(team_config, source_id).and_then(|s| s.view_mode.as_deref());
     match view_id {
-        Some(id) if config.views.contains_key(id) => ViewMode::Custom(id.to_string()),
+        Some(id) if team_config.views.contains_key(id) => ViewMode::Custom(id.to_string()),
         _ => ViewMode::Default,
     }
 }
@@ -511,7 +616,7 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
             // Auto-update view mode for newly selected issue
             if let Some(issue) = app.selected_issue() {
                 let issue = issue.clone();
-                let mode = auto_view_mode(&issue, &app.config);
+                let mode = auto_view_mode(&issue, app.team_config());
                 if app.view_mode == ViewMode::Default {
                     app.view_mode = mode;
                 }
@@ -559,31 +664,25 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
                 *completion_idx = None;
             }
         }
+
+        AppEvent::UpdateWarnings(warnings) => {
+            app.update_warnings = warnings;
+        }
     }
 }
 
 fn handle_action_done(app: &mut AppState, result: ActionResult) {
     match result {
-        ActionResult::Error(e) => {
-            app.action_state = ActionState::Error(Arc::new(e));
-        }
-        ActionResult::Hidden { ref issue_key } => {
-            app.issues.retain(|i| &i.key != issue_key);
-            app.rebuild_nav();
-            app.action_state = ActionState::None;
-        }
+        ActionResult::Error(e) => app.action_state = ActionState::Error(Arc::new(e)),
+        ActionResult::Hidden { ref issue_key } => apply_hidden(app, issue_key),
         ActionResult::TransitionApplied {
             ref issue_key,
             ref new_status,
-        } => {
-            apply_transition_applied(app, issue_key, new_status);
-        }
+        } => apply_transition_applied(app, issue_key, new_status),
         ActionResult::TransitionsLoaded {
             issue_key,
             transitions,
-        } => {
-            apply_transitions_loaded(app, issue_key, transitions);
-        }
+        } => apply_transitions_loaded(app, issue_key, transitions),
         ActionResult::AssignedToMe { ref issue_key } => {
             apply_assigned_to_me(app, issue_key);
             app.action_state = ActionState::None;
@@ -591,22 +690,16 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
         ActionResult::MovedToProject {
             ref issue_key,
             ref project,
-        } => {
-            apply_moved_to_project(app, issue_key, project);
-        }
+        } => apply_moved_to_project(app, issue_key, project),
         ActionResult::CommentPosted {
             issue_key,
             new_comment,
-        } => {
-            apply_comment_posted(app, &issue_key, new_comment);
-        }
+        } => apply_comment_posted(app, &issue_key, new_comment),
         ActionResult::FieldUpdated {
             issue_key,
             field_id,
             new_value,
-        } => {
-            apply_field_updated(app, &issue_key, &field_id, &new_value);
-        }
+        } => apply_field_updated(app, &issue_key, &field_id, &new_value),
         ActionResult::FieldOptionsLoaded {
             issue_key,
             field_id,
@@ -630,9 +723,7 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             names,
             schemas,
             all_fields,
-        } => {
-            apply_field_names_loaded(app, names, schemas, all_fields);
-        }
+        } => apply_field_names_loaded(app, names, schemas, all_fields),
         ActionResult::CommentEdited {
             issue_key,
             updated_comment,
@@ -655,16 +746,18 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             attachment_id,
             cache_path,
             open_after,
-        } => {
-            handle_attachment_cached(app, attachment_id, cache_path.as_path(), open_after);
-        }
+        } => handle_attachment_cached(app, attachment_id, cache_path.as_path(), open_after),
         ActionResult::AttachmentUploaded {
             issue_key,
             new_attachment,
-        } => {
-            apply_attachment_uploaded(app, &issue_key, new_attachment);
-        }
+        } => apply_attachment_uploaded(app, &issue_key, new_attachment),
     }
+}
+
+fn apply_hidden(app: &mut AppState, issue_key: &str) {
+    app.issues.retain(|i| i.key != issue_key);
+    app.rebuild_nav();
+    app.action_state = ActionState::None;
 }
 
 fn apply_transitions_loaded(
@@ -687,9 +780,9 @@ fn apply_field_names_loaded(
 ) {
     app.field_names.extend(names);
     app.field_schemas.extend(schemas);
-    app.field_names_loading = false;
+    app.flags.field_names = FieldNamesState::Idle;
     if all_fields {
-        app.all_field_names_loaded = true;
+        app.flags.field_names = FieldNamesState::AllLoaded;
     }
 }
 
@@ -1575,17 +1668,25 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
     // `gg` motion: first `g` arms the latch; a second `g` fires jump-to-first.
     // Any other key clears the latch (handled at the end of each arm via the default clear below).
     if code == KeyCode::Char('g') {
-        if app.pending_g {
-            app.pending_g = false;
+        if app.flags.pending_g {
+            app.flags.pending_g = false;
             key_jump_first(app);
         } else {
-            app.pending_g = true;
+            app.flags.pending_g = true;
         }
         return;
     }
-    app.pending_g = false;
+    app.flags.pending_g = false;
 
     match (code, modifiers) {
+        // Tab switching (only when multiple teams)
+        (KeyCode::Tab, _) if app.resolved_teams.len() > 1 => {
+            app.switch_team((app.active_team_idx + 1) % app.resolved_teams.len());
+        }
+        (KeyCode::BackTab, _) if app.resolved_teams.len() > 1 => {
+            let len = app.resolved_teams.len();
+            app.switch_team((app.active_team_idx + len - 1) % len);
+        }
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
@@ -1611,11 +1712,9 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
                 ViewMode::Comments => ViewMode::Attachments,
                 ViewMode::Attachments => {
                     // Return to the natural view for the current issue
-                    if let Some(issue) = app.selected_issue() {
-                        auto_view_mode(&issue.clone(), &app.config)
-                    } else {
-                        ViewMode::Default
-                    }
+                    app.selected_issue().map_or(ViewMode::Default, |issue| {
+                        auto_view_mode(&issue.clone(), app.team_config())
+                    })
                 }
             };
             app.detail_scroll = 0;
@@ -1628,7 +1727,7 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         }
         (KeyCode::Char('o'), _) => {
             if let Some(issue) = app.selected_issue() {
-                let url = format!("{}/browse/{}", app.config.jira.base_url, issue.key);
+                let url = format!("{}/browse/{}", app.team_jira().base_url, issue.key);
                 let _ = open::that(url);
             }
         }
@@ -1748,7 +1847,7 @@ fn key_hide(app: &mut AppState) {
         let can_hide = issue
             .source_id
             .as_deref()
-            .and_then(|id| source_config_for(&app.config, id))
+            .and_then(|id| source_config_for(app.team_config(), id))
             .is_some_and(|s| s.allow_hide_for_a_day);
         if can_hide {
             app.action_state = ActionState::HidePopup {
@@ -1766,7 +1865,7 @@ fn key_assign(app: &mut AppState) {
         let can_assign = issue
             .source_id
             .as_deref()
-            .and_then(|id| source_config_for(&app.config, id))
+            .and_then(|id| source_config_for(app.team_config(), id))
             .is_some_and(|s| {
                 s.subsources
                     .iter()
@@ -1783,7 +1882,7 @@ fn key_move(app: &mut AppState) {
         let wrong_project = issue
             .source_id
             .as_deref()
-            .and_then(|id| source_config_for(&app.config, id))
+            .and_then(|id| source_config_for(app.team_config(), id))
             .and_then(|s| s.expected_project.as_ref())
             .is_some_and(|ep| issue.fields.project.key != *ep);
         if wrong_project {
@@ -1796,13 +1895,13 @@ fn key_move(app: &mut AppState) {
 fn update_view_mode_on_navigate(app: &mut AppState) {
     if let Some(issue) = app.selected_issue() {
         let issue = issue.clone();
-        app.view_mode = auto_view_mode(&issue, &app.config);
+        app.view_mode = auto_view_mode(&issue, app.team_config());
     }
     app.detail_scroll = 0;
     app.overlay = None;
     app.detail_focus = DetailFocus::Comments;
     app.detail_focus_offsets.clear();
-    app.field_names_loading = false;
+    app.flags.field_names = FieldNamesState::Idle;
 }
 
 fn key_edit_detail_field(app: &mut AppState) {
@@ -2027,7 +2126,7 @@ fn handle_transition_input(app: &mut AppState, event: crossterm::event::Event) {
 #[allow(clippy::needless_pass_by_value)]
 fn handle_hide_input(app: &mut AppState, event: crossterm::event::Event) {
     use crossterm::event::{Event, KeyCode, KeyEvent};
-    let solutions_len = app.config.hide_for_a_day.suggested_solutions.len();
+    let solutions_len = app.team_config().hide_for_a_day.suggested_solutions.len();
 
     if let Event::Key(KeyEvent { code, .. }) = event {
         match code {

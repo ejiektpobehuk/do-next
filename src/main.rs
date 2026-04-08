@@ -41,6 +41,8 @@ enum Commands {
     },
     /// Reconfigure Jira authentication
     Auth,
+    /// Migrate old single-file config to team-based config
+    Migrate,
 }
 
 #[tokio::main]
@@ -56,45 +58,79 @@ async fn main() -> Result<()> {
         log::info!("do-next starting, logging to {}", log_path.display());
     }
 
-    // Load config
-    let (mut config, project_override) = config::load().context("Failed to load configuration")?;
-
-    // Auth reset runs before credential resolution (auth may currently be broken).
-    if matches!(&cli.command, Some(Commands::Auth)) {
-        tui::onboarding::run_auth_reset(&mut config).context("Auth reset failed")?;
+    // Migrate runs before config loading (old format won't parse as new).
+    if matches!(&cli.command, Some(Commands::Migrate)) {
+        subcommands::migrate::run().context("Migration failed")?;
         return Ok(());
     }
 
-    // Run onboarding if config is empty
-    if config.jira.base_url.is_empty() {
-        config = tui::onboarding::run_onboarding().context("Onboarding failed")?;
+    // Load config
+    let mut loaded = config::load().context("Failed to load configuration")?;
+
+    // Auth reset runs before credential resolution (auth may currently be broken).
+    if matches!(&cli.command, Some(Commands::Auth)) {
+        tui::onboarding::run_auth_reset(&mut loaded.config).context("Auth reset failed")?;
+        return Ok(());
     }
 
-    // Resolve authentication
-    let auth = config::credentials::resolve_auth(&config.jira)
-        .context("Failed to resolve Jira authentication")?;
+    // Run onboarding if no config at all (first run)
+    if loaded.config.jira.base_url.is_empty() && loaded.teams.is_empty() {
+        loaded = tui::onboarding::run_onboarding().context("Onboarding failed")?;
+    }
 
-    // Build Jira client
-    let client = jira::JiraClient::new(config.jira.base_url.clone(), auth)
-        .context("Failed to create Jira client")?;
+    // Config exists but no teams — interactive team setup
+    if loaded.teams.is_empty() {
+        loaded =
+            tui::onboarding::run_team_setup(&mut loaded.config).context("Team setup failed")?;
+    }
+
+    // Build one JiraClient per unique base_url across all teams.
+    let mut clients: std::collections::HashMap<String, jira::JiraClient> =
+        std::collections::HashMap::new();
+    for team in &loaded.teams {
+        let url = &team.jira.base_url;
+        if !clients.contains_key(url) {
+            let auth = config::credentials::resolve_auth(&team.jira)
+                .with_context(|| format!("Failed to resolve auth for team '{}'", team.id))?;
+            let client = jira::JiraClient::new(url.clone(), auth)
+                .with_context(|| format!("Failed to create Jira client for team '{}'", team.id))?;
+            clients.insert(url.clone(), client);
+        }
+    }
+
+    // For subcommands, use the first team's client (or default jira).
+    let default_client = if let Some(first_team) = loaded.teams.first() {
+        clients
+            .get(&first_team.jira.base_url)
+            .cloned()
+            .context("No Jira client available")?
+    } else {
+        // No teams at all — use default jira config
+        let auth = config::credentials::resolve_auth(&loaded.config.jira)
+            .context("Failed to resolve Jira authentication")?;
+        jira::JiraClient::new(loaded.config.jira.base_url.clone(), auth)
+            .context("Failed to create Jira client")?
+    };
 
     match cli.command {
         Some(Commands::Comment {
             issue_key,
             no_history,
         }) => {
-            subcommands::comment::run(&client, issue_key.as_deref(), no_history).await?;
+            subcommands::comment::run(&default_client, issue_key.as_deref(), no_history).await?;
         }
         Some(Commands::Fields {
             issue_key,
             field,
             raw,
         }) => {
-            subcommands::fields::run(&client, &issue_key, field.as_deref(), raw).await?;
+            subcommands::fields::run(&default_client, &issue_key, field.as_deref(), raw).await?;
         }
-        Some(Commands::Auth) => unreachable!("handled before credential resolution"),
+        Some(Commands::Auth | Commands::Migrate) => {
+            unreachable!("handled before credential resolution")
+        }
         None => {
-            tui::run(config, client, project_override).await?;
+            tui::run(loaded, clients).await?;
         }
     }
 

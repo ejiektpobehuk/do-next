@@ -116,6 +116,7 @@ impl JiraClient {
                 .await
                 .context("Failed to parse search response")?;
             let fetched = u32::try_from(page.issues.len()).unwrap_or(0);
+            log::debug!("JQL page: fetched={fetched} isLast={}", page.is_last);
             let is_last = page.is_last;
             all_issues.extend(page.issues);
 

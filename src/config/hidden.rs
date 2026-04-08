@@ -53,14 +53,11 @@ impl HiddenState {
     }
 }
 
-/// Resolve the hidden.json5 path: project-local if .do-next/ exists, else user config dir.
-pub fn hidden_path(project_override_exists: bool) -> Result<PathBuf> {
-    if project_override_exists {
-        Ok(PathBuf::from(".do-next/hidden.json5"))
-    } else {
-        Ok(dirs::config_dir()
-            .context("Cannot determine config directory")?
-            .join("do-next")
-            .join("hidden.json5"))
-    }
+/// Resolve the hidden.json5 path for a given team.
+pub fn hidden_path(team_id: &str) -> Result<PathBuf> {
+    Ok(dirs::config_dir()
+        .context("Cannot determine config directory")?
+        .join("do-next")
+        .join("hidden")
+        .join(format!("{team_id}.json5")))
 }

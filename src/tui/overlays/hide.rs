@@ -6,10 +6,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
-use crate::config::types::Config;
+use crate::config::types::TeamConfig;
 use crate::tui::app::ActionState;
 
-pub fn render_hide_overlay(f: &mut Frame, action: &ActionState, config: &Config) {
+pub fn render_hide_overlay(f: &mut Frame, action: &ActionState, config: &TeamConfig) {
     let ActionState::HidePopup {
         issue_key,
         selected_solution,

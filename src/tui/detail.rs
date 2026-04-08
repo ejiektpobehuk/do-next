@@ -120,7 +120,7 @@ fn render_subsource_error(
         return;
     };
 
-    let src_cfg = source_config_for(&app.config, source_id);
+    let src_cfg = source_config_for(app.team_config(), source_id);
     let src_name = src_cfg.map_or_else(|| source_id.to_string(), |s| s.display_name().to_string());
     let badge = src_cfg
         .and_then(|s| s.subsources.get(sub_idx))
@@ -165,7 +165,7 @@ fn render_source_error(f: &mut Frame, area: Rect, source_id: &str, app: &AppStat
     let Some(SourceState::Error(e)) = app.sources.get(source_id) else {
         return;
     };
-    let src_cfg = source_config_for(&app.config, source_id);
+    let src_cfg = source_config_for(app.team_config(), source_id);
     let src_name = src_cfg.map_or_else(|| source_id.to_string(), |s| s.display_name().to_string());
     let jql = src_cfg.map_or("(unknown)", |s| s.jql.as_str());
 

@@ -23,6 +23,8 @@ pub enum AppEvent {
         generation: u64,
         completions: Vec<String>,
     },
+    /// Git-based update warnings for team configs (sent once on startup).
+    UpdateWarnings(Vec<String>),
 }
 
 #[derive(Debug)]

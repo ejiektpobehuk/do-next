@@ -222,7 +222,7 @@ pub fn render_detail_view(
 /// Extract the current view config from app state, or None for the default view.
 pub fn current_view_config(app: &AppState) -> Option<&CustomViewConfig> {
     match &app.view_mode {
-        crate::tui::app::ViewMode::Custom(id) => app.config.views.get(id.as_str()),
+        crate::tui::app::ViewMode::Custom(id) => app.team_config().views.get(id.as_str()),
         _ => None,
     }
 }

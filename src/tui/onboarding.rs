@@ -6,7 +6,8 @@ use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use std::io;
 use std::io::Write;
 
-use crate::config::types::{Config, JiraConfig};
+use crate::config::LoadedConfig;
+use crate::config::types::{Config, JiraConfig, ResolvedTeam, TeamConfig, TeamRef};
 use crate::jira::auth::OAuthStore;
 
 // ── Step 1: auth method ─────────────────────────────────────────────────────
@@ -88,9 +89,9 @@ enum ConfigStyle {
 // ── Onboarding (first run) ──────────────────────────────────────────────────
 
 /// Run the interactive first-run wizard.
-/// Returns a fully configured Config (credentials stored per user's choice).
+/// Returns a fully configured `LoadedConfig` (credentials stored per user's choice).
 #[allow(clippy::too_many_lines)]
-pub fn run_onboarding() -> Result<Config> {
+pub fn run_onboarding() -> Result<LoadedConfig> {
     println!("Welcome to do-next! Let's set up your configuration.\n");
 
     let base_url = prompt(
@@ -119,7 +120,7 @@ pub fn run_onboarding() -> Result<Config> {
 
     let mut jira_config = JiraConfig {
         base_url: base_url.clone(),
-        default_project,
+        default_project: default_project.clone(),
         email,
         ..Default::default()
     };
@@ -149,25 +150,56 @@ pub fn run_onboarding() -> Result<Config> {
         }
     }
 
+    // Create the personal team directory and config.
+    let team_dir = config_dir.join("teams").join("personal");
+    std::fs::create_dir_all(&team_dir)?;
+
+    let team_ref = TeamRef {
+        id: "personal".into(),
+        path: team_dir.to_string_lossy().into_owned(),
+        file: None,
+    };
+
     let config = Config {
         jira: jira_config.clone(),
+        teams: vec![team_ref],
         ..Default::default()
     };
 
     println!();
     let config_style = prompt_config_style()?;
 
+    // Write user config (jira credentials + team reference).
     let config_path = config_dir.join("config.json5");
-    let json5_content = match config_style {
+    let user_json5 = match config_style {
         ConfigStyle::Minimal => json5::to_string(&config)?,
-        ConfigStyle::Template => {
-            template_config(&base_url, &config.jira.default_project, &jira_config)
-        }
+        ConfigStyle::Template => template_user_config(&base_url, &default_project, &jira_config),
     };
-    std::fs::write(&config_path, json5_content)?;
+    std::fs::write(&config_path, &user_json5)?;
     println!("Config written to {}", config_path.display());
 
-    Ok(config)
+    // Write team config (sources, views, etc.).
+    let team_config = default_personal_team_config(&default_project);
+    let team_config_path = team_dir.join("do-next.json5");
+    let team_json5 = match config_style {
+        ConfigStyle::Minimal => json5::to_string(&team_config)?,
+        ConfigStyle::Template => template_team_config(&default_project),
+    };
+    std::fs::write(&team_config_path, &team_json5)?;
+    println!("Team config written to {}", team_config_path.display());
+
+    let resolved = ResolvedTeam {
+        id: "personal".into(),
+        path: team_dir.to_string_lossy().into_owned(),
+        config: team_config,
+        jira: jira_config,
+    };
+
+    Ok(LoadedConfig {
+        config,
+        teams: vec![resolved],
+        load_errors: Vec::new(),
+    })
 }
 
 // ── Auth reset ──────────────────────────────────────────────────────────────
@@ -249,6 +281,127 @@ pub fn run_auth_reset(config: &mut Config) -> Result<()> {
     println!("Config updated at {}", config_path.display());
 
     Ok(())
+}
+
+// ── Team setup (no teams configured) ────────────────────────────────────────
+
+const TEAM_SETUP_COUNT: usize = 2;
+
+const TEAM_SETUP_LABELS: [&str; TEAM_SETUP_COUNT] =
+    ["Create personal space", "Use existing config "];
+
+const TEAM_SETUP_DESCRIPTIONS: [&str; TEAM_SETUP_COUNT] = [
+    "create a local team config for your personal sources",
+    "provide a path to an existing team config (e.g. a cloned git repo)",
+];
+
+/// Interactive prompt when config exists but has no teams.
+/// Adds at least one team to the config and returns the updated `LoadedConfig`.
+pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
+    println!("No teams configured. Let's set one up.\n");
+
+    let tags = vec![String::new(); TEAM_SETUP_COUNT];
+    let choice = run_selection(
+        "How would you like to add a team?",
+        &TEAM_SETUP_LABELS,
+        &TEAM_SETUP_DESCRIPTIONS,
+        &tags,
+        0,
+        None,
+    )?;
+
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?
+        .join("do-next");
+
+    let (team_ref, team_config, team_jira) = if choice == 0 {
+        // Create personal space
+        let team_dir = config_dir.join("teams").join("personal");
+        std::fs::create_dir_all(&team_dir)?;
+
+        let default_project = &config.jira.default_project;
+        let team_config_path = team_dir.join("do-next.json5");
+        let tc = if team_config_path.exists() {
+            // Reuse existing team config (e.g. from a prior migration)
+            let raw = std::fs::read_to_string(&team_config_path)?;
+            let existing: TeamConfig = json5::from_str(&raw)?;
+            println!(
+                "Using existing team config at {}",
+                team_config_path.display()
+            );
+            existing
+        } else {
+            let tc = default_personal_team_config(default_project);
+            let json5_content = template_team_config(default_project);
+            std::fs::write(&team_config_path, &json5_content)?;
+            println!("Team config created at {}", team_config_path.display());
+            tc
+        };
+
+        let tr = TeamRef {
+            id: "personal".into(),
+            path: team_dir.to_string_lossy().into_owned(),
+            file: None,
+        };
+        (tr, tc, config.jira.clone())
+    } else {
+        // Use existing path
+        println!();
+        let path = prompt("Path to team config directory: ", None)?;
+        let expanded = crate::config::expand_tilde(&path);
+        let file_name = "do-next.json5";
+        let config_path = expanded.join(file_name);
+        if !config_path.exists() {
+            return Err(anyhow::anyhow!(
+                "No {} found at {}",
+                file_name,
+                expanded.display()
+            ));
+        }
+
+        println!();
+        let id = prompt("Team ID (short name for tab label): ", None)?;
+
+        let raw = std::fs::read_to_string(&config_path)?;
+        let tc: TeamConfig = json5::from_str(&raw)?;
+
+        let jira = if let Some(ref overlay) = tc.jira {
+            let mut j = config.jira.clone();
+            crate::config::apply_team_jira_override(&mut j, overlay);
+            j
+        } else {
+            config.jira.clone()
+        };
+
+        let tr = TeamRef {
+            id: id.clone(),
+            path: path.clone(),
+            file: None,
+        };
+        println!("Team '{id}' added from {path}");
+        (tr, tc, jira)
+    };
+
+    config.teams.push(team_ref.clone());
+
+    // Save updated config
+    let config_path = config_dir.join("config.json5");
+    let json5_content = json5::to_string(&config)?;
+    std::fs::write(&config_path, &json5_content)?;
+    println!("Config updated at {}", config_path.display());
+
+    let resolved = ResolvedTeam {
+        id: team_ref.id,
+        path: team_ref.path,
+        config: team_config,
+        jira: team_jira,
+    };
+
+    Ok(LoadedConfig {
+        config: config.clone(),
+        teams: vec![resolved],
+        load_errors: Vec::new(),
+    })
 }
 
 // ── Token storage application ───────────────────────────────────────────────
@@ -744,7 +897,8 @@ fn prompt_config_style() -> Result<ConfigStyle> {
 
 // ── Template config ─────────────────────────────────────────────────────────
 
-fn template_config(
+/// Generate a template user config (jira credentials + team references).
+fn template_user_config(
     base_url: &str,
     default_project: &str,
     jira_config: &crate::config::types::JiraConfig,
@@ -779,6 +933,11 @@ fn template_config(
         "    // credential_store: \"keyring\",\n    // credential_command: \"pass show jira/do-next\",\n    // Env: DO_NEXT_JIRA_API_TOKEN=<your-api-token>\n".to_string()
     };
 
+    let config_dir = dirs::config_dir()
+        .map(|d| d.join("do-next").join("teams").join("personal"))
+        .unwrap_or_default();
+    let team_path = config_dir.to_string_lossy();
+
     format!(
         r#"{{
   jira: {{
@@ -795,117 +954,56 @@ fn template_config(
     // Email override:        DO_NEXT_JIRA_EMAIL=<email>
 {cred_line}{cred_comments}  }},
 
-  // Sources in priority order (first = highest priority).
-  // Each source is self-contained: JQL, display, badges, subsources.
-  sources: [
+  // Teams — each team has its own sources, views, and display config.
+  // Add more teams by cloning a shared config repo and adding an entry here.
+  teams: [
+    {{
+      id: "personal",
+      path: "{team_path}",
+    }},
     // {{
-    //   id: "incidents_in_progress",
-    //   display_name: "Incidents in progress",
-    //   jql: "assignee = currentUser() AND type = Incident AND status = \"In Progress\"",
-    //   expected_project: "{default_project}",
-    //   indication: {{ symbol: "!", color: "red" }},
-    // }},
-    // {{
-    //   id: "asap_tasks",
-    //   display_name: "ASAP tasks",
-    //   jql: "project = {default_project} AND priority = Highest AND status = \"To Do\"",
-    //   indication: {{ symbol: "★", color: "yellow" }},
-    //   subsources: [
-    //     {{ jql_filter: "assignee = currentUser()" }},
-    //     {{ jql_filter: "assignee is EMPTY", badge: "unassigned" }},
-    //   ],
-    // }},
-    // {{
-    //   id: "postmortem",
-    //   display_name: "Filling up the postmortem",
-    //   jql: "assignee = currentUser() AND type = Incident AND status = \"Mitigated\"",
-    //   expected_project: "{default_project}",
-    //   view_mode: "postmortem",   // references a key in the `views` map below
-    //   indication: {{ symbol: "📋", color: "blue" }},
-    // }},
-    // {{
-    //   id: "tasks_i_review",
-    //   display_name: "Tasks I'm reviewing",
-    //   jql: "filter = 12345",
-    //   indication: {{ symbol: "👀", color: "cyan" }},
-    //   badges: ["assignee"],
-    // }},
-    // {{
-    //   id: "my_stale_in_review",
-    //   display_name: "My tasks stale in review",
-    //   jql: "assignee = currentUser() AND status = \"Ready for review\" ORDER BY updated ASC",
-    //   indication: {{ symbol: "⏱", color: "magenta" }},
-    //   allow_hide_for_a_day: true,
-    //   badges: ["stale"],
-    // }},
-    // {{
-    //   id: "my_active_tasks",
-    //   display_name: "My active tasks",
-    //   jql: "assignee = currentUser() AND status = \"In Progress\"",
-    //   indication: {{ symbol: "▶", color: "green" }},
-    // }},
-    // {{
-    //   id: "teammate_tasks_to_review",
-    //   display_name: "Teammate's tasks I can review",
-    //   jql: "project = {default_project} AND status = \"Ready for review\"",
-    //   indication: {{ symbol: "✓", color: "cyan" }},
-    //   subsources: [
-    //     {{ jql_filter: "reviewer = currentUser()", badge: "reviewing" }},
-    //     {{ jql_filter: "reviewer is EMPTY", badge: "unassigned" }},
-    //   ],
-    // }},
-    // {{
-    //   id: "regular_by_priority",
-    //   display_name: "Regular tasks by priority",
-    //   jql: "project = {default_project}",
-    //   indication: {{ symbol: "·", color: "default" }},
-    //   subsources: [
-    //     {{ jql_filter: "assignee = currentUser()" }},
-    //     {{ jql_filter: "assignee is EMPTY", badge: "unassigned" }},
-    //   ],
+    //   id: "platform",
+    //   path: "~/work/platform-do-next-config",
+    //   // file: "do-next.json5",  // optional, defaults to "do-next.json5"
     // }},
   ],
-
-  list: {{
-    // default_indication: {{ symbol: "•", color: "default" }},
-  }},
-
-  // hide_for_a_day: {{
-  //   duration_hours: 24,
-  //   suggested_solutions: [
-  //     {{ label: "Ping reviewer (e.g. in Slack)" }},
-  //     {{ label: "Set up a call with reviewer" }},
-  //   ],
-  // }},
-
-  // Custom views keyed by name. Sources reference these via `view_mode: "key"`.
-  // The default view (no view_mode) shows all issue fields automatically.
-  // views: {{
-  //   postmortem: {{
-  //     timezone: "+03",
-  //     sections: [
-  //       {{
-  //         title: "Timeline",
-  //         fields: [
-  //           {{ field_id: "customfield_10000", name: "Start time", datetime: true, duration_role: "start" }},
-  //           {{ field_id: "customfield_10001", name: "End time", datetime: true, duration_role: "end" }},
-  //           {{ field_id: "customfield_10002", name: "Duration (Jira)", duration_role: "jira_value" }},
-  //         ],
-  //       }},
-  //       {{
-  //         title: "Root cause",
-  //         fields: [
-  //           {{ field_id: "customfield_10003", name: "Root cause", use_editor: true }},
-  //         ],
-  //       }},
-  //     ],
-  //   }},
-  // }},
 
   // cache: {{
   //   enabled: true,
   //   max_age_seconds: 300,
   // }},
+}}
+"#
+    )
+}
+
+/// Build the default personal team config with a "`my_tasks`" source.
+fn default_personal_team_config(default_project: &str) -> TeamConfig {
+    use crate::config::types::SourceConfig;
+    TeamConfig {
+        sources: vec![SourceConfig {
+            id: "my_tasks".into(),
+            display_name: Some("My tasks".into()),
+            jql: format!(
+                "assignee = currentUser() AND project = {default_project} AND statusCategory != Done ORDER BY priority DESC, updated DESC"
+            ),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// Generate a template team config (sources, views, etc.).
+fn template_team_config(default_project: &str) -> String {
+    format!(
+        r#"{{
+  sources: [
+    {{
+      id: "my_tasks",
+      display_name: "My tasks",
+      jql: "assignee = currentUser() AND project = {default_project} AND statusCategory != Done ORDER BY priority DESC, updated DESC",
+    }},
+  ],
 }}
 "#
     )

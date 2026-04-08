@@ -20,8 +20,8 @@ use std::io;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::time::{Duration, interval};
 
+use crate::config::LoadedConfig;
 use crate::config::hidden::{HiddenState, hidden_path};
-use crate::config::types::Config;
 use crate::events::{ActionResult, AppEvent};
 use crate::jira::JiraClient;
 use crate::sources::spawn_fetches;
@@ -32,7 +32,10 @@ use crate::tui::app::{
 use crate::tui::render::{RenderOut, render};
 
 /// Entry point for the interactive TUI.
-pub async fn run(config: Config, client: JiraClient, project_override: bool) -> Result<()> {
+pub async fn run(
+    loaded: LoadedConfig,
+    clients: std::collections::HashMap<String, JiraClient>,
+) -> Result<()> {
     // Terminal setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -40,7 +43,7 @@ pub async fn run(config: Config, client: JiraClient, project_override: bool) -> 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_inner(&mut terminal, config, client, project_override).await;
+    let result = run_inner(&mut terminal, loaded, clients).await;
 
     // Cleanup
     disable_raw_mode()?;
@@ -52,53 +55,35 @@ pub async fn run(config: Config, client: JiraClient, project_override: bool) -> 
 
 async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    config: Config,
-    client: JiraClient,
-    project_override: bool,
+    loaded: LoadedConfig,
+    clients: std::collections::HashMap<String, JiraClient>,
 ) -> Result<()> {
     let (tx, mut rx) = unbounded_channel::<AppEvent>();
-    let mut app = AppState::new(config);
+    let mut app = AppState::new(loaded.teams.clone());
 
-    // Fetch current user (best-effort; subsource sorting depends on it)
-    {
-        let client2 = client.clone();
-        let tx2 = tx.clone();
-        tokio::spawn(async move {
-            if let Ok(user) = client2.current_user().await {
-                let _ = tx2.send(AppEvent::CurrentUserResolved(user));
-            }
-        });
+    // Surface team config load errors as warnings
+    if !loaded.load_errors.is_empty() {
+        app.update_warnings = loaded.load_errors.clone();
     }
 
-    // Spawn fetch tasks for all sources
-    spawn_fetches(&client, &app.config, &tx);
-
-    // Mark all sources as Loading (they were Pending)
-    for state in app.sources.values_mut() {
-        *state = crate::tui::app::SourceState::Loading;
-    }
-
-    // Spawn input task
-    let mut input_task = spawn_input_task(tx.clone());
-
-    // Spawn tick task (active while loading)
-    let tick_tx = tx.clone();
-    let tick_handle = tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_millis(100));
-        loop {
-            ticker.tick().await;
-            if tick_tx.send(AppEvent::Tick).is_err() {
-                break;
-            }
-        }
-    });
+    let client = spawn_initial_tasks(&mut app, &loaded, &clients, &tx)?;
 
     // Initialize image picker (best-effort; terminal must be in raw mode for query)
     app.image_picker = ratatui_image::picker::Picker::from_query_stdio().ok();
 
-    let hidden_file = hidden_path(project_override)?;
+    let team_id = app
+        .resolved_teams
+        .first()
+        .map_or("personal", |t| t.id.as_str());
+    let hidden_file = hidden_path(team_id)?;
     let mut hidden = HiddenState::load(&hidden_file)?;
 
+    // Keep the clients map for tab switching.
+    let clients_map = clients;
+
+    let mut input_task = spawn_input_task(tx.clone());
+    // Tick task is spawned on-demand: only while sources are loading.
+    let mut tick_handle: Option<tokio::task::JoinHandle<()>> = Some(spawn_tick_task(tx.clone()));
     let mut list_state = ListState::default();
 
     // Main event loop
@@ -107,29 +92,58 @@ async fn run_inner(
 
         update_state(&mut app, event);
 
-        maybe_spawn_field_names_fetch(&mut app, &client, &tx);
+        // Handle tab switch: spawn fetches for newly active team
+        if app.flags.pending_team_fetch {
+            app.flags.pending_team_fetch = false;
+            if let Some(team) = app.resolved_teams.get(app.active_team_idx)
+                && let Some(team_client) = clients_map.get(&team.jira.base_url)
+            {
+                spawn_fetches(team_client, app.team_config(), &tx);
+                for state in app.sources.values_mut() {
+                    if matches!(state, crate::tui::app::SourceState::Pending) {
+                        *state = crate::tui::app::SourceState::Loading;
+                    }
+                }
+            }
+        }
 
-        handle_pending_comment(terminal, &mut app, &client, &tx, &mut rx, &mut input_task);
+        // Manage tick task lifecycle: run only while sources are loading
+        if app.any_source_loading() {
+            if tick_handle
+                .as_ref()
+                .is_none_or(tokio::task::JoinHandle::is_finished)
+            {
+                tick_handle = Some(spawn_tick_task(tx.clone()));
+            }
+        } else if let Some(h) = tick_handle.take() {
+            h.abort();
+        }
+
+        // Resolve the current team's client for actions
+        let active_client_ref = app
+            .resolved_teams
+            .get(app.active_team_idx)
+            .and_then(|t| clients_map.get(&t.jira.base_url))
+            .unwrap_or(&client);
+
+        maybe_spawn_field_names_fetch(&mut app, active_client_ref, &tx);
+
+        handle_pending_comment(
+            terminal,
+            &mut app,
+            active_client_ref,
+            &tx,
+            &mut rx,
+            &mut input_task,
+        );
         handle_pending_field_edit(terminal, &mut app, &mut rx, &mut input_task, &tx);
         handle_pending_comment_edit(terminal, &mut app, &mut rx, &mut input_task, &tx);
 
         // Dispatch any pending action signals (transition fetch, hide, assign, move)
-        dispatch_action(
-            &mut app,
-            &client,
-            &tx,
-            &mut hidden,
-            &hidden_file,
-            project_override,
-        )?;
+        dispatch_action(&mut app, active_client_ref, &tx, &mut hidden, &hidden_file)?;
 
         if app.should_quit {
             break;
-        }
-
-        // Stop tick task once all sources are done
-        if app.all_sources_terminal() {
-            tick_handle.abort();
         }
 
         let mut render_out = RenderOut::default();
@@ -142,8 +156,68 @@ async fn run_inner(
         app.overlay_comment_offsets = std::mem::take(&mut render_out.overlay_comment_offsets);
     }
 
-    tick_handle.abort();
+    if let Some(h) = tick_handle {
+        h.abort();
+    }
     Ok(())
+}
+
+/// Spawn background tasks for the active team: user resolution, source fetches,
+/// update checks. Returns the active team's `JiraClient`.
+fn spawn_initial_tasks(
+    app: &mut AppState,
+    loaded: &LoadedConfig,
+    clients: &std::collections::HashMap<String, JiraClient>,
+    tx: &UnboundedSender<AppEvent>,
+) -> Result<JiraClient> {
+    let active_client = app
+        .resolved_teams
+        .first()
+        .and_then(|t| clients.get(&t.jira.base_url))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("No teams configured. Run do-next to set up a team."))?;
+
+    // Fetch current user (best-effort; subsource sorting depends on it)
+    let user_client = active_client.clone();
+    let user_tx = tx.clone();
+    tokio::spawn(async move {
+        if let Ok(user) = user_client.current_user().await {
+            let _ = user_tx.send(AppEvent::CurrentUserResolved(user));
+        }
+    });
+
+    // Spawn fetch tasks for the active team's sources
+    spawn_fetches(&active_client, app.team_config(), tx);
+    for state in app.sources.values_mut() {
+        *state = crate::tui::app::SourceState::Loading;
+    }
+
+    // Spawn background update checks for team config repos
+    let teams = loaded.teams.clone();
+    let update_tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let warnings: Vec<String> = teams
+            .iter()
+            .filter_map(crate::config::updates::check_team_update)
+            .collect();
+        if !warnings.is_empty() {
+            let _ = update_tx.send(AppEvent::UpdateWarnings(warnings));
+        }
+    });
+
+    Ok(active_client)
+}
+
+fn spawn_tick_task(tx: UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_millis(100));
+        loop {
+            ticker.tick().await;
+            if tx.send(AppEvent::Tick).is_err() {
+                break;
+            }
+        }
+    })
 }
 
 fn handle_pending_comment(
@@ -265,7 +339,6 @@ fn dispatch_action(
     tx: &UnboundedSender<AppEvent>,
     hidden: &mut HiddenState,
     hidden_file: &std::path::PathBuf,
-    _project_override: bool,
 ) -> Result<()> {
     dispatch_background_tasks(app, client, tx);
 
@@ -410,7 +483,7 @@ fn dispatch_pending_hide(
     app.action_state = ActionState::AwaitingAction {
         description: "Hiding…".into(),
     };
-    let duration = app.config.hide_for_a_day.duration_hours();
+    let duration = app.team_config().hide_for_a_day.duration_hours();
     hidden.hide_for(&issue_key, duration);
     hidden.save(hidden_file)?;
     let _ = tx.send(AppEvent::ActionDone(ActionResult::Hidden { issue_key }));
@@ -442,7 +515,7 @@ fn dispatch_pending_move(
     app.action_state = ActionState::AwaitingAction {
         description: "Moving…".into(),
     };
-    let target = app.config.jira.default_project.clone();
+    let target = app.team_jira().default_project.clone();
     spawn_move(issue_key, target, client.clone(), tx.clone());
 }
 
@@ -905,11 +978,11 @@ fn maybe_spawn_field_names_fetch(
     client: &JiraClient,
     tx: &UnboundedSender<AppEvent>,
 ) {
-    use crate::tui::app::ViewMode;
+    use crate::tui::app::{FieldNamesState, ViewMode};
     if !matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) {
         return;
     }
-    if app.field_names_loading {
+    if app.flags.field_names == FieldNamesState::Loading {
         return;
     }
 
@@ -917,7 +990,7 @@ fn maybe_spawn_field_names_fetch(
         let Some(issue) = app.selected_issue() else {
             return;
         };
-        let Some(cfg) = app.config.views.get(id.as_str()) else {
+        let Some(cfg) = app.team_config().views.get(id.as_str()) else {
             return;
         };
         // Only fetch names for fields that don't have a name override and aren't cached yet
@@ -936,15 +1009,15 @@ fn maybe_spawn_field_names_fetch(
             return;
         }
         let issue_key = issue.key.clone();
-        app.field_names_loading = true;
+        app.flags.field_names = FieldNamesState::Loading;
         spawn_load_field_names_editmeta(issue_key, field_ids, client.clone(), tx.clone());
     } else {
         // Default view: use the global field registry to get names for all fields.
         // This covers readonly fields that don't appear in editmeta.
-        if app.all_field_names_loaded {
+        if app.flags.field_names == FieldNamesState::AllLoaded {
             return;
         }
-        app.field_names_loading = true;
+        app.flags.field_names = FieldNamesState::Loading;
         spawn_load_all_field_names(client.clone(), tx.clone());
     }
 }

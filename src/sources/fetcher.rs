@@ -57,6 +57,11 @@ pub fn spawn_fetch(client: JiraClient, source_cfg: SourceConfig, tx: UnboundedSe
             all_issues
         };
 
+        log::debug!(
+            "Source '{}' fetch complete: {} issues",
+            source_id,
+            issues.len()
+        );
         let _ = tx.send(AppEvent::SourceLoaded(source_id, issues));
     });
 }

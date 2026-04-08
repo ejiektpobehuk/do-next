@@ -2,10 +2,50 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Top-level config, merged from user config and optional project override.
+/// Top-level user config (personal settings + team references).
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Config {
+    #[serde(default)]
     pub jira: JiraConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
+    /// Team references. Onboarding creates at least one ("personal").
+    #[serde(default)]
+    pub teams: Vec<TeamRef>,
+}
+
+/// A reference to a team config directory.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TeamRef {
+    /// Short identifier used for display (tab label) and hidden-state namespacing.
+    pub id: String,
+    /// Path to the directory containing the team config file.
+    pub path: String,
+    /// Config file name inside `path` (default: "do-next.json5").
+    pub file: Option<String>,
+}
+
+/// Partial Jira overrides for team configs. All fields optional — only set fields
+/// override the user's default Jira config.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TeamJiraOverride {
+    pub base_url: Option<String>,
+    pub default_project: Option<String>,
+    pub email: Option<String>,
+    pub credential_command: Option<String>,
+    pub credential_store: Option<String>,
+    pub credential_key: Option<String>,
+    pub auth_method: Option<String>,
+    pub oauth_client_id: Option<String>,
+    pub oauth_client_secret: Option<String>,
+}
+
+/// Team-level config: shareable across team members via a git repo.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TeamConfig {
+    /// Optional Jira overrides. If absent, inherits the user's default `jira`.
+    #[serde(default)]
+    pub jira: Option<TeamJiraOverride>,
     /// Sources in priority order (position = priority, first = highest).
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
@@ -16,8 +56,16 @@ pub struct Config {
     /// Named custom views. Source `view_mode` references a key in this map.
     #[serde(default)]
     pub views: HashMap<String, CustomViewConfig>,
-    #[serde(default)]
-    pub cache: CacheConfig,
+}
+
+/// A fully resolved team: team ref + loaded config + effective Jira config.
+#[derive(Debug, Clone)]
+pub struct ResolvedTeam {
+    pub id: String,
+    pub path: String,
+    pub config: TeamConfig,
+    /// Effective Jira config (team override merged on top of user default).
+    pub jira: JiraConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

@@ -127,6 +127,10 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         Style::default().fg(nav_color(list_focused)),
     ));
     hints.push(Span::raw(" | "));
+    if app.resolved_teams.len() > 1 {
+        hints.push(Span::styled("Tab", Style::default().fg(Color::Blue)));
+        hints.push(Span::raw(" team | "));
+    }
     hints.push(Span::styled("?", Style::default().fg(Color::Blue)));
     hints.push(Span::raw(" | ("));
     hints.push(Span::styled("q", Style::default().fg(Color::Red)));

@@ -28,7 +28,7 @@ pub fn render_list(
 
     // Build display items by iterating source order
     for (source_id, state) in &app.sources {
-        let src_cfg = source_config_for(&app.config, source_id);
+        let src_cfg = source_config_for(app.team_config(), source_id);
 
         // Add source separator
         let sep_text = source_separator_text(source_id, src_cfg);
@@ -212,7 +212,7 @@ fn issue_row(
 ) -> Line<'static> {
     let indication = src_cfg
         .and_then(|s| s.indication.clone())
-        .or_else(|| app.config.list.default_indication.clone())
+        .or_else(|| app.team_config().list.default_indication.clone())
         .unwrap_or_default();
 
     let color = parse_color(&indication.color);
