@@ -322,7 +322,7 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
         let default_project = &config.jira.default_project;
         let team_config_path = team_dir.join("do-next.json5");
         let tc = if team_config_path.exists() {
-            // Reuse existing team config (e.g. from a prior migration)
+            // Reuse existing team config
             let raw = std::fs::read_to_string(&team_config_path)?;
             let existing: TeamConfig = json5::from_str(&raw)?;
             println!(

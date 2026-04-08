@@ -41,8 +41,6 @@ enum Commands {
     },
     /// Reconfigure Jira authentication
     Auth,
-    /// Migrate old single-file config to team-based config
-    Migrate,
 }
 
 #[tokio::main]
@@ -56,12 +54,6 @@ async fn main() -> Result<()> {
         WriteLogger::init(LevelFilter::Debug, Config::default(), file)
             .context("Failed to initialise logger")?;
         log::info!("do-next starting, logging to {}", log_path.display());
-    }
-
-    // Migrate runs before config loading (old format won't parse as new).
-    if matches!(&cli.command, Some(Commands::Migrate)) {
-        subcommands::migrate::run().context("Migration failed")?;
-        return Ok(());
     }
 
     // Load config
@@ -126,7 +118,7 @@ async fn main() -> Result<()> {
         }) => {
             subcommands::fields::run(&default_client, &issue_key, field.as_deref(), raw).await?;
         }
-        Some(Commands::Auth | Commands::Migrate) => {
+        Some(Commands::Auth) => {
             unreachable!("handled before credential resolution")
         }
         None => {
