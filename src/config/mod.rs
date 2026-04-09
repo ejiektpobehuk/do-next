@@ -32,11 +32,21 @@ pub fn load() -> Result<LoadedConfig> {
         match load_team_config(team_ref) {
             Ok(team_config) => {
                 let jira = resolve_team_jira(&config.jira, &team_config);
+                let open_slack_in_app = team_config
+                    .open_slack_in_app
+                    .or(config.open_slack_in_app)
+                    .unwrap_or(true);
+                let slack_team_id = team_config
+                    .slack_team_id
+                    .clone()
+                    .or_else(|| config.slack_team_id.clone());
                 teams.push(ResolvedTeam {
                     id: team_ref.id.clone(),
                     path: team_ref.path.clone(),
                     config: team_config,
                     jira,
+                    open_slack_in_app,
+                    slack_team_id,
                 });
             }
             Err(e) => {

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -1904,6 +1905,50 @@ fn update_view_mode_on_navigate(app: &mut AppState) {
     app.flags.field_names = FieldNamesState::Idle;
 }
 
+/// Open a readonly URL, routing Slack links to the desktop app when enabled.
+fn open_readonly_url(
+    url: &str,
+    open_slack_in_app: bool,
+    slack_team_id: Option<&str>,
+    open_with: Option<&str>,
+) {
+    let is_slack = url.contains(".slack.com/");
+    let use_slack = match open_with {
+        Some("browser") => false,
+        Some("slack") => true,
+        _ => open_slack_in_app && is_slack,
+    };
+    if use_slack && let Some(deep_link) = slack_deep_link(url, slack_team_id) {
+        let _ = open::that_detached(deep_link);
+        return;
+    }
+    let _ = open::that_detached(url);
+}
+
+/// Convert a Slack web URL to a `slack://` deep link.
+///
+/// Input:  `https://workspace.slack.com/archives/C0123ABC/p1234567890123456`
+/// Output: `slack://channel?team=T0123&id=C0123ABC&thread_ts=1234567890.123456`
+fn slack_deep_link(url: &str, team_id: Option<&str>) -> Option<String> {
+    let team_id = team_id?;
+    let path = url.split(".slack.com/").nth(1)?;
+    let mut segments = path.split('/');
+    if segments.next()? != "archives" {
+        return None;
+    }
+    let channel_id = segments.next()?;
+    let mut deep = format!("slack://channel?team={team_id}&id={channel_id}");
+    if let Some(msg_segment) = segments.next()
+        && let Some(raw_ts) = msg_segment.strip_prefix('p')
+        && raw_ts.len() > 6
+    {
+        // Slack timestamps: "p1234567890123456" → "1234567890.123456"
+        let (secs, micros) = raw_ts.split_at(raw_ts.len() - 6);
+        let _ = write!(deep, "&thread_ts={secs}.{micros}");
+    }
+    Some(deep)
+}
+
 fn key_edit_detail_field(app: &mut AppState) {
     let Some(issue) = app.selected_issue() else {
         return;
@@ -1941,12 +1986,20 @@ fn key_edit_detail_field(app: &mut AppState) {
 
     let field_cfg = crate::tui::views::custom::view_field_cfg(view_cfg, Some(&issue), field_idx);
 
-    // Readonly fields: open URL in browser if the value is a link, otherwise do nothing
+    // Readonly fields: open URL if the value is a link, otherwise do nothing.
+    // Slack URLs are opened in the Slack desktop app by default.
     if field_cfg.as_ref().and_then(|f| f.readonly).unwrap_or(false) {
         if let serde_json::Value::String(s) = &original_json
             && (s.starts_with("http://") || s.starts_with("https://"))
         {
-            let _ = open::that(s.clone());
+            let team = &app.resolved_teams[app.active_team_idx];
+            let open_with = field_cfg.as_ref().and_then(|f| f.open_with.as_deref());
+            open_readonly_url(
+                s,
+                team.open_slack_in_app,
+                team.slack_team_id.as_deref(),
+                open_with,
+            );
         }
         return;
     }

@@ -193,6 +193,8 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
         path: team_dir.to_string_lossy().into_owned(),
         config: team_config,
         jira: jira_config,
+        open_slack_in_app: true,
+        slack_team_id: None,
     };
 
     Ok(LoadedConfig {
@@ -395,6 +397,8 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
         path: team_ref.path,
         config: team_config,
         jira: team_jira,
+        open_slack_in_app: true,
+        slack_team_id: None,
     };
 
     Ok(LoadedConfig {

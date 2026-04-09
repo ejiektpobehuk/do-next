@@ -97,12 +97,29 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
                         .as_ref()
                         .map(|f| f.field_id.clone())
                         .unwrap_or_default();
-                    let is_link = app
+                    let url_str = app
                         .selected_issue()
                         .and_then(|i| i.fields.extra.get(&field_id))
                         .and_then(|v| v.as_str())
-                        .is_some_and(|s| s.starts_with("http://") || s.starts_with("https://"));
-                    if is_link { Some("open link") } else { None }
+                        .filter(|s| s.starts_with("http://") || s.starts_with("https://"));
+                    url_str.map(|url| {
+                        let team = &app.resolved_teams[app.active_team_idx];
+                        let open_with = field_cfg.as_ref().and_then(|f| f.open_with.as_deref());
+                        let use_slack = match open_with {
+                            Some("browser") => false,
+                            Some("slack") => true,
+                            _ => {
+                                team.open_slack_in_app
+                                    && team.slack_team_id.is_some()
+                                    && url.contains(".slack.com/")
+                            }
+                        };
+                        if use_slack {
+                            "open in Slack"
+                        } else {
+                            "open link"
+                        }
+                    })
                 } else {
                     Some("edit field")
                 }

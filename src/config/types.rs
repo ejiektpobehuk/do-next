@@ -12,6 +12,11 @@ pub struct Config {
     /// Team references. Onboarding creates at least one ("personal").
     #[serde(default)]
     pub teams: Vec<TeamRef>,
+    /// Open `*.slack.com` links in the Slack desktop app instead of the browser.
+    /// Defaults to `true`. Can be overridden per-team or per-field.
+    pub open_slack_in_app: Option<bool>,
+    /// Slack workspace (team) ID (e.g. "T0123ABCDEF"). Required for deep links.
+    pub slack_team_id: Option<String>,
 }
 
 /// A reference to a team config directory.
@@ -56,6 +61,11 @@ pub struct TeamConfig {
     /// Named custom views. Source `view_mode` references a key in this map.
     #[serde(default)]
     pub views: HashMap<String, CustomViewConfig>,
+    /// Open `*.slack.com` links in the Slack desktop app instead of the browser.
+    /// Overrides the global setting. Defaults to the global value (or `true`).
+    pub open_slack_in_app: Option<bool>,
+    /// Slack workspace (team) ID. Overrides the global setting.
+    pub slack_team_id: Option<String>,
 }
 
 /// A fully resolved team: team ref + loaded config + effective Jira config.
@@ -66,6 +76,10 @@ pub struct ResolvedTeam {
     pub config: TeamConfig,
     /// Effective Jira config (team override merged on top of user default).
     pub jira: JiraConfig,
+    /// Effective setting: open `*.slack.com` links in the Slack desktop app.
+    pub open_slack_in_app: bool,
+    /// Effective Slack workspace (team) ID for deep links.
+    pub slack_team_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -193,6 +207,9 @@ pub struct CustomViewFieldConfig {
     /// row is rendered after that section. `"jira_value"` (float hours) is used
     /// for comparison. Fields with `duration_role` are still editable normally.
     pub duration_role: Option<String>,
+    /// How to open this field's URL: `"browser"` or `"slack"`.
+    /// Overrides the team/global `open_slack_in_app` setting for this field.
+    pub open_with: Option<String>,
 }
 
 /// A section within a custom view.
