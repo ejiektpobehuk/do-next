@@ -51,6 +51,7 @@
           inputsFrom = [ self.packages.${system}.default ];
           packages = [
             pkgs.cargo-msrv
+            pkgs.clippy
             pkgs.rust-analyzer
           ];
         };
