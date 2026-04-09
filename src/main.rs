@@ -6,7 +6,8 @@ mod subcommands;
 mod tui;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 #[derive(Parser)]
 #[command(name = "do-next", about = "Pick your next Jira task")]
@@ -41,6 +42,11 @@ enum Commands {
     },
     /// Reconfigure Jira authentication
     Auth,
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
+    },
 }
 
 #[tokio::main]
@@ -58,6 +64,17 @@ async fn main() -> Result<()> {
 
     // Load config
     let mut loaded = config::load().context("Failed to load configuration")?;
+
+    // Shell completions — no config needed.
+    if let Some(Commands::Completions { shell }) = &cli.command {
+        clap_complete::generate(
+            *shell,
+            &mut Cli::command(),
+            "do-next",
+            &mut std::io::stdout(),
+        );
+        return Ok(());
+    }
 
     // Auth reset runs before credential resolution (auth may currently be broken).
     if matches!(&cli.command, Some(Commands::Auth)) {
@@ -118,7 +135,7 @@ async fn main() -> Result<()> {
         }) => {
             subcommands::fields::run(&default_client, &issue_key, field.as_deref(), raw).await?;
         }
-        Some(Commands::Auth) => {
+        Some(Commands::Auth | Commands::Completions { .. }) => {
             unreachable!("handled before credential resolution")
         }
         None => {

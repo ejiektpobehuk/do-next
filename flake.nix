@@ -34,6 +34,13 @@
 
         packages.default = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
+          nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.installShellFiles ];
+          postInstall = ''
+            installShellCompletion --cmd do-next \
+              --bash <($out/bin/do-next completions bash) \
+              --zsh  <($out/bin/do-next completions zsh) \
+              --fish <($out/bin/do-next completions fish)
+          '';
           meta = {
             description = "Pick your next Jira task from the terminal";
             mainProgram = "do-next";
