@@ -85,8 +85,13 @@ pub fn render_field_edit_confirm_overlay(f: &mut Frame, app_action: &ActionState
 }
 
 fn render_preview(f: &mut Frame, area: Rect, new_text: &str) {
+    let padded = Rect {
+        x: area.x + 2,
+        width: area.width.saturating_sub(2),
+        ..area
+    };
     let lines = markdown_to_lines(new_text);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), padded);
 }
 
 fn render_diff(f: &mut Frame, area: Rect, old_text: &str, new_text: &str) {
