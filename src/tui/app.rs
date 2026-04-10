@@ -120,6 +120,16 @@ pub enum ActionState {
         /// Original JSON value of the field (used to determine PUT value shape).
         original_json: serde_json::Value,
     },
+    /// Offering to use a template for an empty field; `previewing` toggles between
+    /// a small dialog and a full markdown preview.
+    OfferingTemplate {
+        issue_key: String,
+        field_id: String,
+        template_content: String,
+        original_json: serde_json::Value,
+        previewing: bool,
+        scroll: u16,
+    },
     /// User is typing directly in the field widget (single-line string fields).
     InlineEditingField {
         issue_key: String,
@@ -1619,6 +1629,10 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
             handle_datetime_picker_input(app, event);
             return;
         }
+        ActionState::OfferingTemplate { .. } => {
+            handle_offering_template_input(app, &event);
+            return;
+        }
         ActionState::ConfirmingFieldEdit { .. } => {
             handle_confirm_field_edit_input(app, &event);
             return;
@@ -1949,6 +1963,7 @@ fn slack_deep_link(url: &str, team_id: Option<&str>) -> Option<String> {
     Some(deep)
 }
 
+#[allow(clippy::too_many_lines)]
 fn key_edit_detail_field(app: &mut AppState) {
     let Some(issue) = app.selected_issue() else {
         return;
@@ -2040,8 +2055,28 @@ fn key_edit_detail_field(app: &mut AppState) {
         }
     }
 
+    let template_content = field_cfg
+        .as_ref()
+        .and_then(|f| f.template.as_deref())
+        .and_then(|rel| {
+            let team_path = &app.resolved_teams[app.active_team_idx].path;
+            resolve_template(team_path, rel)
+        });
+
     if use_editor {
         let current_value = crate::tui::views::custom::val_to_str(&original_json);
+        let field_is_empty = original_json.is_null() || current_value.is_empty();
+        if field_is_empty && let Some(tpl) = template_content {
+            app.action_state = ActionState::OfferingTemplate {
+                issue_key: issue.key,
+                field_id,
+                template_content: tpl,
+                original_json,
+                previewing: false,
+                scroll: 0,
+            };
+            return;
+        }
         app.action_state = ActionState::PendingFieldEdit {
             issue_key: issue.key,
             field_id,
@@ -2059,9 +2094,11 @@ fn key_edit_detail_field(app: &mut AppState) {
         label,
         description,
         original_json,
+        template_content,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_detail_edit_state(
     app: &mut AppState,
     issue_key: String,
@@ -2070,7 +2107,24 @@ fn set_detail_edit_state(
     label: String,
     description: Option<String>,
     original_json: serde_json::Value,
+    template_content: Option<String>,
 ) {
+    let is_empty = match &original_json {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.is_empty(),
+        _ => false,
+    };
+    if is_empty && let Some(tpl) = template_content {
+        app.action_state = ActionState::OfferingTemplate {
+            issue_key,
+            field_id,
+            template_content: tpl,
+            original_json,
+            previewing: false,
+            scroll: 0,
+        };
+        return;
+    }
     match &original_json {
         serde_json::Value::Object(map) if map.contains_key("value") => {
             app.action_state = ActionState::LoadingFieldOptions {
@@ -2250,6 +2304,110 @@ fn handle_confirm_field_edit_input(app: &mut AppState, event: &crossterm::event:
             app.action_state = ActionState::None;
         }
         _ => {}
+    }
+}
+
+fn resolve_template(team_path: &str, template_rel: &str) -> Option<String> {
+    let path = std::path::Path::new(team_path).join(template_rel);
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::Event) {
+    use crossterm::event::{Event, KeyCode, KeyEvent};
+
+    let ActionState::OfferingTemplate {
+        ref issue_key,
+        ref field_id,
+        ref template_content,
+        ref original_json,
+        ref mut previewing,
+        ref mut scroll,
+    } = app.action_state
+    else {
+        return;
+    };
+    let Event::Key(KeyEvent { code, .. }) = event else {
+        return;
+    };
+
+    if *previewing {
+        // Full preview mode
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let issue_key = issue_key.clone();
+                let field_id = field_id.clone();
+                let current_value = template_content.clone();
+                let original_json = original_json.clone();
+                app.action_state = ActionState::PendingFieldEdit {
+                    issue_key,
+                    field_id,
+                    current_value,
+                    original_json,
+                };
+            }
+            KeyCode::Char('n') => {
+                let issue_key = issue_key.clone();
+                let field_id = field_id.clone();
+                let original_json = original_json.clone();
+                app.action_state = ActionState::PendingFieldEdit {
+                    issue_key,
+                    field_id,
+                    current_value: String::new(),
+                    original_json,
+                };
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                *previewing = false;
+                *scroll = 0;
+            }
+            KeyCode::Up => {
+                *scroll = scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                *scroll = scroll.saturating_add(1);
+            }
+            _ => {}
+        }
+    } else {
+        // Small dialog mode
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let issue_key = issue_key.clone();
+                let field_id = field_id.clone();
+                let current_value = template_content.clone();
+                let original_json = original_json.clone();
+                app.action_state = ActionState::PendingFieldEdit {
+                    issue_key,
+                    field_id,
+                    current_value,
+                    original_json,
+                };
+            }
+            KeyCode::Char('n') => {
+                let issue_key = issue_key.clone();
+                let field_id = field_id.clone();
+                let original_json = original_json.clone();
+                app.action_state = ActionState::PendingFieldEdit {
+                    issue_key,
+                    field_id,
+                    current_value: String::new(),
+                    original_json,
+                };
+            }
+            KeyCode::Char('p') => {
+                *previewing = true;
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                app.action_state = ActionState::None;
+            }
+            _ => {}
+        }
     }
 }
 

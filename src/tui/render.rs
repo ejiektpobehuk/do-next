@@ -158,6 +158,9 @@ fn render_action_overlays(f: &mut Frame, app: &AppState) {
         ActionState::ConfirmingFieldEdit { .. } => {
             overlays::field_edit_confirm::render_field_edit_confirm_overlay(f, &app.action_state);
         }
+        ActionState::OfferingTemplate { .. } => {
+            overlays::template_preview::render_template_preview_overlay(f, &app.action_state);
+        }
         ActionState::SelectingFieldOption { .. } => {
             overlays::field_select::render_field_select_overlay(f, &app.action_state);
         }

@@ -210,6 +210,10 @@ pub struct CustomViewFieldConfig {
     /// How to open this field's URL: `"browser"` or `"slack"`.
     /// Overrides the team/global `open_slack_in_app` setting for this field.
     pub open_with: Option<String>,
+    /// Path to a markdown template file (relative to the team config directory).
+    /// When the field is empty and an editor is opened, the user is offered
+    /// to pre-load the template content.
+    pub template: Option<String>,
 }
 
 /// A section within a custom view.
