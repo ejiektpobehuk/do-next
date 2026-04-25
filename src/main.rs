@@ -83,14 +83,23 @@ async fn main() -> Result<()> {
     }
 
     // Run onboarding if no config at all (first run)
-    if loaded.config.jira.base_url.is_empty() && loaded.teams.is_empty() {
+    if loaded.config.jira.base_url.is_empty() && loaded.config.teams.is_empty() {
         loaded = tui::onboarding::run_onboarding().context("Onboarding failed")?;
     }
 
-    // Config exists but no teams — interactive team setup
-    if loaded.teams.is_empty() {
+    // Config exists but no team refs — interactive team setup
+    if loaded.config.teams.is_empty() {
         loaded =
             tui::onboarding::run_team_setup(&mut loaded.config).context("Team setup failed")?;
+    }
+
+    // Team refs exist but every team failed to load — surface errors and bail.
+    // Falling through to onboarding here would corrupt the user's existing config.
+    if loaded.teams.is_empty() {
+        for e in &loaded.load_errors {
+            eprintln!("error: {e}");
+        }
+        anyhow::bail!("no teams loaded successfully; fix the errors above and retry");
     }
 
     // Build one JiraClient per unique base_url across all teams.

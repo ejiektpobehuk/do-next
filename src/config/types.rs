@@ -210,10 +210,35 @@ pub struct CustomViewFieldConfig {
     /// How to open this field's URL: `"browser"` or `"slack"`.
     /// Overrides the team/global `open_slack_in_app` setting for this field.
     pub open_with: Option<String>,
-    /// Path to a markdown template file (relative to the team config directory).
-    /// When the field is empty and an editor is opened, the user is offered
-    /// to pre-load the template content.
+    /// Shortcut for a single unnamed template (relative to the team config
+    /// directory). Mutually exclusive with `templates`.
     pub template: Option<String>,
+    /// Named template files (relative to the team config directory).
+    /// When the field is empty and an editor is opened, the user is offered
+    /// to pre-load a template. Each entry has a `name` (shown in the picker)
+    /// and a `path` to the markdown file.
+    pub templates: Option<Vec<TemplateEntry>>,
+}
+
+impl CustomViewFieldConfig {
+    /// Returns the unified list of templates from `template` and `templates`.
+    /// Caller should have validated that they aren't both set.
+    pub fn effective_templates(&self) -> Vec<TemplateEntry> {
+        if let Some(path) = &self.template {
+            return vec![TemplateEntry {
+                name: String::new(),
+                path: path.clone(),
+            }];
+        }
+        self.templates.clone().unwrap_or_default()
+    }
+}
+
+/// A named template file for a field.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TemplateEntry {
+    pub name: String,
+    pub path: String,
 }
 
 /// A section within a custom view.

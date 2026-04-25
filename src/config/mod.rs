@@ -3,7 +3,7 @@ pub mod hidden;
 pub mod types;
 pub mod updates;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
 use types::{Config, JiraConfig, ResolvedTeam, TeamConfig, TeamJiraOverride, TeamRef};
@@ -30,7 +30,10 @@ pub fn load() -> Result<LoadedConfig> {
     let mut load_errors = Vec::new();
     for team_ref in &config.teams {
         match load_team_config(team_ref) {
-            Ok(team_config) => {
+            Ok((team_config, warnings)) => {
+                for w in warnings {
+                    load_errors.push(format!("team '{}': {w}", team_ref.id));
+                }
                 let jira = resolve_team_jira(&config.jira, &team_config);
                 let open_slack_in_app = team_config
                     .open_slack_in_app
@@ -76,12 +79,92 @@ fn load_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
         .with_context(|| format!("Failed to parse config file: {}", path.display()))
 }
 
-/// Load a single team config from disk.
-fn load_team_config(team_ref: &TeamRef) -> Result<TeamConfig> {
+/// Load a single team config from disk. Returns the parsed config plus
+/// any non-fatal warnings (e.g. template files that couldn't be read).
+fn load_team_config(team_ref: &TeamRef) -> Result<(TeamConfig, Vec<String>)> {
     let dir = expand_tilde(&team_ref.path);
     let file_name = team_ref.file.as_deref().unwrap_or("do-next.json5");
     let path = dir.join(file_name);
-    load_file(&path).with_context(|| format!("Failed to load team '{}' config", team_ref.id))
+    let team: TeamConfig = load_file(&path)
+        .with_context(|| format!("Failed to load team '{}' config", team_ref.id))?;
+    validate_team_config(&team)?;
+    let warnings = collect_team_warnings(&team, &dir);
+    Ok((team, warnings))
+}
+
+fn validate_team_config(team: &TeamConfig) -> Result<()> {
+    for (view_id, view) in &team.views {
+        for section in &view.sections {
+            for field in &section.fields {
+                if field.template.is_some() && field.templates.is_some() {
+                    return Err(anyhow!(
+                        "view '{}', field '{}': set either `template` or `templates`, not both",
+                        view_id,
+                        field.field_id
+                    ));
+                }
+                if let Some(entries) = &field.templates {
+                    for (i, entry) in entries.iter().enumerate() {
+                        if entry.name.trim().is_empty() {
+                            return Err(anyhow!(
+                                "view '{}', field '{}': templates[{}].name is empty",
+                                view_id,
+                                field.field_id,
+                                i
+                            ));
+                        }
+                        if entry.path.trim().is_empty() {
+                            return Err(anyhow!(
+                                "view '{}', field '{}': templates[{}].path is empty",
+                                view_id,
+                                field.field_id,
+                                i
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk template references and report paths that can't be read or are empty.
+/// Non-fatal — these surface as warnings instead of failing the team load.
+fn collect_team_warnings(team: &TeamConfig, dir: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (view_id, view) in &team.views {
+        for section in &view.sections {
+            for field in &section.fields {
+                let paths: Vec<&str> = if let Some(p) = &field.template {
+                    vec![p.as_str()]
+                } else if let Some(entries) = &field.templates {
+                    entries.iter().map(|e| e.path.as_str()).collect()
+                } else {
+                    continue;
+                };
+                for rel in paths {
+                    let full = dir.join(rel);
+                    match std::fs::read_to_string(&full) {
+                        Ok(s) if s.trim().is_empty() => {
+                            warnings.push(format!(
+                                "view '{}', field '{}': template '{}' is empty",
+                                view_id, field.field_id, rel
+                            ));
+                        }
+                        Err(e) => {
+                            warnings.push(format!(
+                                "view '{}', field '{}': cannot read template '{}': {e}",
+                                view_id, field.field_id, rel
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    warnings
 }
 
 /// Merge team Jira override on top of user default.

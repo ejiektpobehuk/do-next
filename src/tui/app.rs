@@ -77,6 +77,13 @@ pub enum SubView {
     Attachments,
 }
 
+/// A template that has been read from disk and is ready to use.
+#[derive(Debug, Clone)]
+pub struct LoadedTemplate {
+    pub name: String,
+    pub content: String,
+}
+
 /// Current overlay / action being performed.
 #[derive(Debug, Clone)]
 pub enum ActionState {
@@ -125,7 +132,8 @@ pub enum ActionState {
     OfferingTemplate {
         issue_key: String,
         field_id: String,
-        template_content: String,
+        templates: Vec<LoadedTemplate>,
+        cursor: usize,
         original_json: serde_json::Value,
         previewing: bool,
         scroll: u16,
@@ -2055,22 +2063,23 @@ fn key_edit_detail_field(app: &mut AppState) {
         }
     }
 
-    let template_content = field_cfg
+    let templates = field_cfg
         .as_ref()
-        .and_then(|f| f.template.as_deref())
-        .and_then(|rel| {
+        .map(|f| {
             let team_path = &app.resolved_teams[app.active_team_idx].path;
-            resolve_template(team_path, rel)
-        });
+            resolve_templates(team_path, &f.effective_templates())
+        })
+        .unwrap_or_default();
 
     if use_editor {
         let current_value = crate::tui::views::custom::val_to_str(&original_json);
         let field_is_empty = original_json.is_null() || current_value.is_empty();
-        if field_is_empty && let Some(tpl) = template_content {
+        if field_is_empty && !templates.is_empty() {
             app.action_state = ActionState::OfferingTemplate {
                 issue_key: issue.key,
                 field_id,
-                template_content: tpl,
+                templates,
+                cursor: 0,
                 original_json,
                 previewing: false,
                 scroll: 0,
@@ -2094,7 +2103,7 @@ fn key_edit_detail_field(app: &mut AppState) {
         label,
         description,
         original_json,
-        template_content,
+        templates,
     );
 }
 
@@ -2107,18 +2116,19 @@ fn set_detail_edit_state(
     label: String,
     description: Option<String>,
     original_json: serde_json::Value,
-    template_content: Option<String>,
+    templates: Vec<LoadedTemplate>,
 ) {
     let is_empty = match &original_json {
         serde_json::Value::Null => true,
         serde_json::Value::String(s) => s.is_empty(),
         _ => false,
     };
-    if is_empty && let Some(tpl) = template_content {
+    if is_empty && !templates.is_empty() {
         app.action_state = ActionState::OfferingTemplate {
             issue_key,
             field_id,
-            template_content: tpl,
+            templates,
+            cursor: 0,
             original_json,
             previewing: false,
             scroll: 0,
@@ -2307,15 +2317,26 @@ fn handle_confirm_field_edit_input(app: &mut AppState, event: &crossterm::event:
     }
 }
 
-fn resolve_template(team_path: &str, template_rel: &str) -> Option<String> {
-    let path = std::path::Path::new(team_path).join(template_rel);
-    let content = std::fs::read_to_string(path).ok()?;
-    let trimmed = content.trim().to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+fn resolve_templates(
+    team_path: &str,
+    entries: &[crate::config::types::TemplateEntry],
+) -> Vec<LoadedTemplate> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let path = std::path::Path::new(team_path).join(&entry.path);
+            let content = std::fs::read_to_string(path).ok()?;
+            let trimmed = content.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(LoadedTemplate {
+                    name: entry.name.clone(),
+                    content: trimmed,
+                })
+            }
+        })
+        .collect()
 }
 
 fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::Event) {
@@ -2324,7 +2345,8 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
     let ActionState::OfferingTemplate {
         ref issue_key,
         ref field_id,
-        ref template_content,
+        ref templates,
+        ref mut cursor,
         ref original_json,
         ref mut previewing,
         ref mut scroll,
@@ -2342,8 +2364,8 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
             KeyCode::Char('y') | KeyCode::Enter => {
                 let issue_key = issue_key.clone();
                 let field_id = field_id.clone();
-                let current_value = template_content.clone();
                 let original_json = original_json.clone();
+                let current_value = templates[*cursor].content.clone();
                 app.action_state = ActionState::PendingFieldEdit {
                     issue_key,
                     field_id,
@@ -2375,13 +2397,13 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
             _ => {}
         }
     } else {
-        // Small dialog mode
+        // Dialog mode with template selection
         match code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 let issue_key = issue_key.clone();
                 let field_id = field_id.clone();
-                let current_value = template_content.clone();
                 let original_json = original_json.clone();
+                let current_value = templates[*cursor].content.clone();
                 app.action_state = ActionState::PendingFieldEdit {
                     issue_key,
                     field_id,
@@ -2402,6 +2424,13 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
             }
             KeyCode::Char('p') => {
                 *previewing = true;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *cursor = cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = templates.len().saturating_sub(1);
+                *cursor = (*cursor + 1).min(max);
             }
             KeyCode::Char('q') | KeyCode::Esc => {
                 app.action_state = ActionState::None;
