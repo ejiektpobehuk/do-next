@@ -262,7 +262,10 @@ fn handle_pending_comment(
         }
         Ok(None) => {} // empty/cancelled — state already cleared
         Err(e) => {
-            app.action_state = ActionState::Error(std::sync::Arc::new(e));
+            app.action_state = ActionState::Error {
+                error: std::sync::Arc::new(e),
+                scroll: 0,
+            };
         }
     }
 }
@@ -313,7 +316,10 @@ fn handle_pending_field_edit(
         }
         Ok(None) => {} // cancelled
         Err(e) => {
-            app.action_state = ActionState::Error(std::sync::Arc::new(e));
+            app.action_state = ActionState::Error {
+                error: std::sync::Arc::new(e),
+                scroll: 0,
+            };
         }
     }
 }
@@ -846,7 +852,10 @@ fn handle_pending_comment_edit(
         }
         Ok(None) => {}
         Err(e) => {
-            app.action_state = ActionState::Error(std::sync::Arc::new(e));
+            app.action_state = ActionState::Error {
+                error: std::sync::Arc::new(e),
+                scroll: 0,
+            };
         }
     }
 }

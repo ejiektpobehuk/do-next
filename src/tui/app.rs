@@ -269,7 +269,10 @@ pub enum ActionState {
         description: Option<String>,
         picker: crate::tui::overlays::datetime_picker::DatetimePicker,
     },
-    Error(Arc<anyhow::Error>),
+    Error {
+        error: Arc<anyhow::Error>,
+        scroll: u16,
+    },
     /// Keybindings reference overlay.
     KeybindingsHelp,
 }
@@ -702,7 +705,12 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
 
 fn handle_action_done(app: &mut AppState, result: ActionResult) {
     match result {
-        ActionResult::Error(e) => app.action_state = ActionState::Error(Arc::new(e)),
+        ActionResult::Error(e) => {
+            app.action_state = ActionState::Error {
+                error: Arc::new(e),
+                scroll: 0,
+            };
+        }
         ActionResult::Hidden { ref issue_key } => apply_hidden(app, issue_key),
         ActionResult::TransitionApplied {
             ref issue_key,
@@ -1655,9 +1663,8 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
             handle_hide_input(app, event);
             return;
         }
-        ActionState::Error(_) => {
-            // Any key dismisses error
-            app.action_state = ActionState::None;
+        ActionState::Error { .. } => {
+            handle_error_input(app, &event);
             return;
         }
         ActionState::InlineEditingField { .. } => {
@@ -2317,6 +2324,39 @@ fn handle_hide_input(app: &mut AppState, event: crossterm::event::Event) {
             }
             _ => {}
         }
+    }
+}
+
+fn handle_error_input(app: &mut AppState, event: &crossterm::event::Event) {
+    use crossterm::event::{Event, KeyCode, KeyEvent};
+    let max_scroll = u16::try_from(
+        app.last_confirm_content_h
+            .saturating_sub(app.last_confirm_viewport_h),
+    )
+    .unwrap_or(u16::MAX);
+    let ActionState::Error { ref mut scroll, .. } = app.action_state else {
+        return;
+    };
+    let Event::Key(KeyEvent { code, .. }) = event else {
+        return;
+    };
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
+            app.action_state = ActionState::None;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            *scroll = scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            *scroll = scroll.saturating_add(1).min(max_scroll);
+        }
+        KeyCode::PageUp => {
+            *scroll = scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            *scroll = scroll.saturating_add(10).min(max_scroll);
+        }
+        _ => {}
     }
 }
 

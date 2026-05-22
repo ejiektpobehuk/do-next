@@ -212,8 +212,8 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
         ActionState::PendingAttachmentUpload { .. } => {
             overlays::await_spinner::render_await(f, "Uploading…", app.tick_count);
         }
-        ActionState::Error(msg) => {
-            render_error_overlay(f, &msg.to_string());
+        ActionState::Error { error, scroll } => {
+            render_error_overlay(f, &error.to_string(), *scroll, render_out);
         }
         ActionState::KeybindingsHelp => {
             overlays::keybindings::render_keybindings_overlay(f);
@@ -270,20 +270,65 @@ fn render_tab_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_error_overlay(f: &mut Frame, msg: &str) {
-    use ratatui::widgets::Clear;
+fn render_error_overlay(f: &mut Frame, msg: &str, scroll: u16, render_out: &mut RenderOut) {
+    use ratatui::{
+        layout::{Alignment, Rect},
+        widgets::{Clear, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    };
     let area = centered_rect(60, 30, f.area());
     f.render_widget(Clear, area);
+
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let padded = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(2),
+        ..inner
+    };
+    let viewport_h = padded.height as usize;
+
+    let paragraph = Paragraph::new(msg.to_string()).wrap(Wrap { trim: false });
+    let content_h = paragraph.line_count(padded.width);
+    let max_scroll = u16::try_from(content_h.saturating_sub(viewport_h)).unwrap_or(u16::MAX);
+    let display_scroll = scroll.min(max_scroll);
+    let scrollable = content_h > viewport_h;
+
+    render_out.confirm_content_h = content_h;
+    render_out.confirm_viewport_h = viewport_h;
+
+    let mut hint_spans = vec![Span::raw("┤ ")];
+    if scrollable {
+        hint_spans.push(Span::styled("↕", Style::default().fg(Color::Blue)));
+        hint_spans.push(Span::raw(" | "));
+    }
+    hint_spans.push(Span::styled("q", Style::default().fg(Color::Magenta)));
+    hint_spans.push(Span::raw(" close ├──"));
+    let hint = Line::from(hint_spans).alignment(Alignment::Right);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Error ")
+        .title_bottom(hint)
         .style(Style::default().fg(Color::Red));
-    let inner = block.inner(area);
     f.render_widget(block, area);
-    f.render_widget(
-        Paragraph::new(format!("{msg}\n\nPress any key to dismiss.")),
-        inner,
-    );
+    f.render_widget(paragraph.scroll((display_scroll, 0)), padded);
+
+    if scrollable {
+        let mut state = ScrollbarState::new(content_h - viewport_h + 1)
+            .viewport_content_length(viewport_h)
+            .position(display_scroll as usize);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("┐"))
+            .end_symbol(Some("┘"))
+            .track_symbol(Some("│"))
+            .track_style(Style::default())
+            .thumb_style(Style::default().fg(Color::Yellow));
+        f.render_stateful_widget(bar, area, &mut state);
+    }
 }
 
 pub fn centered_rect(
