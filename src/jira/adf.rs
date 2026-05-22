@@ -480,8 +480,11 @@ pub fn markdown_to_adf(markdown: &str) -> Value {
             },
             Event::Text(text) => md_add_text(&mut stack, &marks, text.as_ref()),
             Event::Code(code) => {
-                let mut code_marks = marks.clone();
-                code_marks.push(json!({ "type": "code" }));
+                // ADF: the `code` mark is exclusive — it must not coexist with
+                // strong, em, link, strike, subsup, textColor, or underline.
+                // Jira rejects violating docs with 400 INVALID_INPUT, so we
+                // drop the surrounding marks for the code segment only.
+                let code_marks = vec![json!({ "type": "code" })];
                 md_add_text(&mut stack, &code_marks, code.as_ref());
             }
             Event::SoftBreak => md_add_text(&mut stack, &marks, " "),
@@ -807,6 +810,70 @@ mod tests {
     }
 
     // ── Markdown → ADF tests ────────────────────────────────────────────────
+
+    /// Collect every (text, marks) pair from an ADF tree.
+    fn collect_text_marks(v: &Value, out: &mut Vec<(String, Vec<String>)>) {
+        if let Some(map) = v.as_object() {
+            if map.get("type").and_then(|t| t.as_str()) == Some("text") {
+                let text = map
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let marks = map
+                    .get("marks")
+                    .and_then(|m| m.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| {
+                                m.get("type").and_then(|t| t.as_str()).map(str::to_string)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.push((text, marks));
+            }
+            for sub in map.values() {
+                collect_text_marks(sub, out);
+            }
+        } else if let Some(arr) = v.as_array() {
+            for sub in arr {
+                collect_text_marks(sub, out);
+            }
+        }
+    }
+
+    #[test]
+    fn md_to_adf_inline_code_inside_emphasis_drops_em_mark() {
+        // ADF: `code` is exclusive — cannot coexist with em/strong/link/strike.
+        // Jira rejects violating docs with 400 INVALID_INPUT.
+        let result = markdown_to_adf("_text with `code` inside_");
+        let mut nodes = vec![];
+        collect_text_marks(&result, &mut nodes);
+        for (text, marks) in &nodes {
+            assert!(
+                !(marks.contains(&"code".to_string()) && marks.contains(&"em".to_string())),
+                "text {text:?} has both code and em marks: {marks:?}"
+            );
+        }
+        // The code segment should still be emitted with the code mark.
+        let code_node = nodes.iter().find(|(t, _)| t == "code");
+        assert!(code_node.is_some(), "code text node missing: {nodes:?}");
+        assert_eq!(code_node.unwrap().1, vec!["code".to_string()]);
+    }
+
+    #[test]
+    fn md_to_adf_inline_code_inside_link_drops_link_on_code_segment() {
+        let result = markdown_to_adf("[click `here` now](https://example.com)");
+        let mut nodes = vec![];
+        collect_text_marks(&result, &mut nodes);
+        for (text, marks) in &nodes {
+            assert!(
+                !(marks.contains(&"code".to_string()) && marks.contains(&"link".to_string())),
+                "text {text:?} has both code and link marks: {marks:?}"
+            );
+        }
+    }
 
     #[test]
     fn md_to_adf_plain_paragraph() {
