@@ -168,7 +168,11 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
             );
         }
         ActionState::OfferingTemplate { .. } => {
-            overlays::template_preview::render_template_preview_overlay(f, &app.action_state);
+            overlays::template_preview::render_template_preview_overlay(
+                f,
+                &app.action_state,
+                render_out,
+            );
         }
         ActionState::SelectingFieldOption { .. } => {
             overlays::field_select::render_field_select_overlay(f, &app.action_state);

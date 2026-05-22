@@ -2409,9 +2409,15 @@ fn resolve_templates(
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::Event) {
     use crossterm::event::{Event, KeyCode, KeyEvent};
 
+    let max_scroll = u16::try_from(
+        app.last_confirm_content_h
+            .saturating_sub(app.last_confirm_viewport_h),
+    )
+    .unwrap_or(u16::MAX);
     let ActionState::OfferingTemplate {
         ref issue_key,
         ref field_id,
@@ -2431,7 +2437,7 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
     if *previewing {
         // Full preview mode
         match code {
-            KeyCode::Char('y') | KeyCode::Enter => {
+            KeyCode::Char('y' | 'a') | KeyCode::Enter => {
                 let issue_key = issue_key.clone();
                 let field_id = field_id.clone();
                 let original_json = original_json.clone();
@@ -2443,7 +2449,7 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
                     original_json,
                 };
             }
-            KeyCode::Char('n') => {
+            KeyCode::Char('n' | 'd') => {
                 let issue_key = issue_key.clone();
                 let field_id = field_id.clone();
                 let original_json = original_json.clone();
@@ -2458,18 +2464,24 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
                 *previewing = false;
                 *scroll = 0;
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 *scroll = scroll.saturating_sub(1);
             }
-            KeyCode::Down => {
-                *scroll = scroll.saturating_add(1);
+            KeyCode::Down | KeyCode::Char('j') => {
+                *scroll = scroll.saturating_add(1).min(max_scroll);
+            }
+            KeyCode::PageUp => {
+                *scroll = scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                *scroll = scroll.saturating_add(10).min(max_scroll);
             }
             _ => {}
         }
     } else {
         // Dialog mode with template selection
         match code {
-            KeyCode::Char('y') | KeyCode::Enter => {
+            KeyCode::Char('y' | 'a') | KeyCode::Enter => {
                 let issue_key = issue_key.clone();
                 let field_id = field_id.clone();
                 let original_json = original_json.clone();
@@ -2481,7 +2493,7 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
                     original_json,
                 };
             }
-            KeyCode::Char('n') => {
+            KeyCode::Char('n' | 'd') => {
                 let issue_key = issue_key.clone();
                 let field_id = field_id.clone();
                 let original_json = original_json.clone();
@@ -2502,7 +2514,7 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
                 let max = templates.len().saturating_sub(1);
                 *cursor = (*cursor + 1).min(max);
             }
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Char('q' | 'c') | KeyCode::Esc => {
                 app.action_state = ActionState::None;
             }
             _ => {}
