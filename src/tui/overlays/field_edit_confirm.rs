@@ -3,18 +3,26 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 
 use crate::tui::app::ActionState;
 use crate::tui::markdown::markdown_to_lines;
+use crate::tui::render::RenderOut;
 
-pub fn render_field_edit_confirm_overlay(f: &mut Frame, app_action: &ActionState) {
+pub fn render_field_edit_confirm_overlay(
+    f: &mut Frame,
+    app_action: &ActionState,
+    render_out: &mut RenderOut,
+) {
     let ActionState::ConfirmingFieldEdit {
         issue_key,
         old_text,
         new_text,
         tab,
+        scroll,
         ..
     } = app_action
     else {
@@ -24,10 +32,37 @@ pub fn render_field_edit_confirm_overlay(f: &mut Frame, app_action: &ActionState
     let area = centered_rect(70, 75, f.area());
     f.render_widget(Clear, area);
 
+    // Block uses Borders::ALL; inner is `area` shrunk by 1 on each side. We compute it
+    // up front so we can measure content height and decide whether ↕ is active before
+    // constructing the hint.
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let viewport_h = inner.height as usize;
+
+    let (paragraph, content_area) = build_tab_content(*tab, inner, old_text, new_text);
+    let content_h = paragraph.line_count(content_area.width);
+    let max_scroll = u16::try_from(content_h.saturating_sub(viewport_h)).unwrap_or(u16::MAX);
+    let display_scroll = (*scroll).min(max_scroll);
+    let scrollable = content_h > viewport_h;
+
+    render_out.confirm_content_h = content_h;
+    render_out.confirm_viewport_h = viewport_h;
+
+    let nav_color = |active: bool| {
+        if active { Color::Blue } else { Color::DarkGray }
+    };
     let hint = Line::from(vec![
         Span::raw("┤ "),
         Span::styled("↵", Style::default().fg(Color::Green)),
         Span::raw(" | "),
+        Span::styled("←", Style::default().fg(nav_color(*tab == 1))),
+        Span::styled("↕", Style::default().fg(nav_color(scrollable))),
+        Span::styled("→", Style::default().fg(nav_color(*tab == 0))),
+        Span::raw(" & "),
         Span::styled("tab", Style::default().fg(Color::Blue)),
         Span::raw(" | "),
         Span::styled("q", Style::default().fg(Color::Magenta)),
@@ -74,46 +109,64 @@ pub fn render_field_edit_confirm_overlay(f: &mut Frame, app_action: &ActionState
         .title(format!(" Confirm update · {issue_key} "))
         .title_top(tabs)
         .title_bottom(hint);
-
-    let inner = block.inner(area);
     f.render_widget(block, area);
 
-    match tab {
-        0 => render_preview(f, inner, new_text),
-        _ => render_diff(f, inner, old_text, new_text),
+    f.render_widget(paragraph.scroll((display_scroll, 0)), content_area);
+
+    if scrollable {
+        // Ratatui treats `content_length - 1` as the max position (last line at top of
+        // viewport). We allow scrolling only until the last line reaches the bottom of
+        // the viewport, so pass `max_scroll + 1` here for the thumb to reach the end.
+        let mut state = ScrollbarState::new(content_h - viewport_h + 1)
+            .viewport_content_length(viewport_h)
+            .position(display_scroll as usize);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("┐"))
+            .end_symbol(Some("┘"))
+            .track_symbol(Some("│"))
+            .track_style(Style::default())
+            .thumb_style(Style::default().fg(Color::Yellow));
+        f.render_stateful_widget(bar, area, &mut state);
     }
 }
 
-fn render_preview(f: &mut Frame, area: Rect, new_text: &str) {
-    let padded = Rect {
-        x: area.x + 2,
-        width: area.width.saturating_sub(2),
-        ..area
-    };
-    let lines = markdown_to_lines(new_text);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), padded);
-}
-
-fn render_diff(f: &mut Frame, area: Rect, old_text: &str, new_text: &str) {
-    let lines = diff_lines(old_text, new_text);
-    let rendered: Vec<Line> = lines
-        .into_iter()
-        .map(|dl| match dl {
-            DiffLine::Same(s) => Line::from(Span::styled(
-                format!("  {s}"),
-                Style::default().fg(Color::DarkGray),
-            )),
-            DiffLine::Removed(s) => Line::from(Span::styled(
-                format!("- {s}"),
-                Style::default().fg(Color::Red),
-            )),
-            DiffLine::Added(s) => Line::from(Span::styled(
-                format!("+ {s}"),
-                Style::default().fg(Color::Green),
-            )),
-        })
-        .collect();
-    f.render_widget(Paragraph::new(rendered).wrap(Wrap { trim: false }), area);
+/// Build the active tab's `Paragraph` and the `Rect` it should render into.
+/// Preview is padded by 2 on the left to align with the diff prefix.
+fn build_tab_content<'a>(
+    tab: usize,
+    inner: Rect,
+    old_text: &'a str,
+    new_text: &'a str,
+) -> (Paragraph<'a>, Rect) {
+    if tab == 0 {
+        let padded = Rect {
+            x: inner.x + 2,
+            width: inner.width.saturating_sub(2),
+            ..inner
+        };
+        let lines = markdown_to_lines(new_text);
+        (Paragraph::new(lines).wrap(Wrap { trim: false }), padded)
+    } else {
+        let lines = diff_lines(old_text, new_text);
+        let rendered: Vec<Line> = lines
+            .into_iter()
+            .map(|dl| match dl {
+                DiffLine::Same(s) => Line::from(Span::styled(
+                    format!("  {s}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                DiffLine::Removed(s) => Line::from(Span::styled(
+                    format!("- {s}"),
+                    Style::default().fg(Color::Red),
+                )),
+                DiffLine::Added(s) => Line::from(Span::styled(
+                    format!("+ {s}"),
+                    Style::default().fg(Color::Green),
+                )),
+            })
+            .collect();
+        (Paragraph::new(rendered).wrap(Wrap { trim: false }), inner)
+    }
 }
 
 enum DiffLine<'a> {

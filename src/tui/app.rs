@@ -190,6 +190,8 @@ pub enum ActionState {
         new_value: serde_json::Value,
         /// Active tab: 0 = Preview, 1 = Diff
         tab: usize,
+        /// Vertical scroll offset within the active tab.
+        scroll: u16,
     },
     /// Waiting for $EDITOR to close with edited comment body.
     PendingCommentEdit {
@@ -205,6 +207,8 @@ pub enum ActionState {
         new_text: String,
         /// Active tab: 0 = Preview, 1 = Diff
         tab: usize,
+        /// Vertical scroll offset within the active tab.
+        scroll: u16,
     },
     /// Sending updated comment to Jira.
     CommittingCommentEdit {
@@ -327,6 +331,10 @@ pub struct AppState {
     pub field_schemas: HashMap<String, String>,
     /// Total content lines of the detail view; written each render.
     pub last_detail_content_h: usize,
+    /// Content height of the active confirm overlay (field/comment edit); written each render.
+    pub last_confirm_content_h: usize,
+    /// Viewport height of the active confirm overlay; written each render.
+    pub last_confirm_viewport_h: usize,
     /// Sub-view popup shown on top of the detail view (Comments or Attachments).
     pub overlay: Option<SubView>,
     /// Scroll offset for the sub-view overlay (independent of `detail_scroll`).
@@ -404,6 +412,8 @@ impl AppState {
             field_names: HashMap::new(),
             field_schemas: HashMap::new(),
             last_detail_content_h: 0,
+            last_confirm_content_h: 0,
+            last_confirm_viewport_h: 0,
             overlay: None,
             overlay_scroll: 0,
             overlay_content_h: 0,
@@ -1314,37 +1324,66 @@ fn handle_comment_edit_confirm_input(
     modifiers: crossterm::event::KeyModifiers,
 ) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
+    if matches!((code, modifiers), (KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+        app.should_quit = true;
+        return true;
+    }
+    let max_scroll = u16::try_from(
+        app.last_confirm_content_h
+            .saturating_sub(app.last_confirm_viewport_h),
+    )
+    .unwrap_or(u16::MAX);
     let ActionState::ConfirmingCommentEdit {
-        issue_key,
-        comment_id,
-        old_text,
-        new_text,
-        tab,
-    } = &app.action_state.clone()
+        ref issue_key,
+        ref comment_id,
+        ref new_text,
+        ref mut tab,
+        ref mut scroll,
+        ..
+    } = app.action_state
     else {
         return false;
     };
     match (code, modifiers) {
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
         (KeyCode::Esc | KeyCode::Char('q'), _) => {
             app.action_state = ActionState::None;
         }
         (KeyCode::Tab, _) => {
-            app.action_state = ActionState::ConfirmingCommentEdit {
-                issue_key: issue_key.clone(),
-                comment_id: comment_id.clone(),
-                old_text: old_text.clone(),
-                new_text: new_text.clone(),
-                tab: 1 - tab,
-            };
+            *tab = 1 - *tab;
+            *scroll = 0;
+        }
+        (KeyCode::Left | KeyCode::Char('h'), _) => {
+            if *tab != 0 {
+                *tab = 0;
+                *scroll = 0;
+            }
+        }
+        (KeyCode::Right | KeyCode::Char('l'), _) => {
+            if *tab != 1 {
+                *tab = 1;
+                *scroll = 0;
+            }
+        }
+        (KeyCode::Up | KeyCode::Char('k'), _) => {
+            *scroll = scroll.saturating_sub(1);
+        }
+        (KeyCode::Down | KeyCode::Char('j'), _) => {
+            *scroll = scroll.saturating_add(1).min(max_scroll);
+        }
+        (KeyCode::PageUp, _) => {
+            *scroll = scroll.saturating_sub(10);
+        }
+        (KeyCode::PageDown, _) => {
+            *scroll = scroll.saturating_add(10).min(max_scroll);
         }
         (KeyCode::Enter, _) => {
+            let issue_key = issue_key.clone();
+            let comment_id = comment_id.clone();
+            let new_body = new_text.clone();
             app.action_state = ActionState::CommittingCommentEdit {
-                issue_key: issue_key.clone(),
-                comment_id: comment_id.clone(),
-                new_body: new_text.clone(),
+                issue_key,
+                comment_id,
+                new_body,
             };
         }
         _ => {}
@@ -2283,11 +2322,17 @@ fn handle_hide_input(app: &mut AppState, event: crossterm::event::Event) {
 
 fn handle_confirm_field_edit_input(app: &mut AppState, event: &crossterm::event::Event) {
     use crossterm::event::{Event, KeyCode, KeyEvent};
+    let max_scroll = u16::try_from(
+        app.last_confirm_content_h
+            .saturating_sub(app.last_confirm_viewport_h),
+    )
+    .unwrap_or(u16::MAX);
     let ActionState::ConfirmingFieldEdit {
         ref issue_key,
         ref field_id,
         ref new_value,
         ref mut tab,
+        ref mut scroll,
         ..
     } = app.action_state
     else {
@@ -2299,6 +2344,31 @@ fn handle_confirm_field_edit_input(app: &mut AppState, event: &crossterm::event:
     match code {
         KeyCode::Tab => {
             *tab = 1 - *tab;
+            *scroll = 0;
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if *tab != 0 {
+                *tab = 0;
+                *scroll = 0;
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            if *tab != 1 {
+                *tab = 1;
+                *scroll = 0;
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            *scroll = scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            *scroll = scroll.saturating_add(1).min(max_scroll);
+        }
+        KeyCode::PageUp => {
+            *scroll = scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            *scroll = scroll.saturating_add(10).min(max_scroll);
         }
         KeyCode::Char('y') | KeyCode::Enter => {
             let issue_key = issue_key.clone();

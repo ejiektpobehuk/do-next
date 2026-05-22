@@ -154,6 +154,8 @@ async fn run_inner(
         app.overlay_content_h = render_out.overlay_content_h;
         app.overlay_viewport_h = render_out.overlay_viewport_h;
         app.overlay_comment_offsets = std::mem::take(&mut render_out.overlay_comment_offsets);
+        app.last_confirm_content_h = render_out.confirm_content_h;
+        app.last_confirm_viewport_h = render_out.confirm_viewport_h;
     }
 
     if let Some(h) = tick_handle {
@@ -305,6 +307,7 @@ fn handle_pending_field_edit(
                     new_text,
                     new_value,
                     tab: 0,
+                    scroll: 0,
                 };
             }
         }
@@ -837,6 +840,7 @@ fn handle_pending_comment_edit(
                     old_text: original,
                     new_text,
                     tab: 0,
+                    scroll: 0,
                 };
             }
         }

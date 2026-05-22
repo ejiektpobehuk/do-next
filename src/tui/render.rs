@@ -21,6 +21,10 @@ pub struct RenderOut {
     pub detail_viewport_h: usize,
     /// Total content lines returned by the active detail view renderer.
     pub detail_content_h: usize,
+    /// Wrapped content height of the active confirm overlay (field/comment edit).
+    pub confirm_content_h: usize,
+    /// Viewport height of the active confirm overlay.
+    pub confirm_viewport_h: usize,
     /// Content height (lines) of the sub-view overlay; written each render.
     pub overlay_content_h: usize,
     /// Viewport height of the sub-view overlay; written each render.
@@ -103,10 +107,11 @@ pub fn render(
     }
 
     // Overlays (drawn on top)
-    render_action_overlays(f, app);
+    render_action_overlays(f, app, render_out);
 }
 
-fn render_action_overlays(f: &mut Frame, app: &AppState) {
+#[allow(clippy::too_many_lines)]
+fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut RenderOut) {
     match &app.action_state {
         ActionState::SelectingTransition { .. } => {
             overlays::transition::render_transition_overlay(f, &app.action_state);
@@ -156,7 +161,11 @@ fn render_action_overlays(f: &mut Frame, app: &AppState) {
             overlays::await_spinner::render_await(f, "Fetching attachment…", app.tick_count);
         }
         ActionState::ConfirmingFieldEdit { .. } => {
-            overlays::field_edit_confirm::render_field_edit_confirm_overlay(f, &app.action_state);
+            overlays::field_edit_confirm::render_field_edit_confirm_overlay(
+                f,
+                &app.action_state,
+                render_out,
+            );
         }
         ActionState::OfferingTemplate { .. } => {
             overlays::template_preview::render_template_preview_overlay(f, &app.action_state);
@@ -174,6 +183,7 @@ fn render_action_overlays(f: &mut Frame, app: &AppState) {
             overlays::comment_edit_confirm::render_comment_edit_confirm_overlay(
                 f,
                 &app.action_state,
+                render_out,
             );
         }
         ActionState::ConfirmingCommentDelete { selected, .. } => {
