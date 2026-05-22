@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 
 use crate::config::types::{ResolvedTeam, SourceConfig, TeamConfig};
 use crate::events::{ActionResult, AppEvent};
-use crate::jira::types::{Comment, FieldOption, Issue};
+use crate::jira::types::{Comment, FieldOption, FieldSchema, Issue};
 
 /// Per-team state that is saved/restored when switching tabs.
 #[derive(Debug, Clone)]
@@ -18,7 +18,7 @@ pub struct PerTeamState {
     pub nav_items: Vec<NavItem>,
     pub nav_idx: usize,
     pub field_names: HashMap<String, String>,
-    pub field_schemas: HashMap<String, String>,
+    pub field_schemas: HashMap<String, FieldSchema>,
     pub field_names_state: FieldNamesState,
 }
 
@@ -330,8 +330,8 @@ pub struct AppState {
     pub last_detail_viewport_h: usize,
     /// API-fetched display names for fields: `field_id` → name.
     pub field_names: HashMap<String, String>,
-    /// API-fetched Jira schema types for fields: `field_id` → type string.
-    pub field_schemas: HashMap<String, String>,
+    /// API-fetched Jira schema info for fields: `field_id` → schema.
+    pub field_schemas: HashMap<String, FieldSchema>,
     /// Total content lines of the detail view; written each render.
     pub last_detail_content_h: usize,
     /// Content height of the active confirm overlay (field/comment edit); written each render.
@@ -812,7 +812,7 @@ fn apply_transitions_loaded(
 fn apply_field_names_loaded(
     app: &mut AppState,
     names: HashMap<String, String>,
-    schemas: HashMap<String, String>,
+    schemas: HashMap<String, FieldSchema>,
     all_fields: bool,
 ) {
     app.field_names.extend(names);
@@ -2091,7 +2091,7 @@ fn key_edit_detail_field(app: &mut AppState) {
         let by_schema = app
             .field_schemas
             .get(&field_id)
-            .is_some_and(|t| t == "date" || t == "datetime");
+            .is_some_and(|s| s.ty == "date" || s.ty == "datetime");
         if by_config || by_schema {
             let tz = crate::tui::views::custom::resolve_tz(view_cfg);
             let picker = crate::tui::overlays::datetime_picker::DatetimePicker::from_value(

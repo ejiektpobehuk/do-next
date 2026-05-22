@@ -10,7 +10,8 @@ use tokio::sync::RwLock;
 use crate::jira::auth::Auth;
 use crate::jira::oauth;
 use crate::jira::types::{
-    Attachment, Comment, FieldMeta, Issue, SearchResponse, Transition, TransitionsResponse,
+    Attachment, Comment, FieldMeta, FieldSchema, Issue, SearchResponse, Transition,
+    TransitionsResponse,
 };
 
 const MAX_RESULTS: u32 = 100;
@@ -484,7 +485,7 @@ impl JiraClient {
             .ok_or_else(|| anyhow::anyhow!("Field '{field_id}' not found in editmeta"))
     }
 
-    /// Fetch display names and schema types for a set of field IDs via
+    /// Fetch display names and schemas for a set of field IDs via
     /// `GET /rest/api/3/issue/{key}/editmeta`.
     /// Returns `(names, schemas)` where both are `field_id → value`.
     /// Unknown fields are silently omitted.
@@ -492,7 +493,7 @@ impl JiraClient {
         &self,
         issue_key: &str,
         field_ids: &[&str],
-    ) -> Result<(HashMap<String, String>, HashMap<String, String>)> {
+    ) -> Result<(HashMap<String, String>, HashMap<String, FieldSchema>)> {
         let url = format!("{}/rest/api/3/issue/{issue_key}/editmeta", self.base_url);
         self.maybe_refresh().await?;
         let resp = self
@@ -520,9 +521,24 @@ impl JiraClient {
             if let Some(name) = body.pointer(&name_ptr).and_then(|v| v.as_str()) {
                 names.insert((*field_id).to_string(), name.to_string());
             }
-            let schema_ptr = format!("/fields/{field_id}/schema/type");
-            if let Some(schema_type) = body.pointer(&schema_ptr).and_then(|v| v.as_str()) {
-                schemas.insert((*field_id).to_string(), schema_type.to_string());
+            let schema_ptr = format!("/fields/{field_id}/schema");
+            if let Some(schema_val) = body.pointer(&schema_ptr) {
+                let str_at = |k: &str| {
+                    schema_val
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                };
+                if let Some(ty) = str_at("type") {
+                    schemas.insert(
+                        (*field_id).to_string(),
+                        FieldSchema {
+                            ty,
+                            custom: str_at("custom"),
+                            system: str_at("system"),
+                        },
+                    );
+                }
             }
         }
         Ok((names, schemas))

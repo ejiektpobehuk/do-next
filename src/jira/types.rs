@@ -150,3 +150,39 @@ pub struct FieldMeta {
 pub struct FieldOption {
     pub value: String,
 }
+
+/// Schema info for a Jira field, captured from editmeta `schema`.
+///
+/// `ty` alone isn't enough to detect rich-text fields: Jira returns
+/// `schema.type = "string"` for both plain-text and ADF fields. Whether the
+/// field expects ADF is encoded in `schema.system` (e.g. `"description"`,
+/// `"environment"`) or `schema.custom` (e.g. the multi-line text customfield
+/// type).
+#[derive(Debug, Clone, Default)]
+pub struct FieldSchema {
+    pub ty: String,
+    pub custom: Option<String>,
+    pub system: Option<String>,
+}
+
+impl FieldSchema {
+    /// Returns true when this field's value is an Atlassian Document.
+    pub fn is_adf(&self) -> bool {
+        matches!(self.system.as_deref(), Some("description" | "environment"))
+            || self
+                .custom
+                .as_deref()
+                .is_some_and(is_adf_custom_field_type)
+    }
+}
+
+/// Custom-field type keys whose values are ADF documents.
+///
+/// The classic "Paragraph (supports rich text)" custom field is `:textarea`.
+/// Sourced from Jira's customfieldtypes plugin keys.
+fn is_adf_custom_field_type(custom: &str) -> bool {
+    matches!(
+        custom,
+        "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+    )
+}

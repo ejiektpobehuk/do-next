@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::jira::types::{Attachment, Comment, FieldOption, Issue, Transition};
+use crate::jira::types::{Attachment, Comment, FieldOption, FieldSchema, Issue, Transition};
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -67,8 +67,10 @@ pub enum ActionResult {
     },
     FieldNamesLoaded {
         names: HashMap<String, String>,
-        /// Jira editmeta `schema.type` per `field_id` (e.g. `"date"`, `"datetime"`).
-        schemas: HashMap<String, String>,
+        /// Jira editmeta schema info per `field_id` — used to drive picker
+        /// selection (e.g. datetime) and ADF conversion for currently-empty
+        /// rich-text fields.
+        schemas: HashMap<String, FieldSchema>,
         /// True when this came from the global field registry (all fields loaded).
         all_fields: bool,
     },
