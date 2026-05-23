@@ -50,6 +50,7 @@
         devShells.default = pkgs.mkShell {
           inputsFrom = [ self.packages.${system}.default ];
           packages = [
+            pkgs.cargo-audit
             pkgs.cargo-msrv
             pkgs.clippy
             pkgs.rust-analyzer
