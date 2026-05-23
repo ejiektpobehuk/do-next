@@ -515,6 +515,22 @@ impl AppState {
             .any(|s| matches!(s, SourceState::Pending | SourceState::Loading))
     }
 
+    /// True iff any popup (sub-view or action overlay) is rendered on top of the main panels.
+    /// Inline editing states are NOT popups.
+    pub const fn popup_active(&self) -> bool {
+        self.overlay.is_some() || self.action_popup_active()
+    }
+
+    /// True iff an action overlay is rendered on top (excludes inline edit states).
+    pub const fn action_popup_active(&self) -> bool {
+        !matches!(
+            self.action_state,
+            ActionState::None
+                | ActionState::InlineEditingField { .. }
+                | ActionState::TypingAttachmentPath { .. },
+        )
+    }
+
     pub fn selected_issue(&self) -> Option<&Issue> {
         match self.nav_items.get(self.nav_idx)? {
             NavItem::Issue(idx) => self.issues.get(*idx),

@@ -10,6 +10,7 @@ use crate::tui::app::{ActionState, AppState, FocusedPanel};
 use crate::tui::detail::render_detail;
 use crate::tui::hint_bar::render_hints;
 use crate::tui::overlays;
+use crate::tui::theme;
 
 /// Side-channel data written during a render pass, consumed by the event loop.
 #[derive(Default)]
@@ -83,18 +84,19 @@ pub fn render(
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(main_area);
 
+    let popup = app.popup_active();
     crate::tui::list::render_list(
         f,
         main[0],
         app,
         list_state,
-        app.focused_panel == FocusedPanel::List,
+        app.focused_panel == FocusedPanel::List && !popup,
     );
     render_detail(
         f,
         main[1],
         app,
-        app.focused_panel == FocusedPanel::Detail,
+        app.focused_panel == FocusedPanel::Detail && !popup,
         render_out,
     );
 
@@ -227,12 +229,12 @@ fn render_title(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
             usize::try_from(app.tick_count).unwrap_or(0) % crate::tui::list::SPINNER_FRAMES.len();
         Span::styled(
             crate::tui::list::SPINNER_FRAMES[frame],
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::MUTED),
         )
     } else {
         Span::styled(
             concat!("v", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         )
     };
     let mut spans = vec![Span::raw("──── do-next "), version_span, Span::raw(" ")];
@@ -240,11 +242,14 @@ fn render_title(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
         let msg = app.update_warnings.join("; ");
         spans.push(Span::styled(
             format!("│ {msg} "),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::MUTED),
         ));
     }
-    let title = Line::from(spans);
-    let block = Block::default().borders(Borders::TOP).title_top(title);
+    let title = Line::from(spans).style(Style::default().fg(theme::MUTED));
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(theme::MUTED))
+        .title_top(title);
     f.render_widget(block, area);
 }
 

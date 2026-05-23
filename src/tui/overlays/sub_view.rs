@@ -16,6 +16,7 @@ use crate::jira::types::{Attachment, Comment, Issue};
 use crate::tui::app::{ActionState, AppState, SubView};
 use crate::tui::markdown::markdown_to_lines;
 use crate::tui::render::RenderOut;
+use crate::tui::theme;
 
 pub fn render_sub_view_overlay(f: &mut Frame, app: &AppState, render_out: &mut RenderOut) {
     let Some(sub_view) = &app.overlay else {
@@ -114,7 +115,8 @@ pub fn render_sub_view_overlay(f: &mut Frame, app: &AppState, render_out: &mut R
 
     match sub_view {
         SubView::Comments => {
-            render_comments(f, inner, app, issue, viewport_h, render_out);
+            let dim_focus = app.action_popup_active();
+            render_comments(f, inner, app, issue, viewport_h, render_out, dim_focus);
         }
         SubView::Attachments => {
             render_attachments(f, inner, app, issue, render_out);
@@ -412,6 +414,7 @@ fn render_comments(
     issue: &crate::jira::types::Issue,
     viewport_h: usize,
     render_out: &mut RenderOut,
+    dim_focus: bool,
 ) {
     let Some(list) = &issue.fields.comment else {
         let line = Line::from(Span::styled(
@@ -487,7 +490,7 @@ fn render_comments(
             height: visible_h,
         };
 
-        let focused = idx == app.overlay_focused_comment;
+        let focused = idx == app.overlay_focused_comment && !dim_focus;
         render_comment_widget(f, widget_area, comment, focused);
     }
 
@@ -531,9 +534,9 @@ fn render_comment_widget(f: &mut Frame, area: Rect, comment: &Comment, focused: 
     }
 
     let border_style = if focused {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(theme::BORDER_FOCUS)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme::MUTED)
     };
 
     let author = comment.author.display();
@@ -583,7 +586,7 @@ fn render_scrollbar(f: &mut Frame, area: Rect, content_h: usize, viewport_h: usi
         .end_symbol(Some("┘"))
         .track_symbol(Some("│"))
         .track_style(Style::default())
-        .thumb_style(Style::default().fg(Color::Yellow));
+        .thumb_style(Style::default().fg(theme::BORDER_FOCUS));
     f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
 }
 

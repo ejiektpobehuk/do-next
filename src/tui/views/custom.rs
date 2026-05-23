@@ -27,6 +27,7 @@ use crate::jira::types::Issue;
 use crate::tui::app::{ActionState, AppState, DetailFocus};
 use crate::tui::markdown::markdown_to_lines;
 use crate::tui::render::RenderOut;
+use crate::tui::theme;
 
 // ── Segment model ─────────────────────────────────────────────────────────────
 
@@ -249,9 +250,9 @@ fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, 
                 }
             };
             let border_style = if selected {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(theme::BORDER_FOCUS)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme::MUTED)
             };
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -302,9 +303,9 @@ fn render_editable_field(
     } else if selected && *readonly {
         Style::default()
     } else if selected {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(theme::BORDER_FOCUS)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme::MUTED)
     };
     let title = format!(" {label} ");
     let block = if *readonly {

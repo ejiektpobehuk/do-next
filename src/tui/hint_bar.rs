@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::tui::app::{ActionState, AppState, DetailFocus, FocusedPanel, ViewMode};
+use crate::tui::theme;
 
 /// Renders hints for modal action states. Returns `true` if a modal state was
 /// handled (caller should return early).
@@ -15,20 +16,27 @@ fn try_render_modal_hints(f: &mut Frame, area: Rect, action_state: &ActionState)
         ActionState::KeybindingsHelp
         | ActionState::EditingDatetimeField { .. }
         | ActionState::ConfirmingFieldEdit { .. } => {
-            f.render_widget(Block::default().borders(Borders::BOTTOM), area);
+            f.render_widget(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(theme::MUTED)),
+                area,
+            );
         }
         ActionState::InlineEditingField { .. } => {
             let title = Line::from(vec![
                 Span::raw("┤ "),
-                Span::styled("Enter", Style::default().fg(Color::Blue)),
+                Span::styled("Enter", Style::default().fg(Color::Green)),
                 Span::raw(" save  "),
-                Span::styled("Esc", Style::default().fg(Color::Blue)),
+                Span::styled("Esc", Style::default().fg(Color::Magenta)),
                 Span::raw(" cancel ├──"),
             ])
-            .alignment(Alignment::Right);
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(theme::MUTED));
             f.render_widget(
                 Block::default()
                     .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(theme::MUTED))
                     .title_bottom(title),
                 area,
             );
@@ -38,15 +46,17 @@ fn try_render_modal_hints(f: &mut Frame, area: Rect, action_state: &ActionState)
                 Span::raw("┤ "),
                 Span::styled("↕", Style::default().fg(Color::Blue)),
                 Span::raw(" navigate  "),
-                Span::styled("Enter", Style::default().fg(Color::Blue)),
+                Span::styled("Enter", Style::default().fg(Color::Green)),
                 Span::raw(" confirm  "),
-                Span::styled("Esc", Style::default().fg(Color::Blue)),
+                Span::styled("Esc", Style::default().fg(Color::Magenta)),
                 Span::raw(" cancel ├──"),
             ])
-            .alignment(Alignment::Right);
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(theme::MUTED));
             f.render_widget(
                 Block::default()
                     .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(theme::MUTED))
                     .title_bottom(title),
                 area,
             );
@@ -56,13 +66,19 @@ fn try_render_modal_hints(f: &mut Frame, area: Rect, action_state: &ActionState)
     true
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
     if try_render_modal_hints(f, area, &app.action_state) {
         return;
     }
 
     if app.overlay.is_some() {
-        f.render_widget(Block::default().borders(Borders::BOTTOM), area);
+        f.render_widget(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(theme::MUTED)),
+            area,
+        );
         return;
     }
 
@@ -153,10 +169,13 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
     hints.push(Span::styled("q", Style::default().fg(Color::Red)));
     hints.push(Span::raw(")uit ├──"));
 
-    let title = Line::from(hints).alignment(Alignment::Right);
+    let title = Line::from(hints)
+        .alignment(Alignment::Right)
+        .style(Style::default().fg(theme::MUTED));
 
     let block = Block::default()
         .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(theme::MUTED))
         .title_bottom(title);
     f.render_widget(block, area);
 }

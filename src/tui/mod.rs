@@ -6,6 +6,7 @@ pub mod markdown;
 pub mod onboarding;
 pub mod overlays;
 pub mod render;
+pub mod theme;
 pub mod views;
 
 use anyhow::Result;

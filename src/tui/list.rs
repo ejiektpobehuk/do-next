@@ -10,6 +10,7 @@ use ratatui::{
 
 use crate::config::types::SourceConfig;
 use crate::tui::app::{AppState, NavItem, SourceState, source_config_for};
+use crate::tui::theme;
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -93,7 +94,11 @@ pub fn render_list(
 
     let total = items.len();
 
-    let accent = if focused { Color::Yellow } else { Color::Reset };
+    let accent = if focused {
+        theme::BORDER_FOCUS
+    } else {
+        theme::MUTED
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent));

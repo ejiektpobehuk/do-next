@@ -8,6 +8,7 @@ use ratatui::{
 
 use crate::tui::app::{AppState, NavItem, ViewMode, source_config_for};
 use crate::tui::render::RenderOut;
+use crate::tui::theme;
 use crate::tui::views;
 
 pub fn render_detail(
@@ -17,7 +18,11 @@ pub fn render_detail(
     focused: bool,
     render_out: &mut RenderOut,
 ) {
-    let accent = if focused { Color::Yellow } else { Color::Reset };
+    let accent = if focused {
+        theme::BORDER_FOCUS
+    } else {
+        theme::MUTED
+    };
     // Show issue key in panel border for detail views
     let title = match &app.view_mode {
         ViewMode::Default | ViewMode::Custom(_) => app.selected_issue().map(|i| {
