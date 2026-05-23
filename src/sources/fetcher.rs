@@ -65,3 +65,32 @@ pub fn spawn_fetch(client: JiraClient, source_cfg: SourceConfig, tx: UnboundedSe
         let _ = tx.send(AppEvent::SourceLoaded(source_id, issues));
     });
 }
+
+/// Spawn a background task that refreshes a single issue and sends an
+/// `AppEvent::IssueRefreshed` (or `IssueRefreshError`) when done.
+///
+/// `source_id` and `subsource_idx` are preserved on the refreshed issue so it
+/// keeps its grouping in the list.
+pub fn spawn_refresh_issue(
+    client: JiraClient,
+    key: String,
+    source_id: Option<String>,
+    subsource_idx: usize,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match client.get_issue(&key).await {
+            Ok(mut issue) => {
+                issue.source_id = source_id;
+                issue.subsource_idx = subsource_idx;
+                let _ = tx.send(AppEvent::IssueRefreshed(Box::new(issue)));
+            }
+            Err(error) => {
+                let _ = tx.send(AppEvent::IssueRefreshError {
+                    issue_key: key,
+                    error,
+                });
+            }
+        }
+    });
+}

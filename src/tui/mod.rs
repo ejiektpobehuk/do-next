@@ -25,7 +25,7 @@ use crate::config::LoadedConfig;
 use crate::config::hidden::{HiddenState, hidden_path};
 use crate::events::{ActionResult, AppEvent};
 use crate::jira::JiraClient;
-use crate::sources::spawn_fetches;
+use crate::sources::{fetcher::spawn_refresh_issue, spawn_fetches};
 use crate::tui::app::{
     ActionState, AppState, AttachmentFetchRequest, cache_path_for, compute_completions_for,
     update_state,
@@ -108,8 +108,9 @@ async fn run_inner(
             }
         }
 
-        // Manage tick task lifecycle: run only while sources are loading
-        if app.any_source_loading() {
+        // Manage tick task lifecycle: run while sources are loading or any
+        // single-issue refresh is in flight (so the spinner animates).
+        if app.any_source_loading() || !app.refreshing_issues.is_empty() {
             if tick_handle
                 .as_ref()
                 .is_none_or(tokio::task::JoinHandle::is_finished)
@@ -465,6 +466,27 @@ fn dispatch_background_tasks(
 
     // Debounced path completion fetch
     spawn_debounced_completions(app, tx);
+
+    // Full-team refresh requested via `r` (list focus) / `Shift+R`.
+    if app.pending_refresh_all {
+        app.pending_refresh_all = false;
+        for state in app.sources.values_mut() {
+            *state = crate::tui::app::SourceState::Loading;
+        }
+        app.subsource_errors.clear();
+        spawn_fetches(client, app.team_config(), tx);
+    }
+
+    // Single-issue refresh requested via `r` (detail focus).
+    if let Some(req) = app.pending_refresh_issue.take() {
+        spawn_refresh_issue(
+            client.clone(),
+            req.key,
+            req.source_id,
+            req.subsource_idx,
+            tx.clone(),
+        );
+    }
 }
 
 fn spawn_debounced_completions(app: &mut AppState, tx: &UnboundedSender<AppEvent>) {

@@ -23,16 +23,28 @@ pub fn render_detail(
     } else {
         theme::MUTED
     };
-    // Show issue key in panel border for detail views
-    let title = match &app.view_mode {
-        ViewMode::Default | ViewMode::Custom(_) => app.selected_issue().map(|i| {
-            Span::styled(
-                format!(" {} ", i.key),
-                Style::default().add_modifier(Modifier::BOLD),
-            )
-        }),
-        _ => None,
-    };
+    // Show issue key in panel border for detail views (and while a refresh
+    // is in flight, also for the Comments/Attachments subview modes — so the
+    // user sees the spinner regardless of which subview they triggered it from).
+    let title = app.selected_issue().and_then(|i| {
+        let refreshing = app.refreshing_issues.contains(&i.key);
+        let show_title = matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
+            || refreshing;
+        if !show_title {
+            return None;
+        }
+        let text = if refreshing {
+            let frame = usize::try_from(app.tick_count).unwrap_or(0)
+                % crate::tui::list::SPINNER_FRAMES.len();
+            format!(" {} {} ", i.key, crate::tui::list::SPINNER_FRAMES[frame])
+        } else {
+            format!(" {} ", i.key)
+        };
+        Some(Span::styled(
+            text,
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+    });
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent));

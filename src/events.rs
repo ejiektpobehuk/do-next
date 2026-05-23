@@ -25,6 +25,13 @@ pub enum AppEvent {
     },
     /// Git-based update warnings for team configs (sent once on startup).
     UpdateWarnings(Vec<String>),
+    /// A single-issue background refresh completed successfully.
+    IssueRefreshed(Box<Issue>),
+    /// A single-issue background refresh failed.
+    IssueRefreshError {
+        issue_key: String,
+        error: anyhow::Error,
+    },
 }
 
 #[derive(Debug)]

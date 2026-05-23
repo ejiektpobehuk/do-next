@@ -93,5 +93,7 @@ fn right_column() -> Vec<Line<'static>> {
         key_line("i", "hide for a day"),
         key_line("a", "assign to me"),
         key_line("m", "move to project"),
+        key_line("r", "refresh focused (list or current issue)"),
+        key_line("Shift+R", "refresh all issues"),
     ]
 }

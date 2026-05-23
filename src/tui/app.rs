@@ -367,6 +367,12 @@ pub struct AppState {
     pub pending_attachment_fetch: Option<AttachmentFetchRequest>,
     /// Pending path completion fetch generation (set by key handler, consumed by `dispatch_action`).
     pub pending_completion_fetch: Option<u64>,
+    /// Set by `r`/`Shift+R` when the user requests a full team refresh.
+    pub pending_refresh_all: bool,
+    /// Set by `r` on a focused issue; consumed by the main loop dispatcher.
+    pub pending_refresh_issue: Option<RefreshIssueRequest>,
+    /// Issue keys with a refresh currently in flight (drives spinner + de-dupes presses).
+    pub refreshing_issues: HashSet<String>,
     /// Terminal image protocol picker (created once at startup).
     pub image_picker: Option<ratatui_image::picker::Picker>,
 }
@@ -377,6 +383,13 @@ pub struct AttachmentFetchRequest {
     pub content_url: String,
     pub filename: String,
     pub issue_key: String,
+}
+
+/// Request for a single-issue background refresh.
+pub struct RefreshIssueRequest {
+    pub key: String,
+    pub source_id: Option<String>,
+    pub subsource_idx: usize,
 }
 
 impl AppState {
@@ -431,6 +444,9 @@ impl AppState {
             update_warnings: Vec::new(),
             pending_attachment_fetch: None,
             pending_completion_fetch: None,
+            pending_refresh_all: false,
+            pending_refresh_issue: None,
+            refreshing_issues: HashSet::new(),
             image_picker: None,
         }
     }
@@ -488,6 +504,11 @@ impl AppState {
         self.focused_panel = FocusedPanel::List;
         self.action_state = ActionState::None;
         self.overlay = None;
+        // Drop any in-flight refresh signals; the running tasks will still
+        // send events, but the handler tolerates unknown keys.
+        self.refreshing_issues.clear();
+        self.pending_refresh_all = false;
+        self.pending_refresh_issue = None;
 
         // Trigger source fetches if any sources are still pending
         if self
@@ -716,6 +737,40 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
         AppEvent::UpdateWarnings(warnings) => {
             app.update_warnings = warnings;
         }
+
+        AppEvent::IssueRefreshed(issue) => {
+            let issue = *issue;
+            app.refreshing_issues.remove(&issue.key);
+            apply_issue_refresh(&mut app.issues, &mut app.sources, issue);
+        }
+
+        AppEvent::IssueRefreshError { issue_key, error } => {
+            app.refreshing_issues.remove(&issue_key);
+            app.action_state = ActionState::Error {
+                error: Arc::new(error),
+                scroll: 0,
+            };
+        }
+    }
+}
+
+/// Patch a refreshed issue into both the flat `issues` list and the owning
+/// source's `Vec<Issue>`. Silently drops if the issue isn't found in either
+/// — e.g. team switched while the refresh was in flight, or the issue was
+/// deleted server-side.
+fn apply_issue_refresh(
+    issues: &mut [Issue],
+    sources: &mut IndexMap<String, SourceState>,
+    issue: Issue,
+) {
+    if let Some(slot) = issues.iter_mut().find(|i| i.key == issue.key) {
+        *slot = issue.clone();
+    }
+    if let Some(source_id) = &issue.source_id
+        && let Some(SourceState::Loaded(source_issues)) = sources.get_mut(source_id)
+        && let Some(slot) = source_issues.iter_mut().find(|i| i.key == issue.key)
+    {
+        *slot = issue;
     }
 }
 
@@ -1835,8 +1890,54 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         (KeyCode::Char('?'), _) => {
             app.action_state = ActionState::KeybindingsHelp;
         }
+        (KeyCode::Char('R'), _) => key_refresh_all(app),
+        (KeyCode::Char('r'), _) => key_refresh_focused(app),
         _ => {}
     }
+}
+
+/// Refresh is allowed only when no edit/picker/in-flight action is active.
+/// `KeybindingsHelp` and `Error` overlays are view-only and don't block.
+const fn refresh_allowed(state: &ActionState) -> bool {
+    matches!(
+        state,
+        ActionState::None | ActionState::KeybindingsHelp | ActionState::Error { .. }
+    )
+}
+
+const fn key_refresh_all(app: &mut AppState) {
+    if !refresh_allowed(&app.action_state) {
+        return;
+    }
+    app.pending_refresh_all = true;
+}
+
+fn key_refresh_focused(app: &mut AppState) {
+    if !refresh_allowed(&app.action_state) {
+        return;
+    }
+    match app.focused_panel {
+        FocusedPanel::List => key_refresh_all(app),
+        FocusedPanel::Detail => key_refresh_current_issue(app),
+    }
+}
+
+fn key_refresh_current_issue(app: &mut AppState) {
+    let Some(issue) = app.selected_issue() else {
+        return;
+    };
+    let key = issue.key.clone();
+    if app.refreshing_issues.contains(&key) {
+        return;
+    }
+    let source_id = issue.source_id.clone();
+    let subsource_idx = issue.subsource_idx;
+    app.refreshing_issues.insert(key.clone());
+    app.pending_refresh_issue = Some(RefreshIssueRequest {
+        key,
+        source_id,
+        subsource_idx,
+    });
 }
 
 fn key_nav_down(app: &mut AppState) {
@@ -2966,4 +3067,106 @@ pub fn compute_completions_for(path: &str) -> Vec<String> {
     files_vec.sort();
     dirs_vec.extend(files_vec);
     dirs_vec
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jira::types::{
+        IssueFields, IssueTypeField, ProjectField, StatusField,
+    };
+
+    fn make_issue(key: &str, status: &str, source_id: Option<&str>) -> Issue {
+        Issue {
+            id: format!("id-{key}"),
+            key: key.to_string(),
+            fields: IssueFields {
+                summary: format!("Summary {key}"),
+                status: StatusField {
+                    id: "s1".into(),
+                    name: status.into(),
+                },
+                priority: None,
+                assignee: None,
+                reporter: None,
+                issuetype: IssueTypeField {
+                    id: "t1".into(),
+                    name: "Task".into(),
+                },
+                project: ProjectField {
+                    id: "p1".into(),
+                    key: "PROJ".into(),
+                    name: "Project".into(),
+                },
+                description: None,
+                comment: None,
+                attachment: None,
+                extra: HashMap::new(),
+            },
+            source_id: source_id.map(str::to_string),
+            subsource_idx: 0,
+        }
+    }
+
+    #[test]
+    fn apply_issue_refresh_replaces_in_both_lists() {
+        let src = "src-1";
+        let mut issues = vec![
+            make_issue("A-1", "To Do", Some(src)),
+            make_issue("A-2", "To Do", Some(src)),
+        ];
+        let mut sources = IndexMap::new();
+        sources.insert(
+            src.to_string(),
+            SourceState::Loaded(issues.clone()),
+        );
+
+        let refreshed = make_issue("A-1", "Done", Some(src));
+        apply_issue_refresh(&mut issues, &mut sources, refreshed);
+
+        assert_eq!(issues[0].fields.status.name, "Done");
+        assert_eq!(issues[1].fields.status.name, "To Do");
+        let SourceState::Loaded(src_issues) = sources.get(src).unwrap() else {
+            panic!("expected Loaded");
+        };
+        assert_eq!(src_issues[0].fields.status.name, "Done");
+        assert_eq!(src_issues[1].fields.status.name, "To Do");
+    }
+
+    #[test]
+    fn apply_issue_refresh_silently_drops_missing_key() {
+        let src = "src-1";
+        let mut issues = vec![make_issue("A-1", "To Do", Some(src))];
+        let mut sources = IndexMap::new();
+        sources.insert(
+            src.to_string(),
+            SourceState::Loaded(issues.clone()),
+        );
+
+        let refreshed = make_issue("Z-9", "Done", Some(src));
+        apply_issue_refresh(&mut issues, &mut sources, refreshed);
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].key, "A-1");
+        let SourceState::Loaded(src_issues) = sources.get(src).unwrap() else {
+            panic!("expected Loaded");
+        };
+        assert_eq!(src_issues.len(), 1);
+        assert_eq!(src_issues[0].key, "A-1");
+    }
+
+    #[test]
+    fn apply_issue_refresh_skips_source_when_not_loaded() {
+        let src = "src-1";
+        let mut issues = vec![make_issue("A-1", "To Do", Some(src))];
+        let mut sources = IndexMap::new();
+        sources.insert(src.to_string(), SourceState::Loading);
+
+        let refreshed = make_issue("A-1", "Done", Some(src));
+        apply_issue_refresh(&mut issues, &mut sources, refreshed);
+
+        // Flat list updated, source state untouched (still Loading).
+        assert_eq!(issues[0].fields.status.name, "Done");
+        assert!(matches!(sources.get(src), Some(SourceState::Loading)));
+    }
 }
