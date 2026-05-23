@@ -6,6 +6,7 @@ pub mod markdown;
 pub mod onboarding;
 pub mod overlays;
 pub mod render;
+pub mod search;
 pub mod theme;
 pub mod views;
 
