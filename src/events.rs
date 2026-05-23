@@ -32,6 +32,13 @@ pub enum AppEvent {
         issue_key: String,
         error: anyhow::Error,
     },
+    /// Debounced Jira-side search returned; carries the `debounce_token` that
+    /// was current when the request was spawned. Stale responses (token
+    /// mismatch) are dropped by the handler.
+    SearchJiraResult {
+        token: u64,
+        result: Result<Vec<Issue>, anyhow::Error>,
+    },
 }
 
 #[derive(Debug)]

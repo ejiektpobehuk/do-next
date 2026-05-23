@@ -66,6 +66,21 @@ pub fn spawn_fetch(client: JiraClient, source_cfg: SourceConfig, tx: UnboundedSe
     });
 }
 
+/// Spawn a background task running a one-off JQL query for the search popup.
+/// The result carries the `token` of the search request that triggered it so
+/// the receiver can drop stale responses.
+pub fn spawn_jira_search(
+    client: JiraClient,
+    jql: String,
+    token: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = client.fetch_jql(&jql).await;
+        let _ = tx.send(AppEvent::SearchJiraResult { token, result });
+    });
+}
+
 /// Spawn a background task that refreshes a single issue and sends an
 /// `AppEvent::IssueRefreshed` (or `IssueRefreshError`) when done.
 ///

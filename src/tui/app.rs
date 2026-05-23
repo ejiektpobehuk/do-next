@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use crate::config::types::{ResolvedTeam, SourceConfig, TeamConfig};
 use crate::events::{ActionResult, AppEvent};
 use crate::jira::types::{Comment, FieldOption, FieldSchema, Issue};
+use crate::tui::search::{ChipSet, RankedHit};
 
 /// Per-team state that is saved/restored when switching tabs.
 #[derive(Debug, Clone)]
@@ -275,6 +276,48 @@ pub enum ActionState {
     },
     /// Keybindings reference overlay.
     KeybindingsHelp,
+    /// Telescope-style search popup: text input + chip filters + result list +
+    /// live preview pane.
+    Searching {
+        query: String,
+        cursor: usize,
+        active_chips: ChipSet,
+        focus: SearchFocus,
+        local_results: Vec<RankedHit>,
+        jira_state: JiraSearchState,
+        /// Index in the merged result list of the currently highlighted hit.
+        selected: usize,
+        /// Selected nav index before opening search; restored on Esc.
+        prev_nav_idx: usize,
+        /// Incremented on every query/chip change; lets stale Jira responses be discarded.
+        debounce_token: u64,
+        /// Instant when query/chips last changed. The background dispatcher
+        /// spawns the Jira search 250ms after the latest change.
+        last_change_at: std::time::Instant,
+        /// True once the Jira spawn for the current `debounce_token` has fired.
+        jira_spawned_for_token: bool,
+    },
+}
+
+/// Which sub-widget inside the search popup currently has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchFocus {
+    Input,
+    Chip(usize),
+    Result(usize),
+}
+
+/// Async state of the parallel Jira-side search.
+#[derive(Debug, Clone)]
+pub enum JiraSearchState {
+    Idle,
+    Pending {
+        /// Debounce token of the request in flight; lets stale responses be discarded.
+        #[allow(dead_code)]
+        token: u64,
+    },
+    Loaded { hits: Vec<RankedHit>, issues: Vec<Issue> },
+    Error(String),
 }
 
 /// Progress of field name fetching from Jira API.
@@ -375,6 +418,10 @@ pub struct AppState {
     pub refreshing_issues: HashSet<String>,
     /// Terminal image protocol picker (created once at startup).
     pub image_picker: Option<ratatui_image::picker::Picker>,
+    /// When true, hide the list panel and render the detail view full-width.
+    /// Toggled off by `h` or `Esc` in normal mode. Set when opening an issue
+    /// from the search popup.
+    pub fullscreen_detail: bool,
 }
 
 /// Request for a silent background attachment fetch.
@@ -448,6 +495,7 @@ impl AppState {
             pending_refresh_issue: None,
             refreshing_issues: HashSet::new(),
             image_picker: None,
+            fullscreen_detail: false,
         }
     }
 
@@ -504,6 +552,7 @@ impl AppState {
         self.focused_panel = FocusedPanel::List;
         self.action_state = ActionState::None;
         self.overlay = None;
+        self.fullscreen_detail = false;
         // Drop any in-flight refresh signals; the running tasks will still
         // send events, but the handler tolerates unknown keys.
         self.refreshing_issues.clear();
@@ -750,6 +799,66 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
                 error: Arc::new(error),
                 scroll: 0,
             };
+        }
+
+        AppEvent::SearchJiraResult { token, result } => {
+            apply_search_jira_result(app, token, result);
+        }
+    }
+}
+
+/// Merge a Jira search response into the active `Searching` state, dropping
+/// stale responses (token mismatch) silently.
+fn apply_search_jira_result(
+    app: &mut AppState,
+    token: u64,
+    result: Result<Vec<Issue>, anyhow::Error>,
+) {
+    let ActionState::Searching {
+        ref query,
+        active_chips,
+        ref mut jira_state,
+        ref mut selected,
+        ref local_results,
+        debounce_token,
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+    if token != debounce_token {
+        return;
+    }
+    match result {
+        Ok(issues) => {
+            let me = app.current_user.as_deref();
+            let mut hits = Vec::with_capacity(issues.len());
+            let local_keys: std::collections::HashSet<&str> =
+                local_results.iter().map(|h| h.issue_key.as_str()).collect();
+            for issue in &issues {
+                if local_keys.contains(issue.key.as_str()) {
+                    continue;
+                }
+                if let Some(mut hit) =
+                    crate::tui::search::score_local(query, active_chips, issue, me)
+                {
+                    hit.origin = crate::tui::search::HitOrigin::Jira;
+                    hits.push(hit);
+                }
+            }
+            hits.sort_by(|a, b| b.score.cmp(&a.score));
+            *jira_state = JiraSearchState::Loaded { hits, issues };
+            let total = local_results.len()
+                + match jira_state {
+                    JiraSearchState::Loaded { hits, .. } => hits.len(),
+                    _ => 0,
+                };
+            if total > 0 && *selected >= total {
+                *selected = total - 1;
+            }
+        }
+        Err(e) => {
+            *jira_state = JiraSearchState::Error(e.to_string());
         }
     }
 }
@@ -1762,6 +1871,10 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
             handle_confirm_field_edit_input(app, &event);
             return;
         }
+        ActionState::Searching { .. } => {
+            handle_search_input(app, event);
+            return;
+        }
         ActionState::KeybindingsHelp => {
             if let crossterm::event::Event::Key(crossterm::event::KeyEvent { code, .. }) = event
                 && matches!(code, KeyCode::Char('q') | KeyCode::Esc)
@@ -1830,7 +1943,14 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
+        (KeyCode::Esc, _) if app.fullscreen_detail => {
+            app.fullscreen_detail = false;
+            app.focused_panel = FocusedPanel::List;
+        }
         (KeyCode::Left | KeyCode::Char('h'), _) => {
+            if app.fullscreen_detail {
+                app.fullscreen_detail = false;
+            }
             app.focused_panel = FocusedPanel::List;
         }
         (KeyCode::Right | KeyCode::Char('l'), _) => {
@@ -1892,8 +2012,396 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         }
         (KeyCode::Char('R'), _) => key_refresh_all(app),
         (KeyCode::Char('r'), _) => key_refresh_focused(app),
+        (KeyCode::Char('/'), _) => key_open_search(app),
         _ => {}
     }
+}
+
+fn key_open_search(app: &mut AppState) {
+    let prev_nav_idx = app.nav_idx;
+    let me = app.current_user.as_deref();
+    let chips = ChipSet::default();
+    let mut local_results: Vec<RankedHit> = app
+        .issues
+        .iter()
+        .filter_map(|i| crate::tui::search::score_local("", chips, i, me))
+        .collect();
+    sort_hits(&mut local_results);
+    app.action_state = ActionState::Searching {
+        query: String::new(),
+        cursor: 0,
+        active_chips: chips,
+        focus: SearchFocus::Input,
+        local_results,
+        jira_state: JiraSearchState::Idle,
+        selected: 0,
+        prev_nav_idx,
+        debounce_token: 1,
+        last_change_at: std::time::Instant::now(),
+        jira_spawned_for_token: true,
+    };
+}
+
+fn sort_hits(hits: &mut [RankedHit]) {
+    hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.issue_key.cmp(&b.issue_key)));
+}
+
+/// Total number of merged results currently shown in the search popup.
+const fn search_total_results(local: &[RankedHit], jira: &JiraSearchState) -> usize {
+    local.len()
+        + match jira {
+            JiraSearchState::Loaded { hits, .. } => hits.len(),
+            _ => 0,
+        }
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+fn handle_search_input(app: &mut AppState, event: crossterm::event::Event) {
+    use crossterm::event::{Event, KeyEvent};
+
+    let Event::Key(KeyEvent {
+        code, modifiers, ..
+    }) = event
+    else {
+        return;
+    };
+
+    // Global keys regardless of focus
+    match (code, modifiers) {
+        (KeyCode::Esc, _) => {
+            cancel_search(app);
+            return;
+        }
+        (KeyCode::Enter, _) => {
+            commit_search_selection(app);
+            return;
+        }
+        (KeyCode::Tab, _) => {
+            cycle_search_focus(app, true);
+            return;
+        }
+        (KeyCode::BackTab, _) => {
+            cycle_search_focus(app, false);
+            return;
+        }
+        (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            move_search_selection(app, -1);
+            return;
+        }
+        (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            move_search_selection(app, 1);
+            return;
+        }
+        (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+            force_jira_search(app);
+            return;
+        }
+        _ => {}
+    }
+
+    let ActionState::Searching {
+        ref mut query,
+        ref mut cursor,
+        ref mut active_chips,
+        focus,
+        ref mut local_results,
+        ref mut jira_state,
+        ref mut selected,
+        ref mut debounce_token,
+        ref mut last_change_at,
+        ref mut jira_spawned_for_token,
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+
+    match focus {
+        SearchFocus::Input => {
+            if let KeyCode::Char(c) = code
+                && let Some(idx) = digit_chip_index(c)
+            {
+                toggle_chip(active_chips, idx);
+                bump_debounce(
+                    debounce_token,
+                    last_change_at,
+                    jira_spawned_for_token,
+                    jira_state,
+                );
+                *local_results = recompute_local(
+                    &app.issues,
+                    query,
+                    *active_chips,
+                    app.current_user.as_deref(),
+                );
+                clamp_selection(selected, local_results.len(), jira_state);
+                return;
+            }
+            let before = query.clone();
+            edit_text(query, cursor, code);
+            if query != &before {
+                bump_debounce(
+                    debounce_token,
+                    last_change_at,
+                    jira_spawned_for_token,
+                    jira_state,
+                );
+                *local_results = recompute_local(
+                    &app.issues,
+                    query,
+                    *active_chips,
+                    app.current_user.as_deref(),
+                );
+                clamp_selection(selected, local_results.len(), jira_state);
+            }
+        }
+        SearchFocus::Chip(idx) => {
+            if matches!(code, KeyCode::Char(' ') | KeyCode::Enter) {
+                toggle_chip(active_chips, idx);
+                bump_debounce(
+                    debounce_token,
+                    last_change_at,
+                    jira_spawned_for_token,
+                    jira_state,
+                );
+                *local_results = recompute_local(
+                    &app.issues,
+                    query,
+                    *active_chips,
+                    app.current_user.as_deref(),
+                );
+                clamp_selection(selected, local_results.len(), jira_state);
+            } else if let KeyCode::Char(c) = code
+                && let Some(target) = digit_chip_index(c)
+            {
+                toggle_chip(active_chips, target);
+                bump_debounce(
+                    debounce_token,
+                    last_change_at,
+                    jira_spawned_for_token,
+                    jira_state,
+                );
+                *local_results = recompute_local(
+                    &app.issues,
+                    query,
+                    *active_chips,
+                    app.current_user.as_deref(),
+                );
+                clamp_selection(selected, local_results.len(), jira_state);
+            }
+        }
+        SearchFocus::Result(_) => {
+            // Up/Down already handled above; nothing else for now.
+        }
+    }
+}
+
+fn recompute_local(
+    issues: &[Issue],
+    query: &str,
+    chips: ChipSet,
+    me: Option<&str>,
+) -> Vec<RankedHit> {
+    let mut hits: Vec<RankedHit> = issues
+        .iter()
+        .filter_map(|i| crate::tui::search::score_local(query, chips, i, me))
+        .collect();
+    sort_hits(&mut hits);
+    hits
+}
+
+const fn clamp_selection(selected: &mut usize, local_len: usize, jira: &JiraSearchState) {
+    let total = local_len
+        + match jira {
+            JiraSearchState::Loaded { hits, .. } => hits.len(),
+            _ => 0,
+        };
+    if total == 0 {
+        *selected = 0;
+    } else if *selected >= total {
+        *selected = total - 1;
+    }
+}
+
+const NUM_CHIPS: usize = 5;
+
+const fn digit_chip_index(c: char) -> Option<usize> {
+    match c {
+        '1' => Some(0),
+        '2' => Some(1),
+        '3' => Some(2),
+        '4' => Some(3),
+        '5' => Some(4),
+        _ => None,
+    }
+}
+
+const fn toggle_chip(chips: &mut ChipSet, idx: usize) {
+    match idx {
+        0 => chips.mine = !chips.mine,
+        1 => chips.unassigned = !chips.unassigned,
+        2 => chips.in_review = !chips.in_review,
+        3 => chips.active_sprint = !chips.active_sprint,
+        4 => chips.global = !chips.global,
+        _ => {}
+    }
+}
+
+fn bump_debounce(
+    token: &mut u64,
+    last_change_at: &mut std::time::Instant,
+    jira_spawned_for_token: &mut bool,
+    jira_state: &mut JiraSearchState,
+) {
+    *token = token.wrapping_add(1);
+    *last_change_at = std::time::Instant::now();
+    *jira_spawned_for_token = false;
+    *jira_state = JiraSearchState::Idle;
+}
+
+fn cycle_search_focus(app: &mut AppState, forward: bool) {
+    let ActionState::Searching {
+        ref mut focus,
+        active_chips: _,
+        ref local_results,
+        ref jira_state,
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+    let result_count = search_total_results(local_results, jira_state);
+    // Cycle: Input → Chip(0..NUM_CHIPS) → Result(0) → Input.
+    let order_len = 1 + NUM_CHIPS + usize::from(result_count > 0);
+    let cur = match *focus {
+        SearchFocus::Input => 0,
+        SearchFocus::Chip(i) => 1 + i,
+        SearchFocus::Result(_) => 1 + NUM_CHIPS,
+    };
+    let next = if forward {
+        (cur + 1) % order_len
+    } else {
+        (cur + order_len - 1) % order_len
+    };
+    *focus = match next {
+        0 => SearchFocus::Input,
+        n if n > NUM_CHIPS => SearchFocus::Result(0),
+        n => SearchFocus::Chip(n - 1),
+    };
+}
+
+fn move_search_selection(app: &mut AppState, delta: i32) {
+    let ActionState::Searching {
+        ref mut selected,
+        ref local_results,
+        ref jira_state,
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+    let total = search_total_results(local_results, jira_state);
+    if total == 0 {
+        *selected = 0;
+        return;
+    }
+    let cur = i64::try_from(*selected).unwrap_or(0);
+    let new = (cur + i64::from(delta)).rem_euclid(i64::try_from(total).unwrap_or(1));
+    *selected = usize::try_from(new).unwrap_or(0);
+}
+
+fn cancel_search(app: &mut AppState) {
+    if let ActionState::Searching { prev_nav_idx, .. } = app.action_state {
+        app.nav_idx = prev_nav_idx.min(app.nav_items.len().saturating_sub(1));
+    }
+    app.action_state = ActionState::None;
+}
+
+fn commit_search_selection(app: &mut AppState) {
+    let (key, was_jira) = {
+        let ActionState::Searching {
+            ref local_results,
+            ref jira_state,
+            selected,
+            ..
+        } = app.action_state
+        else {
+            return;
+        };
+        let local_len = local_results.len();
+        if selected < local_len {
+            (local_results[selected].issue_key.clone(), false)
+        } else {
+            let jira_idx = selected - local_len;
+            match jira_state {
+                JiraSearchState::Loaded { hits, issues } => {
+                    let key = hits.get(jira_idx).map(|h| h.issue_key.clone());
+                    let is_in_local = key.as_deref().is_some_and(|k| {
+                        app.issues.iter().any(|i| i.key == k)
+                    });
+                    if let Some(k) = key {
+                        if !is_in_local
+                            && let Some(issue) = issues.iter().find(|i| i.key == k).cloned()
+                        {
+                            inject_jira_search_result(app, issue);
+                        }
+                        (k, true)
+                    } else {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    };
+
+    app.action_state = ActionState::None;
+    // Focus the picked issue in the main list.
+    if let Some(pos) = app
+        .nav_items
+        .iter()
+        .position(|n| matches!(n, NavItem::Issue(idx) if app.issues.get(*idx).is_some_and(|i| i.key == key)))
+    {
+        app.nav_idx = pos;
+    }
+    app.focused_panel = FocusedPanel::Detail;
+    app.detail_scroll = 0;
+    app.fullscreen_detail = true;
+    let _ = was_jira;
+}
+
+const SEARCH_RESULTS_SOURCE_ID: &str = "_search_results";
+
+/// Inject a Jira-only search hit into the team's local list under a synthetic
+/// "Search Results" source group so the issue stays navigable + actionable.
+fn inject_jira_search_result(app: &mut AppState, mut issue: Issue) {
+    issue.source_id = Some(SEARCH_RESULTS_SOURCE_ID.into());
+    issue.subsource_idx = 0;
+    if let Some(SourceState::Loaded(existing)) = app.sources.get_mut(SEARCH_RESULTS_SOURCE_ID) {
+        if !existing.iter().any(|i| i.key == issue.key) {
+            existing.push(issue);
+        }
+    } else {
+        app.sources
+            .insert(SEARCH_RESULTS_SOURCE_ID.into(), SourceState::Loaded(vec![issue]));
+    }
+    app.rebuild_issues();
+}
+
+fn force_jira_search(app: &mut AppState) {
+    let ActionState::Searching {
+        ref mut last_change_at,
+        ref mut jira_spawned_for_token,
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+    // Pull last_change_at into the past so the dispatcher fires immediately.
+    *last_change_at = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    *jira_spawned_for_token = false;
 }
 
 /// Refresh is allowed only when no edit/picker/in-flight action is active.

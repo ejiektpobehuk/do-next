@@ -26,7 +26,10 @@ use crate::config::LoadedConfig;
 use crate::config::hidden::{HiddenState, hidden_path};
 use crate::events::{ActionResult, AppEvent};
 use crate::jira::JiraClient;
-use crate::sources::{fetcher::spawn_refresh_issue, spawn_fetches};
+use crate::sources::{
+    fetcher::{spawn_jira_search, spawn_refresh_issue},
+    spawn_fetches,
+};
 use crate::tui::app::{
     ActionState, AppState, AttachmentFetchRequest, cache_path_for, compute_completions_for,
     update_state,
@@ -110,8 +113,12 @@ async fn run_inner(
         }
 
         // Manage tick task lifecycle: run while sources are loading or any
-        // single-issue refresh is in flight (so the spinner animates).
-        if app.any_source_loading() || !app.refreshing_issues.is_empty() {
+        // single-issue refresh is in flight (so the spinner animates), or while
+        // the search popup is open (to drive the debounced Jira dispatch).
+        if app.any_source_loading()
+            || !app.refreshing_issues.is_empty()
+            || matches!(app.action_state, crate::tui::app::ActionState::Searching { .. })
+        {
             if tick_handle
                 .as_ref()
                 .is_none_or(tokio::task::JoinHandle::is_finished)
@@ -488,6 +495,66 @@ fn dispatch_background_tasks(
             tx.clone(),
         );
     }
+
+    // Debounced Jira-side search dispatch.
+    maybe_dispatch_search(app, client, tx);
+}
+
+const SEARCH_DEBOUNCE_MS: u128 = 250;
+
+fn maybe_dispatch_search(
+    app: &mut AppState,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let team_projects = team_project_keys(app);
+    let (jql, token) = {
+        let crate::tui::app::ActionState::Searching {
+            ref query,
+            active_chips,
+            ref last_change_at,
+            ref mut jira_state,
+            ref mut jira_spawned_for_token,
+            debounce_token,
+            ..
+        } = app.action_state
+        else {
+            return;
+        };
+        if *jira_spawned_for_token {
+            return;
+        }
+        if last_change_at.elapsed().as_millis() < SEARCH_DEBOUNCE_MS {
+            return;
+        }
+        let jql = crate::tui::search::build_jql(query, active_chips, &team_projects);
+        if jql.is_empty() {
+            // Nothing to send; mark as idle.
+            *jira_state = crate::tui::app::JiraSearchState::Idle;
+            *jira_spawned_for_token = true;
+            return;
+        }
+        *jira_state = crate::tui::app::JiraSearchState::Pending { token: debounce_token };
+        *jira_spawned_for_token = true;
+        (jql, debounce_token)
+    };
+    spawn_jira_search(client.clone(), jql, token, tx.clone());
+}
+
+fn team_project_keys(app: &crate::tui::app::AppState) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let team = &app.resolved_teams[app.active_team_idx];
+    if !team.jira.default_project.is_empty() {
+        keys.push(team.jira.default_project.clone());
+    }
+    for source in &team.config.sources {
+        if let Some(p) = &source.expected_project
+            && !keys.contains(p)
+        {
+            keys.push(p.clone());
+        }
+    }
+    keys
 }
 
 fn spawn_debounced_completions(app: &mut AppState, tx: &UnboundedSender<AppEvent>) {

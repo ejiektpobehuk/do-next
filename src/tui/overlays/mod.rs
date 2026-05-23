@@ -7,6 +7,7 @@ pub mod field_multiselect;
 pub mod field_select;
 pub mod hide;
 pub mod keybindings;
+pub mod search;
 pub mod sub_view;
 pub mod template_preview;
 pub mod transition;

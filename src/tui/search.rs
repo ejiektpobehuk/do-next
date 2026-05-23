@@ -17,11 +17,6 @@ pub struct ChipSet {
     pub global: bool,
 }
 
-impl ChipSet {
-    pub const fn any_filter(self) -> bool {
-        self.mine || self.unassigned || self.in_review || self.active_sprint
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitOrigin {
@@ -39,7 +34,11 @@ pub struct MatchRange {
 pub struct RankedHit {
     pub issue_key: String,
     pub score: i32,
+    /// Match offsets in the issue key — reserved for future highlight rendering.
+    #[allow(dead_code)]
     pub key_ranges: Vec<MatchRange>,
+    /// Match offsets in the summary — reserved for future highlight rendering.
+    #[allow(dead_code)]
     pub summary_ranges: Vec<MatchRange>,
     pub origin: HitOrigin,
 }

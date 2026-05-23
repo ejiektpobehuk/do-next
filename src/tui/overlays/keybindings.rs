@@ -95,5 +95,12 @@ fn right_column() -> Vec<Line<'static>> {
         key_line("m", "move to project"),
         key_line("r", "refresh focused (list or current issue)"),
         key_line("Shift+R", "refresh all issues"),
+        Line::raw(""),
+        section_header("Search"),
+        key_line("/", "open search popup"),
+        key_line("Tab", "cycle focus (input → chips → results)"),
+        key_line("1..5", "toggle chip"),
+        key_line("Ctrl+J", "force Jira search"),
+        key_line("Enter", "open result (fullscreen detail)"),
     ]
 }

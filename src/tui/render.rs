@@ -78,27 +78,31 @@ pub fn render(
         render_tab_bar(f, root[1], app);
     }
 
-    // Main: list (30%) | detail (70%)
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(main_area);
-
     let popup = app.popup_active();
-    crate::tui::list::render_list(
-        f,
-        main[0],
-        app,
-        list_state,
-        app.focused_panel == FocusedPanel::List && !popup,
-    );
-    render_detail(
-        f,
-        main[1],
-        app,
-        app.focused_panel == FocusedPanel::Detail && !popup,
-        render_out,
-    );
+    if app.fullscreen_detail {
+        render_detail(f, main_area, app, !popup, render_out);
+    } else {
+        // Main: list (30%) | detail (70%)
+        let main = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(main_area);
+
+        crate::tui::list::render_list(
+            f,
+            main[0],
+            app,
+            list_state,
+            app.focused_panel == FocusedPanel::List && !popup,
+        );
+        render_detail(
+            f,
+            main[1],
+            app,
+            app.focused_panel == FocusedPanel::Detail && !popup,
+            render_out,
+        );
+    }
 
     // Hint bar
     render_hints(f, hint_area, app);
@@ -219,6 +223,9 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
         }
         ActionState::KeybindingsHelp => {
             overlays::keybindings::render_keybindings_overlay(f);
+        }
+        ActionState::Searching { .. } => {
+            overlays::search::render_search_overlay(f, app);
         }
     }
 }
