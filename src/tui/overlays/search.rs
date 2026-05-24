@@ -8,14 +8,14 @@ use ratatui::{
 
 use crate::jira::types::Issue;
 use crate::tui::app::{ActionState, AppState, JiraSearchState, SearchFocus};
-use crate::tui::search::{ChipSet, RankedHit};
+use crate::tui::search::{RankedHit, SearchFilters};
 use crate::tui::theme;
 
 pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
     let ActionState::Searching {
         ref query,
         cursor,
-        active_chips,
+        ref filters,
         focus,
         ref local_results,
         ref jira_state,
@@ -29,9 +29,10 @@ pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
     let area = centered_rect(90, 90, f.area());
     f.render_widget(Clear, area);
 
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" Search ", Style::default().add_modifier(Modifier::BOLD)));
+    let outer = Block::default().borders(Borders::ALL).title(Span::styled(
+        " Search ",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
@@ -47,7 +48,7 @@ pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // input
-            Constraint::Length(3), // chips
+            Constraint::Length(3), // filter row
             Constraint::Min(1),    // results
             Constraint::Length(1), // footer
         ])
@@ -56,9 +57,23 @@ pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
     let team_projects = crate::tui::team_project_keys(app);
     let ordered = ordered_hits(local_results, jira_state, &team_projects);
 
-    render_input(f, left_chunks[0], query, cursor, focus == SearchFocus::Input);
-    render_chips(f, left_chunks[1], active_chips, focus);
-    render_results(f, left_chunks[2], app, jira_state, &ordered, selected, focus);
+    render_input(
+        f,
+        left_chunks[0],
+        query,
+        cursor,
+        focus == SearchFocus::Input,
+    );
+    render_filter_row(f, left_chunks[1], filters, focus);
+    render_results(
+        f,
+        left_chunks[2],
+        app,
+        jira_state,
+        &ordered,
+        selected,
+        focus,
+    );
     render_footer(f, left_chunks[3], jira_state);
 
     render_preview(f, right, app, jira_state, &ordered, selected);
@@ -84,7 +99,11 @@ fn ordered_hits<'a>(
 }
 
 fn render_input(f: &mut Frame, area: Rect, query: &str, cursor: usize, focused: bool) {
-    let border_color = if focused { theme::BORDER_FOCUS } else { theme::MUTED };
+    let border_color = if focused {
+        theme::BORDER_FOCUS
+    } else {
+        theme::MUTED
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
@@ -102,14 +121,14 @@ fn render_input(f: &mut Frame, area: Rect, query: &str, cursor: usize, focused: 
         let prefix_cols = 2; // "/ "
         #[allow(clippy::cast_possible_truncation)]
         let cursor_col = prefix_cols + cursor as u16;
-        let x = inner.x.saturating_add(cursor_col.min(inner.width.saturating_sub(1)));
+        let x = inner
+            .x
+            .saturating_add(cursor_col.min(inner.width.saturating_sub(1)));
         f.set_cursor_position((x, inner.y));
     }
 }
 
-const CHIP_LABELS: [&str; 4] = ["Mine", "Unassigned", "In Review", "Active Sprint"];
-
-fn render_chips(f: &mut Frame, area: Rect, chips: ChipSet, focus: SearchFocus) {
+fn render_filter_row(f: &mut Frame, area: Rect, filters: &SearchFilters, focus: SearchFocus) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::MUTED))
@@ -117,36 +136,59 @@ fn render_chips(f: &mut Frame, area: Rect, chips: ChipSet, focus: SearchFocus) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let status_focused = focus == SearchFocus::StatusSlot;
+    let project_focused = focus == SearchFocus::ProjectSlot;
+
     let mut spans: Vec<Span> = Vec::new();
-    for (idx, label) in CHIP_LABELS.iter().enumerate() {
-        let active = chip_active(chips, idx);
-        let focused = matches!(focus, SearchFocus::Chip(i) if i == idx);
-        let mut style = Style::default();
-        if active {
-            style = style.fg(Color::Blue).add_modifier(Modifier::BOLD);
-        } else {
-            style = style.fg(theme::MUTED);
-        }
-        if focused {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        spans.push(Span::styled(format!(" {} {} ", idx + 1, label), style));
-        spans.push(Span::raw(" "));
-    }
+    spans.extend(filter_slot_spans(
+        "1",
+        "Status",
+        filters.statuses.len(),
+        status_focused,
+    ));
+    spans.push(Span::raw("   "));
+    spans.extend(filter_slot_spans(
+        "2",
+        "Project",
+        filters.projects.len(),
+        project_focused,
+    ));
+
     f.render_widget(
         Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
         inner,
     );
 }
 
-const fn chip_active(chips: ChipSet, idx: usize) -> bool {
-    match idx {
-        0 => chips.mine,
-        1 => chips.unassigned,
-        2 => chips.in_review,
-        3 => chips.active_sprint,
-        _ => false,
+fn filter_slot_spans(digit: &str, label: &str, count: usize, focused: bool) -> Vec<Span<'static>> {
+    let active = count > 0;
+    let label_style = if active {
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::MUTED)
+    };
+    let label_style = if focused {
+        label_style.add_modifier(Modifier::REVERSED)
+    } else {
+        label_style
+    };
+
+    let mut spans = vec![
+        Span::styled(format!("{digit} "), Style::default().fg(theme::MUTED)),
+        Span::styled(label.to_string(), label_style),
+    ];
+    if active {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("[{count}]"),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
+    spans
 }
 
 fn render_results(
@@ -159,7 +201,11 @@ fn render_results(
     focus: SearchFocus,
 ) {
     let focused = matches!(focus, SearchFocus::Result(_));
-    let border_color = if focused { theme::BORDER_FOCUS } else { theme::MUTED };
+    let border_color = if focused {
+        theme::BORDER_FOCUS
+    } else {
+        theme::MUTED
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
@@ -171,7 +217,9 @@ fn render_results(
         f.render_widget(
             Paragraph::new(Span::styled(
                 "No matches",
-                Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(theme::MUTED)
+                    .add_modifier(Modifier::ITALIC),
             )),
             inner,
         );
@@ -193,9 +241,7 @@ fn render_results(
 }
 
 fn result_item(hit: &RankedHit, issue: Option<&Issue>) -> ListItem<'static> {
-    let summary = issue
-        .map(|i| i.fields.summary.clone())
-        .unwrap_or_default();
+    let summary = issue.map(|i| i.fields.summary.clone()).unwrap_or_default();
     ListItem::new(Line::from(vec![
         Span::raw(hit.issue_key.clone()),
         Span::raw("  "),
@@ -240,7 +286,9 @@ fn render_preview(
         f.render_widget(
             Paragraph::new(Span::styled(
                 "No selection",
-                Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(theme::MUTED)
+                    .add_modifier(Modifier::ITALIC),
             )),
             inner,
         );
@@ -289,18 +337,21 @@ fn render_preview(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Description",
-        Style::default().fg(theme::MUTED).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme::MUTED)
+            .add_modifier(Modifier::BOLD),
     )));
     let desc_text = description_text(issue);
     lines.push(Line::from(desc_text));
 
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        inner,
-    );
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn find_issue<'a>(app: &'a AppState, hit: &RankedHit, jira: &'a JiraSearchState) -> Option<&'a Issue> {
+fn find_issue<'a>(
+    app: &'a AppState,
+    hit: &RankedHit,
+    jira: &'a JiraSearchState,
+) -> Option<&'a Issue> {
     if let Some(issue) = app.issues.iter().find(|i| i.key == hit.issue_key) {
         return Some(issue);
     }

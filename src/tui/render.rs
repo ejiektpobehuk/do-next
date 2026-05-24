@@ -224,8 +224,11 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
         ActionState::KeybindingsHelp => {
             overlays::keybindings::render_keybindings_overlay(f);
         }
-        ActionState::Searching { .. } => {
+        ActionState::Searching { picker, .. } => {
             overlays::search::render_search_overlay(f, app);
+            if picker.is_some() {
+                overlays::search_picker::render_search_picker_overlay(f, app);
+            }
         }
     }
 }

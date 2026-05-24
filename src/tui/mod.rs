@@ -27,7 +27,10 @@ use crate::config::hidden::{HiddenState, hidden_path};
 use crate::events::{ActionResult, AppEvent};
 use crate::jira::JiraClient;
 use crate::sources::{
-    fetcher::{spawn_jira_search, spawn_refresh_issue},
+    fetcher::{
+        spawn_all_statuses_fetch, spawn_jira_search, spawn_projects_fetch, spawn_refresh_issue,
+        spawn_team_statuses_fetch,
+    },
     spawn_fetches,
 };
 use crate::tui::app::{
@@ -117,7 +120,10 @@ async fn run_inner(
         // the search popup is open (to drive the debounced Jira dispatch).
         if app.any_source_loading()
             || !app.refreshing_issues.is_empty()
-            || matches!(app.action_state, crate::tui::app::ActionState::Searching { .. })
+            || matches!(
+                app.action_state,
+                crate::tui::app::ActionState::Searching { .. }
+            )
         {
             if tick_handle
                 .as_ref()
@@ -498,19 +504,40 @@ fn dispatch_background_tasks(
 
     // Debounced Jira-side search dispatch.
     maybe_dispatch_search(app, client, tx);
+
+    // Filter picker background fetches. Triggered when the search overlay
+    // opens (or a picker opens with a cold cache).
+    if app.pending_team_status_fetch {
+        app.pending_team_status_fetch = false;
+        let team_idx = app.active_team_idx;
+        let keys = team_project_keys(app);
+        if keys.is_empty() {
+            // No team projects → nothing to fetch; mark the cache loaded with
+            // an empty list so the picker stops showing "Loading…".
+            app.status_team_cache = crate::tui::app::CacheState::Loaded(Vec::new());
+        } else {
+            spawn_team_statuses_fetch(client.clone(), keys, team_idx, tx.clone());
+        }
+    }
+    if app.pending_all_statuses_fetch {
+        app.pending_all_statuses_fetch = false;
+        let team_idx = app.active_team_idx;
+        spawn_all_statuses_fetch(client.clone(), team_idx, tx.clone());
+    }
+    if app.pending_projects_fetch {
+        app.pending_projects_fetch = false;
+        let team_idx = app.active_team_idx;
+        spawn_projects_fetch(client.clone(), team_idx, tx.clone());
+    }
 }
 
 const SEARCH_DEBOUNCE_MS: u128 = 250;
 
-fn maybe_dispatch_search(
-    app: &mut AppState,
-    client: &JiraClient,
-    tx: &UnboundedSender<AppEvent>,
-) {
+fn maybe_dispatch_search(app: &mut AppState, client: &JiraClient, tx: &UnboundedSender<AppEvent>) {
     let (jql, token) = {
         let crate::tui::app::ActionState::Searching {
             ref query,
-            active_chips,
+            ref filters,
             ref last_change_at,
             ref mut jira_state,
             ref mut jira_spawned_for_token,
@@ -526,14 +553,16 @@ fn maybe_dispatch_search(
         if last_change_at.elapsed().as_millis() < SEARCH_DEBOUNCE_MS {
             return;
         }
-        let jql = crate::tui::search::build_jql(query, active_chips);
+        let jql = crate::tui::search::build_jql(query, filters);
         if jql.is_empty() {
             // Nothing to send; mark as idle.
             *jira_state = crate::tui::app::JiraSearchState::Idle;
             *jira_spawned_for_token = true;
             return;
         }
-        *jira_state = crate::tui::app::JiraSearchState::Pending { token: debounce_token };
+        *jira_state = crate::tui::app::JiraSearchState::Pending {
+            token: debounce_token,
+        };
         *jira_spawned_for_token = true;
         (jql, debounce_token)
     };
@@ -1224,9 +1253,7 @@ mod tests {
     fn adf_paragraph_custom_schema() -> FieldSchema {
         FieldSchema {
             ty: "string".to_string(),
-            custom: Some(
-                "com.atlassian.jira.plugin.system.customfieldtypes:textarea".to_string(),
-            ),
+            custom: Some("com.atlassian.jira.plugin.system.customfieldtypes:textarea".to_string()),
             system: None,
         }
     }
@@ -1241,7 +1268,11 @@ mod tests {
 
     #[test]
     fn empty_adf_description_uses_schema_to_produce_adf() {
-        let result = shape_field_value("hello", &serde_json::Value::Null, Some(&adf_description_schema()));
+        let result = shape_field_value(
+            "hello",
+            &serde_json::Value::Null,
+            Some(&adf_description_schema()),
+        );
         assert_eq!(result.get("type").and_then(|t| t.as_str()), Some("doc"));
     }
 

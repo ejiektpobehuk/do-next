@@ -3,19 +3,17 @@
 //! Local scoring filters issues already loaded; JQL is built for parallel
 //! escalation to the Jira search API.
 
-use serde_json::Value;
-
 use crate::jira::types::Issue;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct ChipSet {
-    pub mine: bool,
-    pub unassigned: bool,
-    pub in_review: bool,
-    pub active_sprint: bool,
+/// User-selected filters in the search overlay.
+///
+/// An empty list means "no constraint" for that field. Matching is
+/// case-insensitive on the stored string values (status name, project key).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchFilters {
+    pub statuses: Vec<String>,
+    pub projects: Vec<String>,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitOrigin {
@@ -48,17 +46,12 @@ const SCORE_KEY_SUBSTR: i32 = 250;
 const SCORE_SUMMARY_TOKEN_PREFIX: i32 = 200;
 const SCORE_SUMMARY_SUBSTR: i32 = 100;
 
-/// Score an issue against a local search query + chip filters.
+/// Score an issue against a local search query + filters.
 ///
 /// Returns `None` if the issue should be hidden. When `query` is empty and no
-/// chip filter rejects the issue, returns a hit with `score = 0`.
-pub fn score_local(
-    query: &str,
-    chips: ChipSet,
-    issue: &Issue,
-    me: Option<&str>,
-) -> Option<RankedHit> {
-    if !chips_match(chips, issue, me) {
+/// filter rejects the issue, returns a hit with `score = 0`.
+pub fn score_local(query: &str, filters: &SearchFilters, issue: &Issue) -> Option<RankedHit> {
+    if !filters_match(filters, issue) {
         return None;
     }
 
@@ -171,51 +164,35 @@ fn match_summary_token(summary_lower: &str, token: &str) -> Option<TokenHit> {
     })
 }
 
-fn chips_match(chips: ChipSet, issue: &Issue, me: Option<&str>) -> bool {
-    if chips.mine {
-        let assignee = issue.fields.assignee.as_ref();
-        let matched = me.is_some_and(|m| {
-            assignee.is_some_and(|a| {
-                a.name.as_deref() == Some(m)
-                    || a.account_id.as_deref() == Some(m)
-                    || a.display_name.as_deref() == Some(m)
-            })
-        });
+fn filters_match(filters: &SearchFilters, issue: &Issue) -> bool {
+    if !filters.statuses.is_empty() {
+        let issue_status = issue.fields.status.name.as_str();
+        let matched = filters
+            .statuses
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(issue_status));
         if !matched {
             return false;
         }
     }
-    if chips.unassigned && issue.fields.assignee.is_some() {
-        return false;
-    }
-    if chips.in_review && !issue.fields.status.name.to_lowercase().contains("review") {
-        return false;
-    }
-    if chips.active_sprint && !has_active_sprint(issue) {
-        return false;
+    if !filters.projects.is_empty() {
+        let issue_project = issue.fields.project.key.as_str();
+        let matched = filters
+            .projects
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(issue_project));
+        if !matched {
+            return false;
+        }
     }
     true
 }
 
-fn has_active_sprint(issue: &Issue) -> bool {
-    issue.fields.extra.values().any(|v| match v {
-        Value::Array(arr) => arr.iter().any(is_active_sprint_value),
-        _ => false,
-    })
-}
-
-fn is_active_sprint_value(v: &Value) -> bool {
-    v.as_object()
-        .and_then(|o| o.get("state"))
-        .and_then(Value::as_str)
-        .is_some_and(|s| s.eq_ignore_ascii_case("active"))
-}
-
 /// Build the JQL to send to Jira for the current search state.
 ///
-/// Returns an empty string when there is nothing to search (no query, no chip
+/// Returns an empty string when there is nothing to search (no query, no
 /// filter). Callers should skip the request in that case.
-pub fn build_jql(query: &str, chips: ChipSet) -> String {
+pub fn build_jql(query: &str, filters: &SearchFilters) -> String {
     let mut clauses: Vec<String> = Vec::new();
 
     let q = query.trim();
@@ -231,17 +208,24 @@ pub fn build_jql(query: &str, chips: ChipSet) -> String {
         }
     }
 
-    if chips.mine {
-        clauses.push("assignee = currentUser()".into());
+    if !filters.statuses.is_empty() {
+        let list = filters
+            .statuses
+            .iter()
+            .map(|s| format!("\"{}\"", escape_jql_string(s)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("status in ({list})"));
     }
-    if chips.unassigned {
-        clauses.push("assignee is EMPTY".into());
-    }
-    if chips.in_review {
-        clauses.push("status = \"In Review\"".into());
-    }
-    if chips.active_sprint {
-        clauses.push("sprint in openSprints()".into());
+
+    if !filters.projects.is_empty() {
+        let list = filters
+            .projects
+            .iter()
+            .map(|p| format!("\"{}\"", escape_jql_string(p)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("project in ({list})"));
     }
 
     clauses.join(" AND ")
@@ -269,8 +253,7 @@ pub fn escape_jql_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jira::types::{IssueFields, IssueTypeField, ProjectField, StatusField, UserField};
-    use serde_json::json;
+    use crate::jira::types::{IssueFields, IssueTypeField, ProjectField, StatusField};
     use std::collections::HashMap;
 
     fn make_issue(key: &str, summary: &str) -> Issue {
@@ -310,29 +293,17 @@ mod tests {
         issue
     }
 
-    fn with_assignee(mut issue: Issue, name: &str) -> Issue {
-        issue.fields.assignee = Some(UserField {
-            name: Some(name.into()),
-            display_name: Some(name.into()),
-            account_id: Some(name.into()),
-        });
-        issue
-    }
-
-    fn with_sprint(mut issue: Issue, state: &str) -> Issue {
-        issue.fields.extra.insert(
-            "customfield_10020".into(),
-            json!([{"id": 1, "name": "Sprint 1", "state": state}]),
-        );
+    fn with_project(mut issue: Issue, key: &str) -> Issue {
+        issue.fields.project.key = key.into();
         issue
     }
 
     // ── score_local ──────────────────────────────────────────────────────────
 
     #[test]
-    fn empty_query_no_chips_keeps_issue_with_zero_score() {
+    fn empty_query_no_filters_keeps_issue_with_zero_score() {
         let issue = make_issue("PROJ-1", "Fix login bug");
-        let hit = score_local("", ChipSet::default(), &issue, None).unwrap();
+        let hit = score_local("", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, 0);
         assert_eq!(hit.issue_key, "PROJ-1");
         assert!(hit.key_ranges.is_empty());
@@ -342,7 +313,7 @@ mod tests {
     #[test]
     fn exact_key_match_wins_over_summary() {
         let issue = make_issue("PROJ-12", "Fix login bug");
-        let hit = score_local("PROJ-12", ChipSet::default(), &issue, None).unwrap();
+        let hit = score_local("PROJ-12", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, SCORE_KEY_EXACT);
         assert_eq!(
             hit.key_ranges,
@@ -356,21 +327,21 @@ mod tests {
     #[test]
     fn key_match_is_case_insensitive() {
         let issue = make_issue("PROJ-12", "Whatever");
-        let hit = score_local("proj-12", ChipSet::default(), &issue, None).unwrap();
+        let hit = score_local("proj-12", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, SCORE_KEY_EXACT);
     }
 
     #[test]
     fn key_prefix_scores_below_exact() {
         let issue = make_issue("PROJ-12", "Fix login bug");
-        let hit = score_local("PROJ", ChipSet::default(), &issue, None).unwrap();
+        let hit = score_local("PROJ", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, SCORE_KEY_PREFIX);
     }
 
     #[test]
     fn summary_token_prefix_outranks_substring() {
         let issue = make_issue("PROJ-12", "Fix login bug");
-        let hit = score_local("log", ChipSet::default(), &issue, None).unwrap();
+        let hit = score_local("log", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, SCORE_SUMMARY_TOKEN_PREFIX);
         assert_eq!(hit.summary_ranges.len(), 1);
     }
@@ -378,172 +349,171 @@ mod tests {
     #[test]
     fn summary_substring_falls_back_to_lower_score() {
         let issue = make_issue("PROJ-12", "Refactor authentication");
-        let hit = score_local("entic", ChipSet::default(), &issue, None).unwrap();
+        let hit = score_local("entic", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, SCORE_SUMMARY_SUBSTR);
     }
 
     #[test]
     fn multi_token_query_requires_all_tokens_to_match() {
         let issue = make_issue("PROJ-12", "Fix login bug");
-        assert!(score_local("fix bug", ChipSet::default(), &issue, None).is_some());
-        assert!(score_local("fix banana", ChipSet::default(), &issue, None).is_none());
+        assert!(score_local("fix bug", &SearchFilters::default(), &issue).is_some());
+        assert!(score_local("fix banana", &SearchFilters::default(), &issue).is_none());
     }
 
     #[test]
     fn no_match_returns_none() {
         let issue = make_issue("PROJ-12", "Fix login bug");
-        assert!(score_local("banana", ChipSet::default(), &issue, None).is_none());
+        assert!(score_local("banana", &SearchFilters::default(), &issue).is_none());
     }
 
     #[test]
     fn unicode_summary_matches() {
         let issue = make_issue("PROJ-12", "Починить вход тёмной темы");
-        let hit = score_local("тёмной", ChipSet::default(), &issue, None).unwrap();
+        let hit = score_local("тёмной", &SearchFilters::default(), &issue).unwrap();
         assert!(hit.score >= SCORE_SUMMARY_TOKEN_PREFIX);
         let r = &hit.summary_ranges[0];
-        assert_eq!(&issue.fields.summary.to_lowercase()[r.start..r.end], "тёмной");
-    }
-
-    // ── chip filters ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn chip_mine_matches_when_assignee_equals_me() {
-        let issue = with_assignee(make_issue("PROJ-1", "x"), "alice");
-        let chips = ChipSet {
-            mine: true,
-            ..ChipSet::default()
-        };
-        assert!(score_local("", chips, &issue, Some("alice")).is_some());
-        assert!(score_local("", chips, &issue, Some("bob")).is_none());
+        assert_eq!(
+            &issue.fields.summary.to_lowercase()[r.start..r.end],
+            "тёмной"
+        );
     }
 
     #[test]
-    fn chip_mine_filters_out_unassigned() {
+    fn digit_only_query_matches_key_substring() {
+        let issue = make_issue("PROJ-123", "Anything");
+        let hit = score_local("123", &SearchFilters::default(), &issue).unwrap();
+        assert!(hit.score >= SCORE_KEY_SUBSTR);
+    }
+
+    // ── filters_match ────────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_filters_accept_everything() {
         let issue = make_issue("PROJ-1", "x");
-        let chips = ChipSet {
-            mine: true,
-            ..ChipSet::default()
-        };
-        assert!(score_local("", chips, &issue, Some("alice")).is_none());
+        assert!(score_local("", &SearchFilters::default(), &issue).is_some());
     }
 
     #[test]
-    fn chip_unassigned_matches_only_when_no_assignee() {
-        let chips = ChipSet {
-            unassigned: true,
-            ..ChipSet::default()
+    fn status_filter_matches_case_insensitive() {
+        let issue = with_status(make_issue("PROJ-1", "x"), "In Progress");
+        let filters = SearchFilters {
+            statuses: vec!["in progress".into()],
+            ..SearchFilters::default()
         };
-        let unassigned = make_issue("PROJ-1", "x");
-        let assigned = with_assignee(make_issue("PROJ-2", "x"), "alice");
-        assert!(score_local("", chips, &unassigned, None).is_some());
-        assert!(score_local("", chips, &assigned, None).is_none());
+        assert!(score_local("", &filters, &issue).is_some());
     }
 
     #[test]
-    fn chip_in_review_matches_status_containing_review() {
-        let chips = ChipSet {
-            in_review: true,
-            ..ChipSet::default()
+    fn status_filter_rejects_non_listed() {
+        let issue = with_status(make_issue("PROJ-1", "x"), "Done");
+        let filters = SearchFilters {
+            statuses: vec!["In Progress".into(), "In Review".into()],
+            ..SearchFilters::default()
         };
-        let in_review = with_status(make_issue("PROJ-1", "x"), "In Review");
-        let code_review = with_status(make_issue("PROJ-2", "x"), "Code Review");
-        let done = with_status(make_issue("PROJ-3", "x"), "Done");
-        assert!(score_local("", chips, &in_review, None).is_some());
-        assert!(score_local("", chips, &code_review, None).is_some());
-        assert!(score_local("", chips, &done, None).is_none());
+        assert!(score_local("", &filters, &issue).is_none());
     }
 
     #[test]
-    fn chip_active_sprint_finds_open_sprint_in_extra() {
-        let chips = ChipSet {
-            active_sprint: true,
-            ..ChipSet::default()
+    fn project_filter_matches_case_insensitive() {
+        let issue = with_project(make_issue("PROJ-1", "x"), "PLAT");
+        let filters = SearchFilters {
+            projects: vec!["plat".into()],
+            ..SearchFilters::default()
         };
-        let active = with_sprint(make_issue("PROJ-1", "x"), "active");
-        let closed = with_sprint(make_issue("PROJ-2", "x"), "closed");
-        let none = make_issue("PROJ-3", "x");
-        assert!(score_local("", chips, &active, None).is_some());
-        assert!(score_local("", chips, &closed, None).is_none());
-        assert!(score_local("", chips, &none, None).is_none());
+        assert!(score_local("", &filters, &issue).is_some());
     }
 
     #[test]
-    fn chips_combine_with_query() {
-        let chips = ChipSet {
-            mine: true,
-            ..ChipSet::default()
+    fn project_filter_rejects_non_listed() {
+        let issue = with_project(make_issue("PROJ-1", "x"), "OPS");
+        let filters = SearchFilters {
+            projects: vec!["PLAT".into(), "PROJ".into()],
+            ..SearchFilters::default()
         };
-        let mine_match = with_assignee(make_issue("PROJ-1", "Fix login"), "alice");
-        let mine_no_query = with_assignee(make_issue("PROJ-2", "Refactor"), "alice");
-        assert!(score_local("login", chips, &mine_match, Some("alice")).is_some());
-        assert!(score_local("login", chips, &mine_no_query, Some("alice")).is_none());
+        assert!(score_local("", &filters, &issue).is_none());
+    }
+
+    #[test]
+    fn filters_combine_with_query() {
+        let issue = with_status(make_issue("PROJ-1", "Fix login"), "In Progress");
+        let filters = SearchFilters {
+            statuses: vec!["In Progress".into()],
+            ..SearchFilters::default()
+        };
+        assert!(score_local("login", &filters, &issue).is_some());
+        assert!(score_local("banana", &filters, &issue).is_none());
     }
 
     // ── build_jql ────────────────────────────────────────────────────────────
 
     #[test]
     fn jql_text_only_emits_key_clause_for_key_fragment() {
-        let jql = build_jql("login", ChipSet::default());
+        let jql = build_jql("login", &SearchFilters::default());
         assert_eq!(jql, "(summary ~ \"login*\" OR key = \"LOGIN\")");
     }
 
     #[test]
     fn jql_phrase_query_does_not_emit_key_clause() {
-        let jql = build_jql("login bug", ChipSet::default());
+        let jql = build_jql("login bug", &SearchFilters::default());
         assert_eq!(jql, "summary ~ \"login bug*\"");
     }
 
     #[test]
-    fn jql_each_chip_alone() {
-        let mine = ChipSet {
-            mine: true,
-            ..ChipSet::default()
+    fn jql_status_filter_alone() {
+        let filters = SearchFilters {
+            statuses: vec!["In Progress".into(), "In Review".into()],
+            ..SearchFilters::default()
         };
-        assert_eq!(build_jql("", mine), "assignee = currentUser()");
-
-        let unassigned = ChipSet {
-            unassigned: true,
-            ..ChipSet::default()
-        };
-        assert_eq!(build_jql("", unassigned), "assignee is EMPTY");
-
-        let review = ChipSet {
-            in_review: true,
-            ..ChipSet::default()
-        };
-        assert_eq!(build_jql("", review), "status = \"In Review\"");
-
-        let sprint = ChipSet {
-            active_sprint: true,
-            ..ChipSet::default()
-        };
-        assert_eq!(build_jql("", sprint), "sprint in openSprints()");
+        assert_eq!(
+            build_jql("", &filters),
+            "status in (\"In Progress\", \"In Review\")"
+        );
     }
 
     #[test]
-    fn jql_combines_query_and_chips() {
-        let chips = ChipSet {
-            mine: true,
-            in_review: true,
-            ..ChipSet::default()
+    fn jql_project_filter_alone() {
+        let filters = SearchFilters {
+            projects: vec!["PLAT".into(), "PROJ".into()],
+            ..SearchFilters::default()
         };
-        let jql = build_jql("login", chips);
+        assert_eq!(build_jql("", &filters), "project in (\"PLAT\", \"PROJ\")");
+    }
+
+    #[test]
+    fn jql_combines_query_and_filters() {
+        let filters = SearchFilters {
+            statuses: vec!["In Review".into()],
+            projects: vec!["PLAT".into()],
+        };
+        let jql = build_jql("login", &filters);
         assert_eq!(
             jql,
-            "(summary ~ \"login*\" OR key = \"LOGIN\") AND assignee = currentUser() AND status = \"In Review\""
+            "(summary ~ \"login*\" OR key = \"LOGIN\") AND status in (\"In Review\") AND project in (\"PLAT\")"
         );
     }
 
     #[test]
     fn jql_empty_when_nothing_to_search() {
-        assert_eq!(build_jql("", ChipSet::default()), "");
-        assert_eq!(build_jql("   ", ChipSet::default()), "");
+        assert_eq!(build_jql("", &SearchFilters::default()), "");
+        assert_eq!(build_jql("   ", &SearchFilters::default()), "");
     }
 
     #[test]
     fn jql_escapes_quotes_and_backslashes_in_query() {
-        let jql = build_jql("he said \"hi\\bye\"", ChipSet::default());
+        let jql = build_jql("he said \"hi\\bye\"", &SearchFilters::default());
         assert_eq!(jql, "summary ~ \"he said \\\"hi\\\\bye\\\"*\"");
+    }
+
+    #[test]
+    fn jql_escapes_quotes_in_status_filter() {
+        let filters = SearchFilters {
+            statuses: vec!["Has \"quotes\"".into()],
+            ..SearchFilters::default()
+        };
+        assert_eq!(
+            build_jql("", &filters),
+            "status in (\"Has \\\"quotes\\\"\")"
+        );
     }
 
     #[test]

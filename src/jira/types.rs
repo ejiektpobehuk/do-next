@@ -145,6 +145,41 @@ pub struct FieldMeta {
     pub name: String,
 }
 
+/// Light project descriptor used by the search filter picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectInfo {
+    pub key: String,
+    pub name: String,
+}
+
+/// Jira status category. Mirrors the four `statusCategory.key` values returned
+/// by the Jira REST API: `new`, `indeterminate`, `done`, `undefined`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StatusCategory {
+    New,
+    Indeterminate,
+    Done,
+    Undefined,
+}
+
+impl StatusCategory {
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "new" => Self::New,
+            "indeterminate" => Self::Indeterminate,
+            "done" => Self::Done,
+            _ => Self::Undefined,
+        }
+    }
+}
+
+/// A Jira status with the category it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusInfo {
+    pub name: String,
+    pub category: StatusCategory,
+}
+
 /// A selectable option for a Jira select/array field (from editmeta `allowedValues`).
 #[derive(Debug, Clone)]
 pub struct FieldOption {
@@ -169,10 +204,7 @@ impl FieldSchema {
     /// Returns true when this field's value is an Atlassian Document.
     pub fn is_adf(&self) -> bool {
         matches!(self.system.as_deref(), Some("description" | "environment"))
-            || self
-                .custom
-                .as_deref()
-                .is_some_and(is_adf_custom_field_type)
+            || self.custom.as_deref().is_some_and(is_adf_custom_field_type)
     }
 }
 

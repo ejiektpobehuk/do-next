@@ -50,8 +50,10 @@ fn try_render_modal_hints(f: &mut Frame, area: Rect, action_state: &ActionState)
                 Span::raw(" cycle  "),
                 Span::styled("↕", Style::default().fg(Color::Blue)),
                 Span::raw(" nav  "),
-                Span::styled("^J", Style::default().fg(Color::Blue)),
-                Span::raw(" jira  "),
+                Span::styled("Alt+1", Style::default().fg(Color::Blue)),
+                Span::raw(" status  "),
+                Span::styled("Alt+2", Style::default().fg(Color::Blue)),
+                Span::raw(" project  "),
                 Span::styled("Esc", Style::default().fg(Color::Magenta)),
                 Span::raw(" cancel ├──"),
             ])

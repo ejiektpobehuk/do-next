@@ -28,8 +28,8 @@ pub fn render_detail(
     // user sees the spinner regardless of which subview they triggered it from).
     let title = app.selected_issue().and_then(|i| {
         let refreshing = app.refreshing_issues.contains(&i.key);
-        let show_title = matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
-            || refreshing;
+        let show_title =
+            matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) || refreshing;
         if !show_title {
             return None;
         }

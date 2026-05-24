@@ -98,9 +98,9 @@ fn right_column() -> Vec<Line<'static>> {
         Line::raw(""),
         section_header("Search"),
         key_line("/", "open search popup"),
-        key_line("Tab", "cycle focus (input → chips → results)"),
-        key_line("1..5", "toggle chip"),
-        key_line("Ctrl+J", "force Jira search"),
+        key_line("Tab", "cycle focus (input → status → project → results)"),
+        key_line("Alt+1", "open status filter"),
+        key_line("Alt+2", "open project filter"),
         key_line("Enter", "open result (fullscreen detail)"),
     ]
 }
