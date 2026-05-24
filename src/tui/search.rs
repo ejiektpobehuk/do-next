@@ -7,11 +7,14 @@ use crate::jira::types::Issue;
 
 /// User-selected filters in the search overlay.
 ///
-/// An empty list means "no constraint" for that field. Matching is
-/// case-insensitive on the stored string values (status name, project key).
+/// An empty list means "no constraint" for that field. `statuses` lists
+/// statuses an issue must match; `statuses_exclude` lists statuses that
+/// reject an issue. Matching is case-insensitive on the stored values
+/// (status name, project key).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchFilters {
     pub statuses: Vec<String>,
+    pub statuses_exclude: Vec<String>,
     pub projects: Vec<String>,
 }
 
@@ -165,8 +168,8 @@ fn match_summary_token(summary_lower: &str, token: &str) -> Option<TokenHit> {
 }
 
 fn filters_match(filters: &SearchFilters, issue: &Issue) -> bool {
+    let issue_status = issue.fields.status.name.as_str();
     if !filters.statuses.is_empty() {
-        let issue_status = issue.fields.status.name.as_str();
         let matched = filters
             .statuses
             .iter()
@@ -174,6 +177,13 @@ fn filters_match(filters: &SearchFilters, issue: &Issue) -> bool {
         if !matched {
             return false;
         }
+    }
+    if filters
+        .statuses_exclude
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(issue_status))
+    {
+        return false;
     }
     if !filters.projects.is_empty() {
         let issue_project = issue.fields.project.key.as_str();
@@ -216,6 +226,16 @@ pub fn build_jql(query: &str, filters: &SearchFilters) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         clauses.push(format!("status in ({list})"));
+    }
+
+    if !filters.statuses_exclude.is_empty() {
+        let list = filters
+            .statuses_exclude
+            .iter()
+            .map(|s| format!("\"{}\"", escape_jql_string(s)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("status not in ({list})"));
     }
 
     if !filters.projects.is_empty() {
@@ -483,12 +503,62 @@ mod tests {
     fn jql_combines_query_and_filters() {
         let filters = SearchFilters {
             statuses: vec!["In Review".into()],
+            statuses_exclude: Vec::new(),
             projects: vec!["PLAT".into()],
         };
         let jql = build_jql("login", &filters);
         assert_eq!(
             jql,
             "(summary ~ \"login*\" OR key = \"LOGIN\") AND status in (\"In Review\") AND project in (\"PLAT\")"
+        );
+    }
+
+    #[test]
+    fn status_exclude_filter_rejects_listed() {
+        let issue = with_status(make_issue("PROJ-1", "x"), "Done");
+        let filters = SearchFilters {
+            statuses_exclude: vec!["done".into()],
+            ..SearchFilters::default()
+        };
+        assert!(score_local("", &filters, &issue).is_none());
+    }
+
+    #[test]
+    fn status_include_and_exclude_combine() {
+        // Include accepts In Progress + In Review, but In Review is excluded.
+        let in_progress = with_status(make_issue("PROJ-1", "x"), "In Progress");
+        let in_review = with_status(make_issue("PROJ-2", "y"), "In Review");
+        let filters = SearchFilters {
+            statuses: vec!["In Progress".into(), "In Review".into()],
+            statuses_exclude: vec!["In Review".into()],
+            ..SearchFilters::default()
+        };
+        assert!(score_local("", &filters, &in_progress).is_some());
+        assert!(score_local("", &filters, &in_review).is_none());
+    }
+
+    #[test]
+    fn jql_status_exclude_alone() {
+        let filters = SearchFilters {
+            statuses_exclude: vec!["Done".into(), "Cancelled".into()],
+            ..SearchFilters::default()
+        };
+        assert_eq!(
+            build_jql("", &filters),
+            "status not in (\"Done\", \"Cancelled\")"
+        );
+    }
+
+    #[test]
+    fn jql_status_include_and_exclude_together() {
+        let filters = SearchFilters {
+            statuses: vec!["In Progress".into()],
+            statuses_exclude: vec!["Blocked".into()],
+            ..SearchFilters::default()
+        };
+        assert_eq!(
+            build_jql("", &filters),
+            "status in (\"In Progress\") AND status not in (\"Blocked\")"
         );
     }
 

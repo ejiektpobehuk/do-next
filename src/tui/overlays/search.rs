@@ -140,10 +140,9 @@ fn render_filter_row(f: &mut Frame, area: Rect, filters: &SearchFilters, focus: 
     let project_focused = focus == SearchFocus::ProjectSlot;
 
     let mut spans: Vec<Span> = Vec::new();
-    spans.extend(filter_slot_spans(
-        "1",
-        "Status",
+    spans.extend(status_slot_spans(
         filters.statuses.len(),
+        filters.statuses_exclude.len(),
         status_focused,
     ));
     spans.push(Span::raw("   "));
@@ -158,6 +157,53 @@ fn render_filter_row(f: &mut Frame, area: Rect, filters: &SearchFilters, focus: 
         Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+fn status_slot_spans(
+    include_count: usize,
+    exclude_count: usize,
+    focused: bool,
+) -> Vec<Span<'static>> {
+    let active = include_count > 0 || exclude_count > 0;
+    let label_style = if active {
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::MUTED)
+    };
+    let label_style = if focused {
+        label_style.add_modifier(Modifier::REVERSED)
+    } else {
+        label_style
+    };
+
+    let mut spans = vec![
+        Span::styled("1 ", Style::default().fg(theme::MUTED)),
+        Span::styled("Status", label_style),
+    ];
+    if active {
+        spans.push(Span::raw(" ["));
+        if include_count > 0 {
+            spans.push(Span::styled(
+                format!("+{include_count}"),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if include_count > 0 && exclude_count > 0 {
+            spans.push(Span::raw(" "));
+        }
+        if exclude_count > 0 {
+            spans.push(Span::styled(
+                format!("-{exclude_count}"),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::raw("]"));
+    }
+    spans
 }
 
 fn filter_slot_spans(digit: &str, label: &str, count: usize, focused: bool) -> Vec<Span<'static>> {

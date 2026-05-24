@@ -7,7 +7,8 @@ use ratatui::{
 };
 
 use crate::tui::app::{
-    ActionState, AppState, FilterKind, FilterPicker, PickerSection, picker_visible_indices,
+    ActionState, AppState, FilterChoice, FilterKind, FilterPicker, PickerSection,
+    picker_visible_indices,
 };
 use crate::tui::theme;
 
@@ -28,10 +29,15 @@ pub fn render_search_picker_overlay(f: &mut Frame, app: &AppState) {
         FilterKind::Project => " Project ",
     };
 
+    let space_hint = if picker.kind == FilterKind::Status {
+        " cycle  "
+    } else {
+        " toggle  "
+    };
     let close_hint = Line::from(vec![
         Span::raw("┤ "),
         Span::styled("Space", Style::default().fg(Color::Blue)),
-        Span::raw(" toggle  "),
+        Span::raw(space_hint),
         Span::styled("Enter", Style::default().fg(Color::Green)),
         Span::raw(" apply  "),
         Span::styled("Esc", Style::default().fg(Color::Magenta)),
@@ -117,14 +123,21 @@ fn render_list(f: &mut Frame, area: Rect, picker: &FilterPicker) {
         if vi == picker.cursor {
             cursor_row = Some(display_rows.len());
         }
-        let checked = picker.selected.contains(&item.value);
-        let check = if checked { "[✓] " } else { "[ ] " };
-        let value_style = if checked {
-            Style::default()
-                .fg(Color::Blue)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
+        let choice = picker.selected.get(&item.value).copied();
+        let (check, value_style) = match choice {
+            Some(FilterChoice::Include) => (
+                "[+] ",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Some(FilterChoice::Exclude) => (
+                "[-] ",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None => ("[ ] ", Style::default()),
         };
         display_rows.push(ListItem::new(Line::from(vec![
             Span::raw(check),

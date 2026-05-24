@@ -324,6 +324,24 @@ pub enum PickerSection {
     Other,
 }
 
+/// Tri-state choice for a filter picker row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterChoice {
+    Include,
+    Exclude,
+}
+
+impl FilterChoice {
+    /// Cycle: None → Include → Exclude → None.
+    pub const fn next(current: Option<Self>) -> Option<Self> {
+        match current {
+            None => Some(Self::Include),
+            Some(Self::Include) => Some(Self::Exclude),
+            Some(Self::Exclude) => None,
+        }
+    }
+}
+
 /// A single selectable row in the filter picker.
 #[derive(Debug, Clone)]
 pub struct PickerItem {
@@ -343,8 +361,9 @@ pub struct FilterPicker {
     pub items: Vec<PickerItem>,
     /// Cursor index into the filtered/visible items.
     pub cursor: usize,
-    /// Set of currently-checked values.
-    pub selected: HashSet<String>,
+    /// Map of values to their tri-state choice. Absent = unselected.
+    /// `FilterKind::Project` only ever stores `FilterChoice::Include`.
+    pub selected: HashMap<String, FilterChoice>,
     pub loading: bool,
 }
 
@@ -2633,9 +2652,18 @@ pub fn picker_visible_count(picker: &FilterPicker) -> usize {
 }
 
 fn open_status_picker(app: &mut AppState) {
-    let selected_values: HashSet<String> = match &app.action_state {
-        ActionState::Searching { filters, .. } => filters.statuses.iter().cloned().collect(),
-        _ => HashSet::new(),
+    let selected_values: HashMap<String, FilterChoice> = match &app.action_state {
+        ActionState::Searching { filters, .. } => {
+            let mut m = HashMap::new();
+            for s in &filters.statuses {
+                m.insert(s.clone(), FilterChoice::Include);
+            }
+            for s in &filters.statuses_exclude {
+                m.insert(s.clone(), FilterChoice::Exclude);
+            }
+            m
+        }
+        _ => HashMap::new(),
     };
     // Ensure the fetches that feed this picker are running.
     if app.status_team_cache.is_idle() {
@@ -2663,9 +2691,13 @@ fn open_status_picker(app: &mut AppState) {
 }
 
 fn open_project_picker(app: &mut AppState) {
-    let selected_values: HashSet<String> = match &app.action_state {
-        ActionState::Searching { filters, .. } => filters.projects.iter().cloned().collect(),
-        _ => HashSet::new(),
+    let selected_values: HashMap<String, FilterChoice> = match &app.action_state {
+        ActionState::Searching { filters, .. } => filters
+            .projects
+            .iter()
+            .map(|p| (p.clone(), FilterChoice::Include))
+            .collect(),
+        _ => HashMap::new(),
     };
     if app.project_cache.is_idle() {
         app.project_cache = CacheState::Loading;
@@ -2720,11 +2752,20 @@ fn apply_picker(app: &mut AppState) {
 
     match kind {
         FilterKind::Status => {
-            filters.statuses = picked.into_iter().collect();
-            filters.statuses.sort();
+            let (mut include, mut exclude): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+            for (value, choice) in picked {
+                match choice {
+                    FilterChoice::Include => include.push(value),
+                    FilterChoice::Exclude => exclude.push(value),
+                }
+            }
+            include.sort();
+            exclude.sort();
+            filters.statuses = include;
+            filters.statuses_exclude = exclude;
         }
         FilterKind::Project => {
-            filters.projects = picked.into_iter().collect();
+            filters.projects = picked.into_keys().collect();
             filters.projects.sort();
         }
     }
@@ -2774,10 +2815,23 @@ fn handle_picker_input(app: &mut AppState, code: KeyCode, modifiers: KeyModifier
             let visible = picker_visible_indices(picker);
             if let Some(&item_idx) = visible.get(picker.cursor) {
                 let value = picker.items[item_idx].value.clone();
-                if picker.selected.contains(&value) {
-                    picker.selected.remove(&value);
+                let current = picker.selected.get(&value).copied();
+                // Project picker is include-only: cycle skips Exclude.
+                let next = if picker.kind == FilterKind::Project {
+                    match current {
+                        None => Some(FilterChoice::Include),
+                        Some(_) => None,
+                    }
                 } else {
-                    picker.selected.insert(value);
+                    FilterChoice::next(current)
+                };
+                match next {
+                    Some(choice) => {
+                        picker.selected.insert(value, choice);
+                    }
+                    None => {
+                        picker.selected.remove(&value);
+                    }
                 }
             }
             return;
