@@ -507,7 +507,6 @@ fn maybe_dispatch_search(
     client: &JiraClient,
     tx: &UnboundedSender<AppEvent>,
 ) {
-    let team_projects = team_project_keys(app);
     let (jql, token) = {
         let crate::tui::app::ActionState::Searching {
             ref query,
@@ -527,7 +526,7 @@ fn maybe_dispatch_search(
         if last_change_at.elapsed().as_millis() < SEARCH_DEBOUNCE_MS {
             return;
         }
-        let jql = crate::tui::search::build_jql(query, active_chips, &team_projects);
+        let jql = crate::tui::search::build_jql(query, active_chips);
         if jql.is_empty() {
             // Nothing to send; mark as idle.
             *jira_state = crate::tui::app::JiraSearchState::Idle;
@@ -541,7 +540,7 @@ fn maybe_dispatch_search(
     spawn_jira_search(client.clone(), jql, token, tx.clone());
 }
 
-fn team_project_keys(app: &crate::tui::app::AppState) -> Vec<String> {
+pub fn team_project_keys(app: &crate::tui::app::AppState) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     let team = &app.resolved_teams[app.active_team_idx];
     if !team.jira.default_project.is_empty() {

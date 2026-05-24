@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::jira::types::Issue;
 use crate::tui::app::{ActionState, AppState, JiraSearchState, SearchFocus};
-use crate::tui::search::{ChipSet, HitOrigin, RankedHit};
+use crate::tui::search::{ChipSet, RankedHit};
 use crate::tui::theme;
 
 pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
@@ -53,12 +53,34 @@ pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
         ])
         .split(left);
 
+    let team_projects = crate::tui::team_project_keys(app);
+    let ordered = ordered_hits(local_results, jira_state, &team_projects);
+
     render_input(f, left_chunks[0], query, cursor, focus == SearchFocus::Input);
     render_chips(f, left_chunks[1], active_chips, focus);
-    render_results(f, left_chunks[2], local_results, jira_state, selected, focus);
-    render_footer(f, left_chunks[3], local_results, jira_state);
+    render_results(f, left_chunks[2], app, jira_state, &ordered, selected, focus);
+    render_footer(f, left_chunks[3], jira_state);
 
-    render_preview(f, right, app, local_results, jira_state, selected);
+    render_preview(f, right, app, jira_state, &ordered, selected);
+}
+
+fn ordered_hits<'a>(
+    local: &'a [RankedHit],
+    jira: &'a JiraSearchState,
+    team_projects: &[String],
+) -> Vec<&'a RankedHit> {
+    let mut out: Vec<&RankedHit> = local.iter().collect();
+    if let JiraSearchState::Loaded { hits, issues } = jira {
+        let (in_proj, rest): (Vec<&RankedHit>, Vec<&RankedHit>) = hits.iter().partition(|h| {
+            issues
+                .iter()
+                .find(|i| i.key == h.issue_key)
+                .is_some_and(|i| team_projects.iter().any(|p| p == &i.fields.project.key))
+        });
+        out.extend(in_proj);
+        out.extend(rest);
+    }
+    out
 }
 
 fn render_input(f: &mut Frame, area: Rect, query: &str, cursor: usize, focused: bool) {
@@ -85,7 +107,7 @@ fn render_input(f: &mut Frame, area: Rect, query: &str, cursor: usize, focused: 
     }
 }
 
-const CHIP_LABELS: [&str; 5] = ["Mine", "Unassigned", "In Review", "Active Sprint", "Global"];
+const CHIP_LABELS: [&str; 4] = ["Mine", "Unassigned", "In Review", "Active Sprint"];
 
 fn render_chips(f: &mut Frame, area: Rect, chips: ChipSet, focus: SearchFocus) {
     let block = Block::default()
@@ -123,7 +145,6 @@ const fn chip_active(chips: ChipSet, idx: usize) -> bool {
         1 => chips.unassigned,
         2 => chips.in_review,
         3 => chips.active_sprint,
-        4 => chips.global,
         _ => false,
     }
 }
@@ -131,8 +152,9 @@ const fn chip_active(chips: ChipSet, idx: usize) -> bool {
 fn render_results(
     f: &mut Frame,
     area: Rect,
-    local: &[RankedHit],
+    app: &AppState,
     jira: &JiraSearchState,
+    ordered: &[&RankedHit],
     selected: usize,
     focus: SearchFocus,
 ) {
@@ -145,17 +167,7 @@ fn render_results(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut items: Vec<ListItem> = Vec::new();
-    for hit in local {
-        items.push(result_item(hit));
-    }
-    if let JiraSearchState::Loaded { hits, .. } = jira {
-        for hit in hits {
-            items.push(result_item(hit));
-        }
-    }
-
-    if items.is_empty() {
+    if ordered.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled(
                 "No matches",
@@ -166,6 +178,11 @@ fn render_results(
         return;
     }
 
+    let items: Vec<ListItem> = ordered
+        .iter()
+        .map(|hit| result_item(hit, find_issue(app, hit, jira)))
+        .collect();
+
     let mut state = ListState::default();
     state.select(Some(selected));
 
@@ -175,58 +192,40 @@ fn render_results(
     f.render_stateful_widget(list, inner, &mut state);
 }
 
-fn result_item(hit: &RankedHit) -> ListItem<'static> {
-    let origin = match hit.origin {
-        HitOrigin::Local => Span::styled(" local ", Style::default().fg(theme::MUTED)),
-        HitOrigin::Jira => Span::styled(" jira  ", Style::default().fg(Color::Blue)),
-    };
-    let spans = vec![
+fn result_item(hit: &RankedHit, issue: Option<&Issue>) -> ListItem<'static> {
+    let summary = issue
+        .map(|i| i.fields.summary.clone())
+        .unwrap_or_default();
+    ListItem::new(Line::from(vec![
         Span::raw(hit.issue_key.clone()),
         Span::raw("  "),
-        origin,
-    ];
-    ListItem::new(Line::from(spans))
+        Span::raw(summary),
+    ]))
 }
 
-fn render_footer(f: &mut Frame, area: Rect, local: &[RankedHit], jira: &JiraSearchState) {
-    let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::styled(
-        format!("{} local", local.len()),
-        Style::default().fg(theme::MUTED),
-    ));
-    spans.push(Span::raw(" · "));
-    match jira {
-        JiraSearchState::Idle => {
-            spans.push(Span::styled("jira: idle", Style::default().fg(theme::MUTED)));
-        }
+fn render_footer(f: &mut Frame, area: Rect, jira: &JiraSearchState) {
+    let span = match jira {
+        JiraSearchState::Idle => Span::styled("jira: idle", Style::default().fg(theme::MUTED)),
         JiraSearchState::Pending { .. } => {
-            spans.push(Span::styled(
-                "jira: searching…",
-                Style::default().fg(Color::Blue),
-            ));
+            Span::styled("jira: searching…", Style::default().fg(Color::Blue))
         }
-        JiraSearchState::Loaded { hits, .. } => {
-            spans.push(Span::styled(
-                format!("jira: {} results", hits.len()),
-                Style::default().fg(theme::MUTED),
-            ));
+        JiraSearchState::Loaded { .. } => {
+            Span::styled("jira: loaded", Style::default().fg(theme::MUTED))
         }
-        JiraSearchState::Error(msg) => {
-            spans.push(Span::styled(
-                format!("jira: error — {msg}"),
-                Style::default().fg(Color::Red),
-            ));
-        }
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+        JiraSearchState::Error(msg) => Span::styled(
+            format!("jira: error — {msg}"),
+            Style::default().fg(Color::Red),
+        ),
+    };
+    f.render_widget(Paragraph::new(Line::from(span)), area);
 }
 
 fn render_preview(
     f: &mut Frame,
     area: Rect,
     app: &AppState,
-    local: &[RankedHit],
     jira: &JiraSearchState,
+    ordered: &[&RankedHit],
     selected: usize,
 ) {
     let block = Block::default()
@@ -236,7 +235,7 @@ fn render_preview(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let selected_hit = current_hit(local, jira, selected);
+    let selected_hit = ordered.get(selected).copied();
     let Some(hit) = selected_hit else {
         f.render_widget(
             Paragraph::new(Span::styled(
@@ -299,21 +298,6 @@ fn render_preview(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         inner,
     );
-}
-
-fn current_hit<'a>(
-    local: &'a [RankedHit],
-    jira: &'a JiraSearchState,
-    selected: usize,
-) -> Option<&'a RankedHit> {
-    if selected < local.len() {
-        return local.get(selected);
-    }
-    let jira_idx = selected - local.len();
-    match jira {
-        JiraSearchState::Loaded { hits, .. } => hits.get(jira_idx),
-        _ => None,
-    }
 }
 
 fn find_issue<'a>(app: &'a AppState, hit: &RankedHit, jira: &'a JiraSearchState) -> Option<&'a Issue> {

@@ -14,7 +14,6 @@ pub struct ChipSet {
     pub unassigned: bool,
     pub in_review: bool,
     pub active_sprint: bool,
-    pub global: bool,
 }
 
 
@@ -215,8 +214,8 @@ fn is_active_sprint_value(v: &Value) -> bool {
 /// Build the JQL to send to Jira for the current search state.
 ///
 /// Returns an empty string when there is nothing to search (no query, no chip
-/// filter, no scope). Callers should skip the request in that case.
-pub fn build_jql(query: &str, chips: ChipSet, team_projects: &[String]) -> String {
+/// filter). Callers should skip the request in that case.
+pub fn build_jql(query: &str, chips: ChipSet) -> String {
     let mut clauses: Vec<String> = Vec::new();
 
     let q = query.trim();
@@ -243,16 +242,6 @@ pub fn build_jql(query: &str, chips: ChipSet, team_projects: &[String]) -> Strin
     }
     if chips.active_sprint {
         clauses.push("sprint in openSprints()".into());
-    }
-
-    if !chips.global && !team_projects.is_empty() {
-        let list = team_projects
-            .iter()
-            .map(|p| escape_jql_string(p))
-            .map(|p| format!("\"{p}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        clauses.push(format!("project in ({list})"));
     }
 
     clauses.join(" AND ")
@@ -493,21 +482,15 @@ mod tests {
     // ── build_jql ────────────────────────────────────────────────────────────
 
     #[test]
-    fn jql_text_only_with_project_scope() {
-        let jql = build_jql("login", ChipSet::default(), &["PROJ".into()]);
-        assert_eq!(
-            jql,
-            "(summary ~ \"login*\" OR key = \"LOGIN\") AND project in (\"PROJ\")"
-        );
+    fn jql_text_only_emits_key_clause_for_key_fragment() {
+        let jql = build_jql("login", ChipSet::default());
+        assert_eq!(jql, "(summary ~ \"login*\" OR key = \"LOGIN\")");
     }
 
     #[test]
     fn jql_phrase_query_does_not_emit_key_clause() {
-        let jql = build_jql("login bug", ChipSet::default(), &["PROJ".into()]);
-        assert_eq!(
-            jql,
-            "summary ~ \"login bug*\" AND project in (\"PROJ\")"
-        );
+        let jql = build_jql("login bug", ChipSet::default());
+        assert_eq!(jql, "summary ~ \"login bug*\"");
     }
 
     #[test]
@@ -516,72 +499,50 @@ mod tests {
             mine: true,
             ..ChipSet::default()
         };
-        assert_eq!(
-            build_jql("", mine, &["P".into()]),
-            "assignee = currentUser() AND project in (\"P\")"
-        );
+        assert_eq!(build_jql("", mine), "assignee = currentUser()");
 
         let unassigned = ChipSet {
             unassigned: true,
             ..ChipSet::default()
         };
-        assert_eq!(
-            build_jql("", unassigned, &["P".into()]),
-            "assignee is EMPTY AND project in (\"P\")"
-        );
+        assert_eq!(build_jql("", unassigned), "assignee is EMPTY");
 
         let review = ChipSet {
             in_review: true,
             ..ChipSet::default()
         };
-        assert_eq!(
-            build_jql("", review, &["P".into()]),
-            "status = \"In Review\" AND project in (\"P\")"
-        );
+        assert_eq!(build_jql("", review), "status = \"In Review\"");
 
         let sprint = ChipSet {
             active_sprint: true,
             ..ChipSet::default()
         };
-        assert_eq!(
-            build_jql("", sprint, &["P".into()]),
-            "sprint in openSprints() AND project in (\"P\")"
-        );
+        assert_eq!(build_jql("", sprint), "sprint in openSprints()");
     }
 
     #[test]
-    fn jql_global_chip_drops_project_scope() {
-        let chips = ChipSet {
-            global: true,
-            mine: true,
-            ..ChipSet::default()
-        };
-        assert_eq!(build_jql("", chips, &["P".into()]), "assignee = currentUser()");
-    }
-
-    #[test]
-    fn jql_combines_query_and_chips_and_multi_project() {
+    fn jql_combines_query_and_chips() {
         let chips = ChipSet {
             mine: true,
             in_review: true,
             ..ChipSet::default()
         };
-        let jql = build_jql("login", chips, &["P1".into(), "P2".into()]);
+        let jql = build_jql("login", chips);
         assert_eq!(
             jql,
-            "(summary ~ \"login*\" OR key = \"LOGIN\") AND assignee = currentUser() AND status = \"In Review\" AND project in (\"P1\", \"P2\")"
+            "(summary ~ \"login*\" OR key = \"LOGIN\") AND assignee = currentUser() AND status = \"In Review\""
         );
     }
 
     #[test]
     fn jql_empty_when_nothing_to_search() {
-        assert_eq!(build_jql("", ChipSet::default(), &[]), "");
-        assert_eq!(build_jql("   ", ChipSet::default(), &[]), "");
+        assert_eq!(build_jql("", ChipSet::default()), "");
+        assert_eq!(build_jql("   ", ChipSet::default()), "");
     }
 
     #[test]
     fn jql_escapes_quotes_and_backslashes_in_query() {
-        let jql = build_jql("he said \"hi\\bye\"", ChipSet::default(), &[]);
+        let jql = build_jql("he said \"hi\\bye\"", ChipSet::default());
         assert_eq!(jql, "summary ~ \"he said \\\"hi\\\\bye\\\"*\"");
     }
 

@@ -2223,7 +2223,7 @@ const fn clamp_selection(selected: &mut usize, local_len: usize, jira: &JiraSear
     }
 }
 
-const NUM_CHIPS: usize = 5;
+const NUM_CHIPS: usize = 4;
 
 const fn digit_chip_index(c: char) -> Option<usize> {
     match c {
@@ -2242,7 +2242,6 @@ const fn toggle_chip(chips: &mut ChipSet, idx: usize) {
         1 => chips.unassigned = !chips.unassigned,
         2 => chips.in_review = !chips.in_review,
         3 => chips.active_sprint = !chips.active_sprint,
-        4 => chips.global = !chips.global,
         _ => {}
     }
 }
