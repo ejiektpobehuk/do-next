@@ -3,14 +3,13 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-    },
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 use crate::tui::app::ActionState;
 use crate::tui::markdown::markdown_to_lines;
 use crate::tui::render::RenderOut;
+use crate::tui::widgets::scrollbar::render_scrollbar;
 
 pub fn render_field_edit_confirm_overlay(
     f: &mut Frame,
@@ -117,16 +116,14 @@ pub fn render_field_edit_confirm_overlay(
         // Ratatui treats `content_length - 1` as the max position (last line at top of
         // viewport). We allow scrolling only until the last line reaches the bottom of
         // the viewport, so pass `max_scroll + 1` here for the thumb to reach the end.
-        let mut state = ScrollbarState::new(content_h - viewport_h + 1)
-            .viewport_content_length(viewport_h)
-            .position(display_scroll as usize);
-        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("┐"))
-            .end_symbol(Some("┘"))
-            .track_symbol(Some("│"))
-            .track_style(Style::default())
-            .thumb_style(Style::default().fg(Color::Yellow));
-        f.render_stateful_widget(bar, area, &mut state);
+        render_scrollbar(
+            f,
+            area,
+            content_h - viewport_h + 1,
+            viewport_h,
+            display_scroll as usize,
+            Color::Reset,
+        );
     }
 }
 

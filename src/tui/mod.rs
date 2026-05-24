@@ -9,6 +9,7 @@ pub mod render;
 pub mod search;
 pub mod theme;
 pub mod views;
+pub mod widgets;
 
 use anyhow::Result;
 use crossterm::{

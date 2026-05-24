@@ -3,9 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-    },
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
 
@@ -17,6 +15,7 @@ use crate::tui::app::{ActionState, AppState, SubView};
 use crate::tui::markdown::markdown_to_lines;
 use crate::tui::render::RenderOut;
 use crate::tui::theme;
+use crate::tui::widgets::scrollbar::render_scrollbar;
 
 pub fn render_sub_view_overlay(f: &mut Frame, app: &AppState, render_out: &mut RenderOut) {
     let Some(sub_view) = &app.overlay else {
@@ -524,7 +523,7 @@ fn render_comments(
             width: inner.width + 2,
             height: inner.height + 2,
         };
-        render_scrollbar(f, outer, content_h, viewport_h, scroll);
+        render_scrollbar(f, outer, content_h, viewport_h, scroll, theme::BORDER_FOCUS);
     }
 }
 
@@ -575,19 +574,6 @@ fn render_comment_widget(f: &mut Frame, area: Rect, comment: &Comment, focused: 
         Paragraph::new(styled_lines).wrap(Wrap { trim: false }),
         block_inner,
     );
-}
-
-fn render_scrollbar(f: &mut Frame, area: Rect, content_h: usize, viewport_h: usize, scroll: usize) {
-    let mut scrollbar_state = ScrollbarState::new(content_h)
-        .viewport_content_length(viewport_h)
-        .position(scroll);
-    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-        .begin_symbol(Some("┐"))
-        .end_symbol(Some("┘"))
-        .track_symbol(Some("│"))
-        .track_style(Style::default())
-        .thumb_style(Style::default().fg(theme::BORDER_FOCUS));
-    f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
 }
 
 fn format_size(bytes: u64) -> String {

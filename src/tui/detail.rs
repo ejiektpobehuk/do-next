@@ -3,13 +3,14 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 use crate::tui::app::{AppState, NavItem, ViewMode, source_config_for};
 use crate::tui::render::RenderOut;
 use crate::tui::theme;
 use crate::tui::views;
+use crate::tui::widgets::scrollbar::render_scrollbar;
 
 pub fn render_detail(
     f: &mut Frame,
@@ -60,16 +61,7 @@ pub fn render_detail(
 
     if total_lines > 0 {
         let viewport = area.height.saturating_sub(2) as usize;
-        let mut scrollbar_state = ScrollbarState::new(total_lines)
-            .viewport_content_length(viewport)
-            .position(app.detail_scroll);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("┐"))
-            .end_symbol(Some("┘"))
-            .track_symbol(Some("│"))
-            .track_style(Style::default())
-            .thumb_style(Style::default().fg(accent));
-        f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+        render_scrollbar(f, area, total_lines, viewport, app.detail_scroll, accent);
     }
 }
 

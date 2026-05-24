@@ -3,14 +3,13 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    },
+    widgets::{Block, Borders, List, ListItem, ListState},
 };
 
 use crate::config::types::SourceConfig;
 use crate::tui::app::{AppState, NavItem, SourceState, source_config_for};
 use crate::tui::theme;
+use crate::tui::widgets::scrollbar::render_scrollbar;
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -110,16 +109,14 @@ pub fn render_list(
 
     let viewport = area.height.saturating_sub(2) as usize;
     if total > viewport {
-        let mut scrollbar_state = ScrollbarState::new(total)
-            .viewport_content_length(viewport)
-            .position(list_state.selected().unwrap_or(0));
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("┐"))
-            .end_symbol(Some("┘"))
-            .track_symbol(Some("│"))
-            .track_style(Style::default())
-            .thumb_style(Style::default().fg(accent));
-        f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+        render_scrollbar(
+            f,
+            area,
+            total,
+            viewport,
+            list_state.selected().unwrap_or(0),
+            accent,
+        );
     }
 }
 
