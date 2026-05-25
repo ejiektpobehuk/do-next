@@ -21,7 +21,7 @@ Polished experience and documentation are coming closer to the first public rele
 
 The main way before the release is to [build from source](#development).
 
-Following solutions are supported at the best effort:
+The following solutions are supported on a best-effort basis:
 
 ### Binaries
 
@@ -40,7 +40,7 @@ The latest published version: ![Crates.io Version](https://img.shields.io/crates
 ### Nix way
 
 This repo provides a flake.
-I guess, you know how to configure in on your own ^.~
+I guess, you know how to configure it on your own ^.~
 
 ```sh
 nix run github:ejiektpobehuk/do-next
@@ -73,7 +73,7 @@ Dependencies:
 - msrv — `1.88.0`
 - `dbus` — Linux specific dependency
 
-`just` acts as a `cargo` wrapper that overwrites some defaults and provides a wrapper for NixOS dev shell.
+`just` acts as a `cargo` wrapper that overrides some defaults and provides a wrapper for NixOS dev shell.
 
 Run `just` to list all available commands:
 
