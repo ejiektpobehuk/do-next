@@ -78,27 +78,31 @@ pub fn render(
         render_tab_bar(f, root[1], app);
     }
 
-    // Main: list (30%) | detail (70%)
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(main_area);
-
     let popup = app.popup_active();
-    crate::tui::list::render_list(
-        f,
-        main[0],
-        app,
-        list_state,
-        app.focused_panel == FocusedPanel::List && !popup,
-    );
-    render_detail(
-        f,
-        main[1],
-        app,
-        app.focused_panel == FocusedPanel::Detail && !popup,
-        render_out,
-    );
+    if app.fullscreen_detail {
+        render_detail(f, main_area, app, !popup, render_out);
+    } else {
+        // Main: list (30%) | detail (70%)
+        let main = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(main_area);
+
+        crate::tui::list::render_list(
+            f,
+            main[0],
+            app,
+            list_state,
+            app.focused_panel == FocusedPanel::List && !popup,
+        );
+        render_detail(
+            f,
+            main[1],
+            app,
+            app.focused_panel == FocusedPanel::Detail && !popup,
+            render_out,
+        );
+    }
 
     // Hint bar
     render_hints(f, hint_area, app);
@@ -220,6 +224,12 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
         ActionState::KeybindingsHelp => {
             overlays::keybindings::render_keybindings_overlay(f);
         }
+        ActionState::Searching { picker, .. } => {
+            overlays::search::render_search_overlay(f, app);
+            if picker.is_some() {
+                overlays::search_picker::render_search_picker_overlay(f, app);
+            }
+        }
     }
 }
 
@@ -276,9 +286,10 @@ fn render_tab_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
 }
 
 fn render_error_overlay(f: &mut Frame, msg: &str, scroll: u16, render_out: &mut RenderOut) {
+    use crate::tui::widgets::scrollbar::render_scrollbar;
     use ratatui::{
         layout::{Alignment, Rect},
-        widgets::{Clear, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+        widgets::{Clear, Wrap},
     };
     let area = centered_rect(60, 30, f.area());
     f.render_widget(Clear, area);
@@ -323,16 +334,14 @@ fn render_error_overlay(f: &mut Frame, msg: &str, scroll: u16, render_out: &mut 
     f.render_widget(paragraph.scroll((display_scroll, 0)), padded);
 
     if scrollable {
-        let mut state = ScrollbarState::new(content_h - viewport_h + 1)
-            .viewport_content_length(viewport_h)
-            .position(display_scroll as usize);
-        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("┐"))
-            .end_symbol(Some("┘"))
-            .track_symbol(Some("│"))
-            .track_style(Style::default())
-            .thumb_style(Style::default().fg(Color::Yellow));
-        f.render_stateful_widget(bar, area, &mut state);
+        render_scrollbar(
+            f,
+            area,
+            content_h - viewport_h + 1,
+            viewport_h,
+            display_scroll as usize,
+            Color::Red,
+        );
     }
 }
 

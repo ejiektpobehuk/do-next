@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::jira::types::{Attachment, Comment, FieldOption, FieldSchema, Issue, Transition};
+use crate::jira::types::{
+    Attachment, Comment, FieldOption, FieldSchema, Issue, ProjectInfo, StatusInfo, Transition,
+};
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -31,6 +33,31 @@ pub enum AppEvent {
     IssueRefreshError {
         issue_key: String,
         error: anyhow::Error,
+    },
+    /// Debounced Jira-side search returned; carries the `debounce_token` that
+    /// was current when the request was spawned. Stale responses (token
+    /// mismatch) are dropped by the handler.
+    SearchJiraResult {
+        token: u64,
+        result: Result<Vec<Issue>, anyhow::Error>,
+    },
+    /// Distinct status names from the team projects' workflows, deduped
+    /// across projects. `team_idx` lets the handler discard responses for a
+    /// team the user has since left.
+    TeamStatusesLoaded {
+        team_idx: usize,
+        result: Result<Vec<String>, anyhow::Error>,
+    },
+    /// All statuses configured on this Jira instance, used to populate the
+    /// status picker's "Other" section.
+    AllStatusesLoaded {
+        team_idx: usize,
+        result: Result<Vec<StatusInfo>, anyhow::Error>,
+    },
+    /// Visible Jira projects fetched via `/project/search`.
+    AllProjectsLoaded {
+        team_idx: usize,
+        result: Result<Vec<ProjectInfo>, anyhow::Error>,
     },
 }
 

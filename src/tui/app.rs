@@ -7,7 +7,8 @@ use indexmap::IndexMap;
 
 use crate::config::types::{ResolvedTeam, SourceConfig, TeamConfig};
 use crate::events::{ActionResult, AppEvent};
-use crate::jira::types::{Comment, FieldOption, FieldSchema, Issue};
+use crate::jira::types::{Comment, FieldOption, FieldSchema, Issue, ProjectInfo, StatusInfo};
+use crate::tui::search::{RankedHit, SearchFilters};
 
 /// Per-team state that is saved/restored when switching tabs.
 #[derive(Debug, Clone)]
@@ -275,6 +276,137 @@ pub enum ActionState {
     },
     /// Keybindings reference overlay.
     KeybindingsHelp,
+    /// Telescope-style search popup: text input + chip filters + result list +
+    /// live preview pane.
+    Searching {
+        query: String,
+        cursor: usize,
+        filters: SearchFilters,
+        focus: SearchFocus,
+        local_results: Vec<RankedHit>,
+        jira_state: JiraSearchState,
+        /// Index in the merged result list of the currently highlighted hit.
+        selected: usize,
+        /// Selected nav index before opening search; restored on Esc.
+        prev_nav_idx: usize,
+        /// Incremented on every query/filter change; lets stale Jira responses be discarded.
+        debounce_token: u64,
+        /// Instant when query/filters last changed. The background dispatcher
+        /// spawns the Jira search 250ms after the latest change.
+        last_change_at: std::time::Instant,
+        /// True once the Jira spawn for the current `debounce_token` has fired.
+        jira_spawned_for_token: bool,
+        /// Active filter picker overlay, if any.
+        picker: Option<FilterPicker>,
+    },
+}
+
+/// Which sub-widget inside the search popup currently has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchFocus {
+    Input,
+    StatusSlot,
+    ProjectSlot,
+    Result(usize),
+}
+
+/// Which filter the active picker is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterKind {
+    Status,
+    Project,
+}
+
+/// Section of the picker an item belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerSection {
+    Team,
+    Other,
+}
+
+/// Tri-state choice for a filter picker row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterChoice {
+    Include,
+    Exclude,
+}
+
+impl FilterChoice {
+    /// Cycle: None → Include → Exclude → None.
+    pub const fn next(current: Option<Self>) -> Option<Self> {
+        match current {
+            None => Some(Self::Include),
+            Some(Self::Include) => Some(Self::Exclude),
+            Some(Self::Exclude) => None,
+        }
+    }
+}
+
+/// A single selectable row in the filter picker.
+#[derive(Debug, Clone)]
+pub struct PickerItem {
+    pub section: PickerSection,
+    /// Canonical value used for matching/JQL (status name or project key).
+    pub value: String,
+    /// Display label (status name, or "KEY  Name" for projects).
+    pub label: String,
+}
+
+/// State for the popup that edits a single filter.
+#[derive(Debug, Clone)]
+pub struct FilterPicker {
+    pub kind: FilterKind,
+    pub query: String,
+    pub query_cursor: usize,
+    pub items: Vec<PickerItem>,
+    /// Cursor index into the filtered/visible items.
+    pub cursor: usize,
+    /// Map of values to their tri-state choice. Absent = unselected.
+    /// `FilterKind::Project` only ever stores `FilterChoice::Include`.
+    pub selected: HashMap<String, FilterChoice>,
+    pub loading: bool,
+}
+
+/// Lifecycle of a background-fetched cache.
+#[derive(Debug, Clone, Default)]
+pub enum CacheState<T> {
+    #[default]
+    Idle,
+    Loading,
+    Loaded(T),
+    #[allow(dead_code)]
+    Failed(String),
+}
+
+impl<T> CacheState<T> {
+    pub const fn loaded(&self) -> Option<&T> {
+        match self {
+            Self::Loaded(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub const fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+    pub const fn is_pending(&self) -> bool {
+        matches!(self, Self::Idle | Self::Loading)
+    }
+}
+
+/// Async state of the parallel Jira-side search.
+#[derive(Debug, Clone)]
+pub enum JiraSearchState {
+    Idle,
+    Pending {
+        /// Debounce token of the request in flight; lets stale responses be discarded.
+        #[allow(dead_code)]
+        token: u64,
+    },
+    Loaded {
+        hits: Vec<RankedHit>,
+        issues: Vec<Issue>,
+    },
+    Error(String),
 }
 
 /// Progress of field name fetching from Jira API.
@@ -296,6 +428,7 @@ pub struct AppFlags {
     pub pending_team_fetch: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct AppState {
     pub resolved_teams: Vec<ResolvedTeam>,
     pub active_team_idx: usize,
@@ -375,6 +508,27 @@ pub struct AppState {
     pub refreshing_issues: HashSet<String>,
     /// Terminal image protocol picker (created once at startup).
     pub image_picker: Option<ratatui_image::picker::Picker>,
+    /// When true, hide the list panel and render the detail view full-width.
+    /// Toggled off by `h` or `Esc` in normal mode. Set when opening an issue
+    /// from the search popup.
+    pub fullscreen_detail: bool,
+    /// Distinct status names from the active team projects' workflows.
+    pub status_team_cache: CacheState<Vec<String>>,
+    /// All statuses configured on this Jira instance (used for the picker's
+    /// "Other" section). Each entry carries its `statusCategory` so terminal
+    /// statuses can bubble to the top.
+    pub status_all_cache: CacheState<Vec<StatusInfo>>,
+    /// Cached visible Jira projects (first page of `/project/search`).
+    pub project_cache: CacheState<Vec<ProjectInfo>>,
+    /// Set when search opens (or the status picker opens) and the team-status
+    /// cache is still cold; consumed by the background dispatcher.
+    pub pending_team_status_fetch: bool,
+    /// Set when search opens (or the status picker opens) and the all-status
+    /// cache is still cold; consumed by the background dispatcher.
+    pub pending_all_statuses_fetch: bool,
+    /// Set when search opens (or the project picker opens) and the project
+    /// cache is still cold; consumed by the background dispatcher.
+    pub pending_projects_fetch: bool,
 }
 
 /// Request for a silent background attachment fetch.
@@ -448,6 +602,13 @@ impl AppState {
             pending_refresh_issue: None,
             refreshing_issues: HashSet::new(),
             image_picker: None,
+            fullscreen_detail: false,
+            status_team_cache: CacheState::default(),
+            status_all_cache: CacheState::default(),
+            project_cache: CacheState::default(),
+            pending_team_status_fetch: false,
+            pending_all_statuses_fetch: false,
+            pending_projects_fetch: false,
         }
     }
 
@@ -501,9 +662,18 @@ impl AppState {
         // Reset UI state for the new tab
         self.detail_scroll = 0;
         self.view_mode = ViewMode::Default;
+        // Filter caches are team-scoped; drop them so the next picker open
+        // re-fetches for the new team.
+        self.status_team_cache = CacheState::default();
+        self.status_all_cache = CacheState::default();
+        self.project_cache = CacheState::default();
+        self.pending_team_status_fetch = false;
+        self.pending_all_statuses_fetch = false;
+        self.pending_projects_fetch = false;
         self.focused_panel = FocusedPanel::List;
         self.action_state = ActionState::None;
         self.overlay = None;
+        self.fullscreen_detail = false;
         // Drop any in-flight refresh signals; the running tasks will still
         // send events, but the handler tolerates unknown keys.
         self.refreshing_issues.clear();
@@ -750,6 +920,312 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
                 error: Arc::new(error),
                 scroll: 0,
             };
+        }
+
+        AppEvent::SearchJiraResult { token, result } => {
+            apply_search_jira_result(app, token, result);
+        }
+
+        AppEvent::TeamStatusesLoaded { team_idx, result } => {
+            apply_team_statuses_loaded(app, team_idx, result);
+        }
+
+        AppEvent::AllStatusesLoaded { team_idx, result } => {
+            apply_all_statuses_loaded(app, team_idx, result);
+        }
+
+        AppEvent::AllProjectsLoaded { team_idx, result } => {
+            apply_all_projects_loaded(app, team_idx, result);
+        }
+    }
+}
+
+fn apply_team_statuses_loaded(
+    app: &mut AppState,
+    team_idx: usize,
+    result: Result<Vec<String>, anyhow::Error>,
+) {
+    if team_idx != app.active_team_idx {
+        return;
+    }
+    match result {
+        Ok(statuses) => app.status_team_cache = CacheState::Loaded(statuses),
+        Err(e) => {
+            log::warn!("team statuses fetch failed: {e}");
+            app.status_team_cache = CacheState::Failed(e.to_string());
+        }
+    }
+    if status_picker_is_open(app) {
+        rebuild_status_picker_items(app);
+    }
+}
+
+fn apply_all_statuses_loaded(
+    app: &mut AppState,
+    team_idx: usize,
+    result: Result<Vec<StatusInfo>, anyhow::Error>,
+) {
+    if team_idx != app.active_team_idx {
+        return;
+    }
+    match result {
+        Ok(statuses) => app.status_all_cache = CacheState::Loaded(statuses),
+        Err(e) => {
+            log::warn!("all statuses fetch failed: {e}");
+            app.status_all_cache = CacheState::Failed(e.to_string());
+        }
+    }
+    if status_picker_is_open(app) {
+        rebuild_status_picker_items(app);
+    }
+}
+
+fn apply_all_projects_loaded(
+    app: &mut AppState,
+    team_idx: usize,
+    result: Result<Vec<ProjectInfo>, anyhow::Error>,
+) {
+    if team_idx != app.active_team_idx {
+        return;
+    }
+    match result {
+        Ok(projects) => app.project_cache = CacheState::Loaded(projects),
+        Err(e) => {
+            log::warn!("projects fetch failed: {e}");
+            app.project_cache = CacheState::Failed(e.to_string());
+        }
+    }
+    if project_picker_is_open(app) {
+        rebuild_project_picker_items(app);
+    }
+}
+
+const fn status_picker_is_open(app: &AppState) -> bool {
+    matches!(
+        app.action_state,
+        ActionState::Searching {
+            picker: Some(FilterPicker {
+                kind: FilterKind::Status,
+                ..
+            }),
+            ..
+        }
+    )
+}
+
+const fn project_picker_is_open(app: &AppState) -> bool {
+    matches!(
+        app.action_state,
+        ActionState::Searching {
+            picker: Some(FilterPicker {
+                kind: FilterKind::Project,
+                ..
+            }),
+            ..
+        }
+    )
+}
+
+/// Rebuild the Status picker's item list from current cache contents.
+/// Team = team-project workflow statuses; Other = all Jira statuses minus team.
+/// Within Other, statuses in the `done` category (Done, Closed, Resolved,
+/// Cancelled, Rejected, Won't Do…) appear first. Preserves the picker's
+/// typeahead query and selected set.
+fn rebuild_status_picker_items(app: &mut AppState) {
+    use crate::jira::types::StatusCategory;
+
+    let team: Vec<String> = app.status_team_cache.loaded().cloned().unwrap_or_default();
+    let all: Vec<StatusInfo> = app.status_all_cache.loaded().cloned().unwrap_or_default();
+    let loading = app.status_team_cache.is_pending() || app.status_all_cache.is_pending();
+
+    let team_lower: HashSet<String> = team.iter().map(|s| s.to_lowercase()).collect();
+
+    let mut other: Vec<StatusInfo> = all
+        .into_iter()
+        .filter(|s| !team_lower.contains(&s.name.to_lowercase()))
+        .collect();
+    other.sort_by(|a, b| {
+        let a_done = a.category == StatusCategory::Done;
+        let b_done = b.category == StatusCategory::Done;
+        // Done category first; alphabetical within each group.
+        b_done
+            .cmp(&a_done)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    let mut items: Vec<PickerItem> = Vec::with_capacity(team.len() + other.len());
+    for name in &team {
+        items.push(PickerItem {
+            section: PickerSection::Team,
+            value: name.clone(),
+            label: name.clone(),
+        });
+    }
+    for s in other {
+        items.push(PickerItem {
+            section: PickerSection::Other,
+            value: s.name.clone(),
+            label: s.name,
+        });
+    }
+
+    let ActionState::Searching {
+        picker: Some(ref mut p),
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+    if p.kind != FilterKind::Status {
+        return;
+    }
+    p.items = items;
+    p.loading = loading;
+    clamp_picker_cursor(p);
+}
+
+/// Rebuild the Project picker's item list. Team = team config projects;
+/// Other = all fetched projects minus team.
+fn rebuild_project_picker_items(app: &mut AppState) {
+    let team_keys = crate::tui::team_project_keys(app);
+    let team_keys_set: HashSet<String> = team_keys.iter().map(|k| k.to_uppercase()).collect();
+
+    // Names for team projects come from any loaded issue we've seen.
+    let mut team_names: HashMap<String, String> = HashMap::new();
+    for issue in &app.issues {
+        let k = issue.fields.project.key.to_uppercase();
+        if team_keys_set.contains(&k) {
+            team_names
+                .entry(k)
+                .or_insert_with(|| issue.fields.project.name.clone());
+        }
+    }
+    // Also pull names from the all-projects fetch when available.
+    if let Some(all) = app.project_cache.loaded() {
+        for p in all {
+            let up = p.key.to_uppercase();
+            if team_keys_set.contains(&up) {
+                team_names.entry(up).or_insert_with(|| p.name.clone());
+            }
+        }
+    }
+
+    let mut items: Vec<PickerItem> = Vec::new();
+    for k in &team_keys {
+        let label = team_names
+            .get(&k.to_uppercase())
+            .map_or_else(|| k.clone(), |name| format!("{k}  {name}"));
+        items.push(PickerItem {
+            section: PickerSection::Team,
+            value: k.clone(),
+            label,
+        });
+    }
+    if let Some(all) = app.project_cache.loaded() {
+        for p in all {
+            let up = p.key.to_uppercase();
+            if !team_keys_set.contains(&up) {
+                items.push(PickerItem {
+                    section: PickerSection::Other,
+                    value: p.key.clone(),
+                    label: format!("{}  {}", p.key, p.name),
+                });
+            }
+        }
+    }
+
+    let loading = app.project_cache.is_pending();
+    let ActionState::Searching {
+        picker: Some(ref mut p),
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+    if p.kind != FilterKind::Project {
+        return;
+    }
+    p.items = items;
+    p.loading = loading;
+    clamp_picker_cursor(p);
+}
+
+fn clamp_picker_cursor(picker: &mut FilterPicker) {
+    let visible = picker_visible_count(picker);
+    if visible == 0 {
+        picker.cursor = 0;
+    } else if picker.cursor >= visible {
+        picker.cursor = visible - 1;
+    }
+}
+
+/// Kick off the background fetches the search overlay needs, if not already
+/// loaded or in-flight. Called when the search overlay opens so that by the
+/// time the user opens a picker the lists are usually populated.
+fn schedule_filter_prefetches(app: &mut AppState) {
+    if app.status_team_cache.is_idle() {
+        app.status_team_cache = CacheState::Loading;
+        app.pending_team_status_fetch = true;
+    }
+    if app.status_all_cache.is_idle() {
+        app.status_all_cache = CacheState::Loading;
+        app.pending_all_statuses_fetch = true;
+    }
+    if app.project_cache.is_idle() {
+        app.project_cache = CacheState::Loading;
+        app.pending_projects_fetch = true;
+    }
+}
+
+/// Merge a Jira search response into the active `Searching` state, dropping
+/// stale responses (token mismatch) silently.
+fn apply_search_jira_result(
+    app: &mut AppState,
+    token: u64,
+    result: Result<Vec<Issue>, anyhow::Error>,
+) {
+    let ActionState::Searching {
+        ref query,
+        ref filters,
+        ref mut jira_state,
+        ref mut selected,
+        ref local_results,
+        debounce_token,
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+    if token != debounce_token {
+        return;
+    }
+    match result {
+        Ok(issues) => {
+            let mut hits = Vec::with_capacity(issues.len());
+            let local_keys: std::collections::HashSet<&str> =
+                local_results.iter().map(|h| h.issue_key.as_str()).collect();
+            for issue in &issues {
+                if local_keys.contains(issue.key.as_str()) {
+                    continue;
+                }
+                if let Some(mut hit) = crate::tui::search::score_local(query, filters, issue) {
+                    hit.origin = crate::tui::search::HitOrigin::Jira;
+                    hits.push(hit);
+                }
+            }
+            hits.sort_by(|a, b| b.score.cmp(&a.score));
+            *jira_state = JiraSearchState::Loaded { hits, issues };
+            let total = local_results.len()
+                + match jira_state {
+                    JiraSearchState::Loaded { hits, .. } => hits.len(),
+                    _ => 0,
+                };
+            if total > 0 && *selected >= total {
+                *selected = total - 1;
+            }
+        }
+        Err(e) => {
+            *jira_state = JiraSearchState::Error(e.to_string());
         }
     }
 }
@@ -1403,7 +1879,10 @@ fn handle_comment_edit_confirm_input(
     modifiers: crossterm::event::KeyModifiers,
 ) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
-    if matches!((code, modifiers), (KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+    if matches!(
+        (code, modifiers),
+        (KeyCode::Char('c'), KeyModifiers::CONTROL)
+    ) {
         app.should_quit = true;
         return true;
     }
@@ -1762,6 +2241,10 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
             handle_confirm_field_edit_input(app, &event);
             return;
         }
+        ActionState::Searching { .. } => {
+            handle_search_input(app, event);
+            return;
+        }
         ActionState::KeybindingsHelp => {
             if let crossterm::event::Event::Key(crossterm::event::KeyEvent { code, .. }) = event
                 && matches!(code, KeyCode::Char('q') | KeyCode::Esc)
@@ -1830,7 +2313,14 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
+        (KeyCode::Esc, _) if app.fullscreen_detail => {
+            app.fullscreen_detail = false;
+            app.focused_panel = FocusedPanel::List;
+        }
         (KeyCode::Left | KeyCode::Char('h'), _) => {
+            if app.fullscreen_detail {
+                app.fullscreen_detail = false;
+            }
             app.focused_panel = FocusedPanel::List;
         }
         (KeyCode::Right | KeyCode::Char('l'), _) => {
@@ -1892,8 +2382,562 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         }
         (KeyCode::Char('R'), _) => key_refresh_all(app),
         (KeyCode::Char('r'), _) => key_refresh_focused(app),
+        (KeyCode::Char('/'), _) => key_open_search(app),
         _ => {}
     }
+}
+
+fn key_open_search(app: &mut AppState) {
+    let prev_nav_idx = app.nav_idx;
+    let filters = SearchFilters::default();
+    let mut local_results: Vec<RankedHit> = app
+        .issues
+        .iter()
+        .filter_map(|i| crate::tui::search::score_local("", &filters, i))
+        .collect();
+    sort_hits(&mut local_results);
+    app.action_state = ActionState::Searching {
+        query: String::new(),
+        cursor: 0,
+        filters,
+        focus: SearchFocus::Input,
+        local_results,
+        jira_state: JiraSearchState::Idle,
+        selected: 0,
+        prev_nav_idx,
+        debounce_token: 1,
+        last_change_at: std::time::Instant::now(),
+        jira_spawned_for_token: true,
+        picker: None,
+    };
+    // Pre-fetch status / project lists in the background so the pickers are
+    // populated by the time the user opens them.
+    schedule_filter_prefetches(app);
+}
+
+fn sort_hits(hits: &mut [RankedHit]) {
+    hits.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.issue_key.cmp(&b.issue_key))
+    });
+}
+
+/// Total number of merged results currently shown in the search popup.
+const fn search_total_results(local: &[RankedHit], jira: &JiraSearchState) -> usize {
+    local.len()
+        + match jira {
+            JiraSearchState::Loaded { hits, .. } => hits.len(),
+            _ => 0,
+        }
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+fn handle_search_input(app: &mut AppState, event: crossterm::event::Event) {
+    use crossterm::event::{Event, KeyEvent};
+
+    let Event::Key(KeyEvent {
+        code, modifiers, ..
+    }) = event
+    else {
+        return;
+    };
+
+    // Picker overlay swallows all input while open.
+    if matches!(
+        app.action_state,
+        ActionState::Searching {
+            picker: Some(_),
+            ..
+        }
+    ) {
+        handle_picker_input(app, code, modifiers);
+        return;
+    }
+
+    // Alt+1 / Alt+2 open the Status / Project pickers from any focus inside
+    // the search overlay. Alt+<char> is reliably distinguishable in terminals
+    // (ESC-prefixed encoding), unlike Ctrl+<digit>. Plain digits remain
+    // available as query text.
+    if modifiers.contains(KeyModifiers::ALT) {
+        if code == KeyCode::Char('1') {
+            open_status_picker(app);
+            return;
+        }
+        if code == KeyCode::Char('2') {
+            open_project_picker(app);
+            return;
+        }
+        // Any other Alt combo is currently a no-op inside the search overlay.
+        return;
+    }
+
+    // Swallow any other Ctrl+<char> combination — these are mostly garbage
+    // from the legacy Ctrl+<digit> encodings (Ctrl+2 → NUL/space) and would
+    // otherwise leak into the query.
+    if matches!(modifiers, KeyModifiers::CONTROL)
+        && !matches!(
+            code,
+            KeyCode::Char('p' | 'n') // result navigation, handled below
+        )
+    {
+        return;
+    }
+
+    // Global keys regardless of focus
+    match (code, modifiers) {
+        (KeyCode::Esc, _) => {
+            cancel_search(app);
+            return;
+        }
+        (KeyCode::Tab, _) => {
+            cycle_search_focus(app, true);
+            return;
+        }
+        (KeyCode::BackTab, _) => {
+            cycle_search_focus(app, false);
+            return;
+        }
+        (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            move_search_selection(app, -1);
+            return;
+        }
+        (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            move_search_selection(app, 1);
+            return;
+        }
+        _ => {}
+    }
+
+    let ActionState::Searching { focus, .. } = app.action_state else {
+        return;
+    };
+
+    // Enter / Space behave differently per slot.
+    match (code, focus) {
+        (KeyCode::Enter | KeyCode::Char(' '), SearchFocus::StatusSlot) => {
+            open_status_picker(app);
+            return;
+        }
+        (KeyCode::Enter | KeyCode::Char(' '), SearchFocus::ProjectSlot) => {
+            open_project_picker(app);
+            return;
+        }
+        (KeyCode::Enter, _) => {
+            commit_search_selection(app);
+            return;
+        }
+        _ => {}
+    }
+
+    if focus != SearchFocus::Input {
+        return;
+    }
+
+    let ActionState::Searching {
+        ref mut query,
+        ref mut cursor,
+        ref filters,
+        ref mut local_results,
+        ref mut jira_state,
+        ref mut selected,
+        ref mut debounce_token,
+        ref mut last_change_at,
+        ref mut jira_spawned_for_token,
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+
+    let before = query.clone();
+    edit_text(query, cursor, code);
+    if query != &before {
+        bump_debounce(
+            debounce_token,
+            last_change_at,
+            jira_spawned_for_token,
+            jira_state,
+        );
+        *local_results = recompute_local(&app.issues, query, filters);
+        clamp_selection(selected, local_results.len(), jira_state);
+    }
+}
+
+fn recompute_local(issues: &[Issue], query: &str, filters: &SearchFilters) -> Vec<RankedHit> {
+    let mut hits: Vec<RankedHit> = issues
+        .iter()
+        .filter_map(|i| crate::tui::search::score_local(query, filters, i))
+        .collect();
+    sort_hits(&mut hits);
+    hits
+}
+
+const fn clamp_selection(selected: &mut usize, local_len: usize, jira: &JiraSearchState) {
+    let total = local_len
+        + match jira {
+            JiraSearchState::Loaded { hits, .. } => hits.len(),
+            _ => 0,
+        };
+    if total == 0 {
+        *selected = 0;
+    } else if *selected >= total {
+        *selected = total - 1;
+    }
+}
+
+fn bump_debounce(
+    token: &mut u64,
+    last_change_at: &mut std::time::Instant,
+    jira_spawned_for_token: &mut bool,
+    jira_state: &mut JiraSearchState,
+) {
+    *token = token.wrapping_add(1);
+    *last_change_at = std::time::Instant::now();
+    *jira_spawned_for_token = false;
+    *jira_state = JiraSearchState::Idle;
+}
+
+fn cycle_search_focus(app: &mut AppState, forward: bool) {
+    let ActionState::Searching {
+        ref mut focus,
+        ref local_results,
+        ref jira_state,
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+    let result_count = search_total_results(local_results, jira_state);
+    // Cycle: Input → StatusSlot → ProjectSlot → Result(0) → Input.
+    let order_len = 3 + usize::from(result_count > 0);
+    let cur = match *focus {
+        SearchFocus::Input => 0,
+        SearchFocus::StatusSlot => 1,
+        SearchFocus::ProjectSlot => 2,
+        SearchFocus::Result(_) => 3,
+    };
+    let next = if forward {
+        (cur + 1) % order_len
+    } else {
+        (cur + order_len - 1) % order_len
+    };
+    *focus = match next {
+        0 => SearchFocus::Input,
+        1 => SearchFocus::StatusSlot,
+        2 => SearchFocus::ProjectSlot,
+        _ => SearchFocus::Result(0),
+    };
+}
+
+/// Indices into `picker.items` of rows the user can navigate over, after
+/// applying the typeahead filter.
+pub fn picker_visible_indices(picker: &FilterPicker) -> Vec<usize> {
+    let q = picker.query.to_lowercase();
+    picker
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| q.is_empty() || item.label.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+pub fn picker_visible_count(picker: &FilterPicker) -> usize {
+    picker_visible_indices(picker).len()
+}
+
+fn open_status_picker(app: &mut AppState) {
+    let selected_values: HashMap<String, FilterChoice> = match &app.action_state {
+        ActionState::Searching { filters, .. } => {
+            let mut m = HashMap::new();
+            for s in &filters.statuses {
+                m.insert(s.clone(), FilterChoice::Include);
+            }
+            for s in &filters.statuses_exclude {
+                m.insert(s.clone(), FilterChoice::Exclude);
+            }
+            m
+        }
+        _ => HashMap::new(),
+    };
+    // Ensure the fetches that feed this picker are running.
+    if app.status_team_cache.is_idle() {
+        app.status_team_cache = CacheState::Loading;
+        app.pending_team_status_fetch = true;
+    }
+    if app.status_all_cache.is_idle() {
+        app.status_all_cache = CacheState::Loading;
+        app.pending_all_statuses_fetch = true;
+    }
+
+    if let ActionState::Searching { ref mut picker, .. } = app.action_state {
+        *picker = Some(FilterPicker {
+            kind: FilterKind::Status,
+            query: String::new(),
+            query_cursor: 0,
+            items: Vec::new(),
+            cursor: 0,
+            selected: selected_values,
+            loading: true,
+        });
+    }
+    // Populate from whichever caches are already loaded.
+    rebuild_status_picker_items(app);
+}
+
+fn open_project_picker(app: &mut AppState) {
+    let selected_values: HashMap<String, FilterChoice> = match &app.action_state {
+        ActionState::Searching { filters, .. } => filters
+            .projects
+            .iter()
+            .map(|p| (p.clone(), FilterChoice::Include))
+            .collect(),
+        _ => HashMap::new(),
+    };
+    if app.project_cache.is_idle() {
+        app.project_cache = CacheState::Loading;
+        app.pending_projects_fetch = true;
+    }
+
+    if let ActionState::Searching { ref mut picker, .. } = app.action_state {
+        *picker = Some(FilterPicker {
+            kind: FilterKind::Project,
+            query: String::new(),
+            query_cursor: 0,
+            items: Vec::new(),
+            cursor: 0,
+            selected: selected_values,
+            loading: true,
+        });
+    }
+    rebuild_project_picker_items(app);
+}
+
+fn cancel_picker(app: &mut AppState) {
+    if let ActionState::Searching { ref mut picker, .. } = app.action_state {
+        *picker = None;
+    }
+}
+
+fn apply_picker(app: &mut AppState) {
+    let (kind, picked) = {
+        let ActionState::Searching { ref mut picker, .. } = app.action_state else {
+            return;
+        };
+        let Some(p) = picker.take() else {
+            return;
+        };
+        (p.kind, p.selected)
+    };
+
+    let ActionState::Searching {
+        ref mut filters,
+        ref mut local_results,
+        ref query,
+        ref mut jira_state,
+        selected: ref mut sel,
+        ref mut debounce_token,
+        ref mut last_change_at,
+        ref mut jira_spawned_for_token,
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+
+    match kind {
+        FilterKind::Status => {
+            let (mut include, mut exclude): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+            for (value, choice) in picked {
+                match choice {
+                    FilterChoice::Include => include.push(value),
+                    FilterChoice::Exclude => exclude.push(value),
+                }
+            }
+            include.sort();
+            exclude.sort();
+            filters.statuses = include;
+            filters.statuses_exclude = exclude;
+        }
+        FilterKind::Project => {
+            filters.projects = picked.into_keys().collect();
+            filters.projects.sort();
+        }
+    }
+    *local_results = recompute_local(&app.issues, query, filters);
+    bump_debounce(
+        debounce_token,
+        last_change_at,
+        jira_spawned_for_token,
+        jira_state,
+    );
+    clamp_selection(sel, local_results.len(), jira_state);
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_picker_input(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
+    let ActionState::Searching {
+        picker: Some(ref mut picker),
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+
+    match (code, modifiers) {
+        (KeyCode::Esc, _) => {
+            cancel_picker(app);
+            return;
+        }
+        (KeyCode::Enter, _) => {
+            apply_picker(app);
+            return;
+        }
+        (KeyCode::Up, _) => {
+            if picker.cursor > 0 {
+                picker.cursor -= 1;
+            }
+            return;
+        }
+        (KeyCode::Down, _) => {
+            let visible = picker_visible_count(picker);
+            if picker.cursor + 1 < visible {
+                picker.cursor += 1;
+            }
+            return;
+        }
+        (KeyCode::Char(' '), _) => {
+            let visible = picker_visible_indices(picker);
+            if let Some(&item_idx) = visible.get(picker.cursor) {
+                let value = picker.items[item_idx].value.clone();
+                let current = picker.selected.get(&value).copied();
+                // Project picker is include-only: cycle skips Exclude.
+                let next = if picker.kind == FilterKind::Project {
+                    match current {
+                        None => Some(FilterChoice::Include),
+                        Some(_) => None,
+                    }
+                } else {
+                    FilterChoice::next(current)
+                };
+                match next {
+                    Some(choice) => {
+                        picker.selected.insert(value, choice);
+                    }
+                    None => {
+                        picker.selected.remove(&value);
+                    }
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    let before = picker.query.clone();
+    edit_text(&mut picker.query, &mut picker.query_cursor, code);
+    if picker.query != before {
+        clamp_picker_cursor(picker);
+    }
+}
+
+fn move_search_selection(app: &mut AppState, delta: i32) {
+    let ActionState::Searching {
+        ref mut selected,
+        ref local_results,
+        ref jira_state,
+        ..
+    } = app.action_state
+    else {
+        return;
+    };
+    let total = search_total_results(local_results, jira_state);
+    if total == 0 {
+        *selected = 0;
+        return;
+    }
+    let cur = i64::try_from(*selected).unwrap_or(0);
+    let new = (cur + i64::from(delta)).rem_euclid(i64::try_from(total).unwrap_or(1));
+    *selected = usize::try_from(new).unwrap_or(0);
+}
+
+fn cancel_search(app: &mut AppState) {
+    if let ActionState::Searching { prev_nav_idx, .. } = app.action_state {
+        app.nav_idx = prev_nav_idx.min(app.nav_items.len().saturating_sub(1));
+    }
+    app.action_state = ActionState::None;
+}
+
+fn commit_search_selection(app: &mut AppState) {
+    let (key, was_jira) = {
+        let ActionState::Searching {
+            ref local_results,
+            ref jira_state,
+            selected,
+            ..
+        } = app.action_state
+        else {
+            return;
+        };
+        let local_len = local_results.len();
+        if selected < local_len {
+            (local_results[selected].issue_key.clone(), false)
+        } else {
+            let jira_idx = selected - local_len;
+            match jira_state {
+                JiraSearchState::Loaded { hits, issues } => {
+                    let key = hits.get(jira_idx).map(|h| h.issue_key.clone());
+                    let is_in_local = key
+                        .as_deref()
+                        .is_some_and(|k| app.issues.iter().any(|i| i.key == k));
+                    if let Some(k) = key {
+                        if !is_in_local
+                            && let Some(issue) = issues.iter().find(|i| i.key == k).cloned()
+                        {
+                            inject_jira_search_result(app, issue);
+                        }
+                        (k, true)
+                    } else {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    };
+
+    app.action_state = ActionState::None;
+    // Focus the picked issue in the main list.
+    if let Some(pos) = app.nav_items.iter().position(
+        |n| matches!(n, NavItem::Issue(idx) if app.issues.get(*idx).is_some_and(|i| i.key == key)),
+    ) {
+        app.nav_idx = pos;
+    }
+    app.focused_panel = FocusedPanel::Detail;
+    app.detail_scroll = 0;
+    app.fullscreen_detail = true;
+    let _ = was_jira;
+}
+
+const SEARCH_RESULTS_SOURCE_ID: &str = "_search_results";
+
+/// Inject a Jira-only search hit into the team's local list under a synthetic
+/// "Search Results" source group so the issue stays navigable + actionable.
+fn inject_jira_search_result(app: &mut AppState, mut issue: Issue) {
+    issue.source_id = Some(SEARCH_RESULTS_SOURCE_ID.into());
+    issue.subsource_idx = 0;
+    if let Some(SourceState::Loaded(existing)) = app.sources.get_mut(SEARCH_RESULTS_SOURCE_ID) {
+        if !existing.iter().any(|i| i.key == issue.key) {
+            existing.push(issue);
+        }
+    } else {
+        app.sources.insert(
+            SEARCH_RESULTS_SOURCE_ID.into(),
+            SourceState::Loaded(vec![issue]),
+        );
+    }
+    app.rebuild_issues();
 }
 
 /// Refresh is allowed only when no edit/picker/in-flight action is active.
@@ -3072,9 +4116,7 @@ pub fn compute_completions_for(path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jira::types::{
-        IssueFields, IssueTypeField, ProjectField, StatusField,
-    };
+    use crate::jira::types::{IssueFields, IssueTypeField, ProjectField, StatusField};
 
     fn make_issue(key: &str, status: &str, source_id: Option<&str>) -> Issue {
         Issue {
@@ -3116,10 +4158,7 @@ mod tests {
             make_issue("A-2", "To Do", Some(src)),
         ];
         let mut sources = IndexMap::new();
-        sources.insert(
-            src.to_string(),
-            SourceState::Loaded(issues.clone()),
-        );
+        sources.insert(src.to_string(), SourceState::Loaded(issues.clone()));
 
         let refreshed = make_issue("A-1", "Done", Some(src));
         apply_issue_refresh(&mut issues, &mut sources, refreshed);
@@ -3138,10 +4177,7 @@ mod tests {
         let src = "src-1";
         let mut issues = vec![make_issue("A-1", "To Do", Some(src))];
         let mut sources = IndexMap::new();
-        sources.insert(
-            src.to_string(),
-            SourceState::Loaded(issues.clone()),
-        );
+        sources.insert(src.to_string(), SourceState::Loaded(issues.clone()));
 
         let refreshed = make_issue("Z-9", "Done", Some(src));
         apply_issue_refresh(&mut issues, &mut sources, refreshed);

@@ -10,8 +10,8 @@ use tokio::sync::RwLock;
 use crate::jira::auth::Auth;
 use crate::jira::oauth;
 use crate::jira::types::{
-    Attachment, Comment, FieldMeta, FieldSchema, Issue, SearchResponse, Transition,
-    TransitionsResponse,
+    Attachment, Comment, FieldMeta, FieldSchema, Issue, ProjectInfo, SearchResponse,
+    StatusCategory, StatusInfo, Transition, TransitionsResponse,
 };
 
 const MAX_RESULTS: u32 = 100;
@@ -635,5 +635,145 @@ impl JiraClient {
     #[allow(dead_code)]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Fetch all statuses configured on this Jira instance via
+    /// `GET /rest/api/3/status`. Returns the distinct status names alongside
+    /// their `statusCategory.key` (used to surface terminal statuses).
+    pub async fn get_all_statuses(&self) -> Result<Vec<StatusInfo>> {
+        #[derive(serde::Deserialize)]
+        struct RawStatus {
+            name: String,
+            #[serde(rename = "statusCategory")]
+            status_category: Option<RawCategory>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawCategory {
+            key: String,
+        }
+
+        let url = format!("{}/rest/api/3/status", self.base_url);
+        self.maybe_refresh().await?;
+        let resp = self
+            .apply_auth(self.client.get(&url))
+            .await
+            .send()
+            .await
+            .context("Failed to fetch all statuses")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+
+        let raw: Vec<RawStatus> = resp.json().await.context("Failed to parse statuses")?;
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<StatusInfo> = Vec::new();
+        for s in raw {
+            if seen.insert(s.name.clone()) {
+                let category = s.status_category.map_or(StatusCategory::Undefined, |c| {
+                    StatusCategory::from_key(&c.key)
+                });
+                out.push(StatusInfo {
+                    name: s.name,
+                    category,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch the distinct status names available for issues in a project via
+    /// `GET /rest/api/3/project/{key}/statuses`. Jira returns statuses grouped
+    /// by issue type; we flatten and dedupe by name.
+    pub async fn get_project_statuses(&self, project_key: &str) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct IssueTypeStatuses {
+            statuses: Vec<NamedStatus>,
+        }
+        #[derive(serde::Deserialize)]
+        struct NamedStatus {
+            name: String,
+        }
+
+        let url = format!(
+            "{}/rest/api/3/project/{project_key}/statuses",
+            self.base_url
+        );
+        self.maybe_refresh().await?;
+        let resp = self
+            .apply_auth(self.client.get(&url))
+            .await
+            .send()
+            .await
+            .context("Failed to fetch project statuses")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+
+        let groups: Vec<IssueTypeStatuses> = resp
+            .json()
+            .await
+            .context("Failed to parse project statuses")?;
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        for g in groups {
+            for s in g.statuses {
+                if seen.insert(s.name.clone()) {
+                    out.push(s.name);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch up to one page (100) of visible projects via
+    /// `GET /rest/api/3/project/search`.
+    pub async fn search_projects(&self) -> Result<Vec<ProjectInfo>> {
+        #[derive(serde::Deserialize)]
+        struct ProjectSearchResponse {
+            values: Vec<RawProject>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawProject {
+            key: String,
+            name: String,
+        }
+
+        let url = format!("{}/rest/api/3/project/search", self.base_url);
+        self.maybe_refresh().await?;
+        let resp = self
+            .apply_auth(self.client.get(&url))
+            .await
+            .query(&[("maxResults", "100")])
+            .send()
+            .await
+            .context("Failed to fetch projects")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+
+        let page: ProjectSearchResponse = resp
+            .json()
+            .await
+            .context("Failed to parse project search response")?;
+
+        Ok(page
+            .values
+            .into_iter()
+            .map(|p| ProjectInfo {
+                key: p.key,
+                name: p.name,
+            })
+            .collect())
     }
 }

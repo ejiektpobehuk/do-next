@@ -66,6 +66,90 @@ pub fn spawn_fetch(client: JiraClient, source_cfg: SourceConfig, tx: UnboundedSe
     });
 }
 
+/// Spawn a background task running a one-off JQL query for the search popup.
+/// The result carries the `token` of the search request that triggered it so
+/// the receiver can drop stale responses.
+pub fn spawn_jira_search(
+    client: JiraClient,
+    jql: String,
+    token: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = client.fetch_jql(&jql).await;
+        let _ = tx.send(AppEvent::SearchJiraResult { token, result });
+    });
+}
+
+/// Spawn a background task that fetches the distinct status names available
+/// across the given project keys, in parallel. Statuses are deduped by name,
+/// preserving first-seen order.
+pub fn spawn_team_statuses_fetch(
+    client: JiraClient,
+    project_keys: Vec<String>,
+    team_idx: usize,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = fetch_team_statuses(client, project_keys).await;
+        let _ = tx.send(AppEvent::TeamStatusesLoaded { team_idx, result });
+    });
+}
+
+async fn fetch_team_statuses(
+    client: JiraClient,
+    project_keys: Vec<String>,
+) -> anyhow::Result<Vec<String>> {
+    let mut handles = Vec::with_capacity(project_keys.len());
+    for key in project_keys {
+        let c = client.clone();
+        handles.push(tokio::spawn(
+            async move { c.get_project_statuses(&key).await },
+        ));
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for h in handles {
+        match h.await {
+            Ok(Ok(statuses)) => {
+                for s in statuses {
+                    if seen.insert(s.clone()) {
+                        out.push(s);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                log::warn!("project statuses fetch failed: {e}");
+            }
+            Err(e) => {
+                log::warn!("project statuses task join failed: {e}");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Spawn a background task that fetches up to one page of visible Jira projects.
+pub fn spawn_projects_fetch(client: JiraClient, team_idx: usize, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = client.search_projects().await;
+        let _ = tx.send(AppEvent::AllProjectsLoaded { team_idx, result });
+    });
+}
+
+/// Spawn a background task that fetches every status configured on the Jira
+/// instance. Used to populate the status picker's "Other" section.
+pub fn spawn_all_statuses_fetch(
+    client: JiraClient,
+    team_idx: usize,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = client.get_all_statuses().await;
+        let _ = tx.send(AppEvent::AllStatusesLoaded { team_idx, result });
+    });
+}
+
 /// Spawn a background task that refreshes a single issue and sends an
 /// `AppEvent::IssueRefreshed` (or `IssueRefreshError`) when done.
 ///

@@ -95,5 +95,12 @@ fn right_column() -> Vec<Line<'static>> {
         key_line("m", "move to project"),
         key_line("r", "refresh focused (list or current issue)"),
         key_line("Shift+R", "refresh all issues"),
+        Line::raw(""),
+        section_header("Search"),
+        key_line("/", "open search popup"),
+        key_line("Tab", "cycle focus (input → status → project → results)"),
+        key_line("Alt+1", "open status filter"),
+        key_line("Alt+2", "open project filter"),
+        key_line("Enter", "open result (fullscreen detail)"),
     ]
 }
