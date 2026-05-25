@@ -11,6 +11,7 @@ use crate::tui::app::{
     picker_visible_indices,
 };
 use crate::tui::theme;
+use crate::tui::widgets::scrollbar::render_scrollbar;
 
 pub fn render_search_picker_overlay(f: &mut Frame, app: &AppState) {
     let ActionState::Searching {
@@ -43,8 +44,7 @@ pub fn render_search_picker_overlay(f: &mut Frame, app: &AppState) {
         Span::styled("Esc", Style::default().fg(Color::Magenta)),
         Span::raw(" cancel ├──"),
     ])
-    .alignment(Alignment::Right)
-    .style(Style::default().fg(theme::MUTED));
+    .alignment(Alignment::Right);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -66,8 +66,20 @@ pub fn render_search_picker_overlay(f: &mut Frame, app: &AppState) {
         .split(inner);
 
     render_typeahead(f, chunks[0], picker);
-    render_list(f, chunks[1], picker);
+    let (total_rows, cursor_row) = render_list(f, chunks[1], picker);
     render_footer(f, chunks[2], picker);
+
+    let viewport = chunks[1].height as usize;
+    if total_rows > viewport {
+        render_scrollbar(
+            f,
+            area,
+            total_rows,
+            viewport,
+            cursor_row.unwrap_or(0),
+            theme::MUTED,
+        );
+    }
 }
 
 fn render_typeahead(f: &mut Frame, area: Rect, picker: &FilterPicker) {
@@ -85,7 +97,7 @@ fn render_typeahead(f: &mut Frame, area: Rect, picker: &FilterPicker) {
     f.set_cursor_position((x, area.y));
 }
 
-fn render_list(f: &mut Frame, area: Rect, picker: &FilterPicker) {
+fn render_list(f: &mut Frame, area: Rect, picker: &FilterPicker) -> (usize, Option<usize>) {
     let visible = picker_visible_indices(picker);
     if visible.is_empty() {
         let msg = if picker.loading {
@@ -104,7 +116,7 @@ fn render_list(f: &mut Frame, area: Rect, picker: &FilterPicker) {
             )),
             area,
         );
-        return;
+        return (0, None);
     }
 
     // Walk visible items, emitting section headers as decorative non-cursor
@@ -148,11 +160,14 @@ fn render_list(f: &mut Frame, area: Rect, picker: &FilterPicker) {
     let mut state = ListState::default();
     state.select(cursor_row);
 
+    let total = display_rows.len();
     let list = List::new(display_rows)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("");
 
     f.render_stateful_widget(list, area, &mut state);
+
+    (total, cursor_row)
 }
 
 fn section_header_row(section: PickerSection) -> ListItem<'static> {

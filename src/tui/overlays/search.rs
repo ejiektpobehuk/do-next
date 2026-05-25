@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -10,6 +10,7 @@ use crate::jira::types::Issue;
 use crate::tui::app::{ActionState, AppState, JiraSearchState, SearchFocus};
 use crate::tui::search::{RankedHit, SearchFilters};
 use crate::tui::theme;
+use crate::tui::widgets::scrollbar::render_scrollbar;
 
 pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
     let ActionState::Searching {
@@ -20,19 +21,36 @@ pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
         ref local_results,
         ref jira_state,
         selected,
+        ref picker,
         ..
     } = app.action_state
     else {
         return;
     };
+    let picker_open = picker.is_some();
 
     let area = centered_rect(90, 90, f.area());
     f.render_widget(Clear, area);
 
-    let outer = Block::default().borders(Borders::ALL).title(Span::styled(
-        " Search ",
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
+    let border_color = if picker_open {
+        theme::MUTED
+    } else {
+        Color::Reset
+    };
+    let title_style = if picker_open {
+        Style::default()
+            .fg(theme::MUTED)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    let mut outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(" Search ", title_style));
+    if !picker_open {
+        outer = outer.title_bottom(search_hints_line());
+    }
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
@@ -62,9 +80,10 @@ pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
         left_chunks[0],
         query,
         cursor,
-        focus == SearchFocus::Input,
+        !picker_open && focus == SearchFocus::Input,
     );
-    render_filter_row(f, left_chunks[1], filters, focus);
+    render_filter_row(f, left_chunks[1], filters, focus, picker_open);
+    let results_focused = !picker_open && matches!(focus, SearchFocus::Result(_));
     render_results(
         f,
         left_chunks[2],
@@ -72,7 +91,7 @@ pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
         jira_state,
         &ordered,
         selected,
-        focus,
+        results_focused,
     );
     render_footer(f, left_chunks[3], jira_state);
 
@@ -128,7 +147,13 @@ fn render_input(f: &mut Frame, area: Rect, query: &str, cursor: usize, focused: 
     }
 }
 
-fn render_filter_row(f: &mut Frame, area: Rect, filters: &SearchFilters, focus: SearchFocus) {
+fn render_filter_row(
+    f: &mut Frame,
+    area: Rect,
+    filters: &SearchFilters,
+    focus: SearchFocus,
+    picker_open: bool,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::MUTED))
@@ -136,8 +161,8 @@ fn render_filter_row(f: &mut Frame, area: Rect, filters: &SearchFilters, focus: 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let status_focused = focus == SearchFocus::StatusSlot;
-    let project_focused = focus == SearchFocus::ProjectSlot;
+    let status_focused = !picker_open && focus == SearchFocus::StatusSlot;
+    let project_focused = !picker_open && focus == SearchFocus::ProjectSlot;
 
     let mut spans: Vec<Span> = Vec::new();
     spans.extend(status_slot_spans(
@@ -244,9 +269,8 @@ fn render_results(
     jira: &JiraSearchState,
     ordered: &[&RankedHit],
     selected: usize,
-    focus: SearchFocus,
+    focused: bool,
 ) {
-    let focused = matches!(focus, SearchFocus::Result(_));
     let border_color = if focused {
         theme::BORDER_FOCUS
     } else {
@@ -284,6 +308,12 @@ fn render_results(
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, inner, &mut state);
+
+    let total = ordered.len();
+    let viewport = area.height.saturating_sub(2) as usize;
+    if total > viewport {
+        render_scrollbar(f, area, total, viewport, selected, border_color);
+    }
 }
 
 fn result_item(hit: &RankedHit, issue: Option<&Issue>) -> ListItem<'static> {
@@ -420,6 +450,25 @@ fn description_text(issue: &Issue) -> String {
             }
         },
     )
+}
+
+fn search_hints_line() -> Line<'static> {
+    Line::from(vec![
+        Span::raw("┤ "),
+        Span::styled("Enter", Style::default().fg(Color::Green)),
+        Span::raw(" open  "),
+        Span::styled("Tab", Style::default().fg(Color::Blue)),
+        Span::raw(" cycle  "),
+        Span::styled("↕", Style::default().fg(Color::Blue)),
+        Span::raw(" nav  "),
+        Span::styled("Alt+1", Style::default().fg(Color::Blue)),
+        Span::raw(" status  "),
+        Span::styled("Alt+2", Style::default().fg(Color::Blue)),
+        Span::raw(" project  "),
+        Span::styled("Esc", Style::default().fg(Color::Magenta)),
+        Span::raw(" cancel ├──"),
+    ])
+    .alignment(Alignment::Right)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

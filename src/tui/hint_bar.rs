@@ -15,7 +15,8 @@ fn try_render_modal_hints(f: &mut Frame, area: Rect, action_state: &ActionState)
     match action_state {
         ActionState::KeybindingsHelp
         | ActionState::EditingDatetimeField { .. }
-        | ActionState::ConfirmingFieldEdit { .. } => {
+        | ActionState::ConfirmingFieldEdit { .. }
+        | ActionState::Searching { .. } => {
             f.render_widget(
                 Block::default()
                     .borders(Borders::BOTTOM)
@@ -28,32 +29,6 @@ fn try_render_modal_hints(f: &mut Frame, area: Rect, action_state: &ActionState)
                 Span::raw("┤ "),
                 Span::styled("Enter", Style::default().fg(Color::Green)),
                 Span::raw(" save  "),
-                Span::styled("Esc", Style::default().fg(Color::Magenta)),
-                Span::raw(" cancel ├──"),
-            ])
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(theme::MUTED));
-            f.render_widget(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(theme::MUTED))
-                    .title_bottom(title),
-                area,
-            );
-        }
-        ActionState::Searching { .. } => {
-            let title = Line::from(vec![
-                Span::raw("┤ "),
-                Span::styled("Enter", Style::default().fg(Color::Green)),
-                Span::raw(" open  "),
-                Span::styled("Tab", Style::default().fg(Color::Blue)),
-                Span::raw(" cycle  "),
-                Span::styled("↕", Style::default().fg(Color::Blue)),
-                Span::raw(" nav  "),
-                Span::styled("Alt+1", Style::default().fg(Color::Blue)),
-                Span::raw(" status  "),
-                Span::styled("Alt+2", Style::default().fg(Color::Blue)),
-                Span::raw(" project  "),
                 Span::styled("Esc", Style::default().fg(Color::Magenta)),
                 Span::raw(" cancel ├──"),
             ])
