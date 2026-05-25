@@ -9,33 +9,33 @@ All notable changes to `do-next` are documented here.
 Second feature release.
 Adds issue search, reusable templates, and a quieter look — plus smaller polish across editing, integrations, and rendering.
 
-### Highlights
-- Search overlay with access all issue
-- Total and targeted issue reload
-- Slack links open straight in the Slack desktop app
+ ### New features
 
-### Look & feel
-- A calmer, more uniform color palette across the issue list, detail view, and hint bars
+ - Search MVP
+ - Reload MVP
+ - Template support, with multiple templates and scrolling/hints in template popups
+ - Shell completion
+ - Open Slack links directly in the desktop app
 
-### Templates
-- Reusable templates for an empty fields
-- Preview and usage confirmation
-- Multiple templates per field in a team config
+ ### UX polish
 
-### Scrollbars
-- Confirmation previews
-- Diff and preview tabs in the post-`$EDITOR` confirmation
-- Error messages wrap inside the error popup instead of overflowing
+ - Calmer theme
+ - Wrap text in the error popup
+ - Scrolling for confirmation previews
+ - Aligned post-edit diff and preview
 
-### Fixes
-- Inline code in ADF output is no longer wrapped in stray marks
-- Empty rich-text fields are now recognized from their schema and render correctly
+ ### Fixes
 
-### Technical
-- Dependency updates clear all outstanding `cargo audit` warnings
-- Nix build switched to crane and to nixpkgs' Rust toolchain
-- `clippy` is now available in the dev shell
-- Shell completion generation with `do-next completion <shell>`
+ - ADF: detect rich-text fields by schema, not just existing value
+ - ADF: drop exclusive marks around inline code
+
+ ### Chores / CI
+
+ - Address cargo audit warnings
+ - Flake: switch from oxalica/rust-overlay to nixpkgs' rust
+ - Flake: add crane for CI
+ - Flake: add clippy to dev shell
+ - Add .gitignore for CI
 
 ## v0.0.0-2026.4.8 — 2026-04-08
 
