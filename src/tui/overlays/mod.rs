@@ -1,5 +1,6 @@
 pub mod await_spinner;
 pub mod comment_edit_confirm;
+pub mod create_issue;
 pub mod datetime_picker;
 pub mod delete_confirm;
 pub mod field_edit_confirm;

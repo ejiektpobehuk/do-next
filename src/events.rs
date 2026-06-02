@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::jira::types::{
-    Attachment, Comment, FieldOption, FieldSchema, Issue, ProjectInfo, StatusInfo, Transition,
+    Attachment, Comment, FieldOption, FieldSchema, Issue, IssueTypeField, ProjectInfo, StatusInfo,
+    Transition,
 };
 
 #[derive(Debug)]
@@ -58,6 +59,19 @@ pub enum AppEvent {
     AllProjectsLoaded {
         team_idx: usize,
         result: Result<Vec<ProjectInfo>, anyhow::Error>,
+    },
+    /// Issue types for the create form's selected project. `token` is the
+    /// `CreateForm::meta_token` current when the fetch was spawned; stale
+    /// responses (project changed since) are dropped.
+    CreateIssueTypesLoaded {
+        token: u64,
+        result: Result<Vec<IssueTypeField>, anyhow::Error>,
+    },
+    /// Field metadata (raw createmeta descriptors) for the create form's
+    /// selected project + issue type. `token` guards against stale responses.
+    CreateFieldsLoaded {
+        token: u64,
+        result: Result<Vec<serde_json::Value>, anyhow::Error>,
     },
 }
 
@@ -128,6 +142,10 @@ pub enum ActionResult {
     AttachmentDeleted {
         issue_key: String,
         attachment_id: String,
+    },
+    /// A new issue was created; carries its key for the confirmation popup.
+    IssueCreated {
+        key: String,
     },
     Error(anyhow::Error),
 }

@@ -11,10 +11,21 @@ pub fn check_team_update(team: &ResolvedTeam) -> Option<String> {
         return None;
     }
 
-    // Fetch latest refs from remote (silent, best-effort)
+    // Fetch latest refs from remote (silent, best-effort).
+    // Force non-interactive: ssh's passphrase/host-key prompts go to /dev/tty,
+    // not stdio, so silencing pipes is not enough — BatchMode=yes makes ssh
+    // fail instead of prompting, and GIT_TERMINAL_PROMPT=0 blocks git's own
+    // HTTPS credential prompts.
+    let ssh_command = std::env::var("GIT_SSH_COMMAND").unwrap_or_else(|_| "ssh".to_string());
     let _ = Command::new("git")
         .args(["fetch", "--quiet"])
         .current_dir(&path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env(
+            "GIT_SSH_COMMAND",
+            format!("{ssh_command} -o BatchMode=yes"),
+        )
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

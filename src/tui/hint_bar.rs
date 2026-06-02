@@ -16,7 +16,9 @@ fn try_render_modal_hints(f: &mut Frame, area: Rect, action_state: &ActionState)
         ActionState::KeybindingsHelp
         | ActionState::EditingDatetimeField { .. }
         | ActionState::ConfirmingFieldEdit { .. }
-        | ActionState::Searching { .. } => {
+        | ActionState::Searching { .. }
+        | ActionState::CreatingIssue(_)
+        | ActionState::IssueCreatedConfirm { .. } => {
             f.render_widget(
                 Block::default()
                     .borders(Borders::BOTTOM)

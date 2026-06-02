@@ -6,7 +6,13 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-pub fn render_delete_confirm_overlay(f: &mut Frame, title: &str, selected: usize) {
+pub fn render_delete_confirm_overlay(
+    f: &mut Frame,
+    title: &str,
+    selected: usize,
+    buttons: (&str, &str),
+    body: &str,
+) {
     let area = crate::tui::render::centered_rect(40, 20, f.area());
     f.render_widget(Clear, area);
 
@@ -43,10 +49,10 @@ pub fn render_delete_confirm_overlay(f: &mut Frame, title: &str, selected: usize
         Style::default().fg(Color::DarkGray)
     };
 
-    let buttons = Line::from(vec![
-        Span::styled("  Yes  ", yes_style),
+    let buttons_line = Line::from(vec![
+        Span::styled(format!("  {}  ", buttons.0), yes_style),
         Span::raw("   "),
-        Span::styled("  No  ", no_style),
+        Span::styled(format!("  {}  ", buttons.1), no_style),
     ]);
 
     let layout = Layout::default()
@@ -54,6 +60,6 @@ pub fn render_delete_confirm_overlay(f: &mut Frame, title: &str, selected: usize
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(inner);
 
-    f.render_widget(Paragraph::new("This action cannot be undone."), layout[0]);
-    f.render_widget(Paragraph::new(buttons), layout[1]);
+    f.render_widget(Paragraph::new(body), layout[0]);
+    f.render_widget(Paragraph::new(buttons_line), layout[1]);
 }

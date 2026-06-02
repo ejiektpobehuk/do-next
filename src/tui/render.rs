@@ -201,6 +201,8 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
                 f,
                 " Delete comment? ",
                 *selected,
+                ("Yes", "No"),
+                "This action cannot be undone.",
             );
         }
         ActionState::ConfirmingAttachmentDelete { selected, .. } => {
@@ -208,6 +210,8 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
                 f,
                 " Delete attachment? ",
                 *selected,
+                ("Yes", "No"),
+                "This action cannot be undone.",
             );
         }
         ActionState::InlineEditingField { .. }
@@ -229,6 +233,15 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
             if picker.is_some() {
                 overlays::search_picker::render_search_picker_overlay(f, app);
             }
+        }
+        ActionState::CreatingIssue(_) => {
+            overlays::create_issue::render_create_issue_overlay(f, app);
+        }
+        ActionState::CommittingCreate { .. } => {
+            overlays::await_spinner::render_await(f, "Creating issue…", app.tick_count);
+        }
+        ActionState::IssueCreatedConfirm { key } => {
+            overlays::create_issue::render_created_confirm_overlay(f, key);
         }
     }
 }

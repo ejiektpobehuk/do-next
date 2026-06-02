@@ -273,6 +273,18 @@ pub fn render_datetime_picker_overlay(f: &mut Frame, app_action: &ActionState) {
     };
 
     let area = centered_rect(30, 40, f.area());
+    render_datetime_picker_in(f, area, picker, label, description.as_deref());
+}
+
+/// Render the datetime picker into a given area (clears it first). Reused by
+/// the create-issue form, which embeds the picker as a nested overlay.
+pub fn render_datetime_picker_in(
+    f: &mut Frame,
+    area: Rect,
+    picker: &DatetimePicker,
+    label: &str,
+    description: Option<&str>,
+) {
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -283,7 +295,7 @@ pub fn render_datetime_picker_overlay(f: &mut Frame, app_action: &ActionState) {
     f.render_widget(block, area);
 
     // Vertical split: optional description | main (calendar + time) | bottom datetime
-    let content_area = description.as_ref().map_or(inner, |desc| {
+    let content_area = description.map_or(inner, |desc| {
         let hint_lines = u16::try_from(desc.chars().count())
             .unwrap_or(u16::MAX)
             .div_ceil(inner.width.saturating_sub(2).max(1))
@@ -293,7 +305,7 @@ pub fn render_datetime_picker_overlay(f: &mut Frame, app_action: &ActionState) {
             .constraints([Constraint::Length(hint_lines), Constraint::Min(0)])
             .split(inner);
         f.render_widget(
-            Paragraph::new(desc.as_str())
+            Paragraph::new(desc)
                 .style(Style::default().add_modifier(Modifier::DIM))
                 .wrap(ratatui::widgets::Wrap { trim: false }),
             chunks[0],

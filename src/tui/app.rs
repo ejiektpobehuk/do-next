@@ -276,6 +276,17 @@ pub enum ActionState {
     },
     /// Keybindings reference overlay.
     KeybindingsHelp,
+    /// Create-issue form overlay.
+    CreatingIssue(crate::tui::overlays::create_issue::CreateForm),
+    /// New-issue create request ready to dispatch (`payload` is the full
+    /// `{ "fields": { … } }` object). Transient, like `CommittingFieldEdit`.
+    CommittingCreate {
+        payload: serde_json::Value,
+    },
+    /// Confirmation popup shown after a successful create.
+    IssueCreatedConfirm {
+        key: String,
+    },
     /// Telescope-style search popup: text input + chip filters + result list +
     /// live preview pane.
     Searching {
@@ -937,6 +948,68 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
         AppEvent::AllProjectsLoaded { team_idx, result } => {
             apply_all_projects_loaded(app, team_idx, result);
         }
+
+        AppEvent::CreateIssueTypesLoaded { token, result } => {
+            apply_create_issuetypes_loaded(app, token, result);
+        }
+
+        AppEvent::CreateFieldsLoaded { token, result } => {
+            apply_create_fields_loaded(app, token, result);
+        }
+    }
+}
+
+fn apply_create_issuetypes_loaded(
+    app: &mut AppState,
+    token: u64,
+    result: Result<Vec<crate::jira::types::IssueTypeField>, anyhow::Error>,
+) {
+    let ActionState::CreatingIssue(ref mut form) = app.action_state else {
+        return;
+    };
+    if token != form.meta_token {
+        return;
+    }
+    match result {
+        Ok(types) => {
+            // Auto-select the first type and fetch its fields under the same token.
+            if let Some(first) = types.first().cloned() {
+                form.issuetype = Some(first);
+                form.fields_state = CacheState::Loading;
+                form.needs_field_fetch = true;
+            }
+            form.issuetypes = CacheState::Loaded(types);
+        }
+        Err(e) => {
+            form.issuetypes = CacheState::Failed(e.to_string());
+        }
+    }
+}
+
+fn apply_create_fields_loaded(
+    app: &mut AppState,
+    token: u64,
+    result: Result<Vec<serde_json::Value>, anyhow::Error>,
+) {
+    let ActionState::CreatingIssue(ref mut form) = app.action_state else {
+        return;
+    };
+    if token != form.meta_token {
+        return;
+    }
+    match result {
+        Ok(values) => {
+            form.fields = crate::tui::overlays::create_issue::parse_create_fields(&values);
+            form.fields_state = CacheState::Loaded(());
+            // Clamp focus to the new field/button range.
+            let max = 2 + form.fields.len();
+            if form.focus > max {
+                form.focus = max;
+            }
+        }
+        Err(e) => {
+            form.fields_state = CacheState::Failed(e.to_string());
+        }
     }
 }
 
@@ -998,6 +1071,23 @@ fn apply_all_projects_loaded(
     if project_picker_is_open(app) {
         rebuild_project_picker_items(app);
     }
+    merge_projects_into_create_form(app);
+}
+
+/// If the create-issue form is open, append any newly cached projects not
+/// already in `available_projects` (matched by uppercase key).
+fn merge_projects_into_create_form(app: &mut AppState) {
+    let cache = match app.project_cache.loaded() {
+        Some(v) => v.clone(),
+        None => return,
+    };
+    let ActionState::CreatingIssue(ref mut form) = app.action_state else {
+        return;
+    };
+    crate::tui::overlays::create_issue::merge_cached_projects(
+        &mut form.available_projects,
+        &cache,
+    );
 }
 
 const fn status_picker_is_open(app: &AppState) -> bool {
@@ -1257,6 +1347,9 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
                 error: Arc::new(e),
                 scroll: 0,
             };
+        }
+        ActionResult::IssueCreated { key } => {
+            app.action_state = ActionState::IssueCreatedConfirm { key };
         }
         ActionResult::Hidden { ref issue_key } => apply_hidden(app, issue_key),
         ActionResult::TransitionApplied {
@@ -2245,6 +2338,18 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
             handle_search_input(app, event);
             return;
         }
+        ActionState::CreatingIssue(_) => {
+            crate::tui::overlays::create_issue::handle_create_input(app, event);
+            return;
+        }
+        ActionState::IssueCreatedConfirm { .. } => {
+            if let crossterm::event::Event::Key(crossterm::event::KeyEvent { code, .. }) = event
+                && matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))
+            {
+                app.action_state = ActionState::None;
+            }
+            return;
+        }
         ActionState::KeybindingsHelp => {
             if let crossterm::event::Event::Key(crossterm::event::KeyEvent { code, .. }) = event
                 && matches!(code, KeyCode::Char('q') | KeyCode::Esc)
@@ -2272,6 +2377,7 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
         | ActionState::DeletingAttachment { .. }
         | ActionState::OpeningAttachment { .. }
         | ActionState::PendingAttachmentUpload { .. }
+        | ActionState::CommittingCreate { .. }
         | ActionState::TypingAttachmentPath { .. } => {
             // Ignore input while waiting / handled by overlay
             return;
@@ -2383,8 +2489,61 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         (KeyCode::Char('R'), _) => key_refresh_all(app),
         (KeyCode::Char('r'), _) => key_refresh_focused(app),
         (KeyCode::Char('/'), _) => key_open_search(app),
+        (KeyCode::Char('n'), _) => key_open_create(app),
         _ => {}
     }
+}
+
+/// Open the create-issue form. Seeds the project list with the team's
+/// configured projects plus any projects seen in loaded issues; the full
+/// list of accessible projects is fetched lazily when the picker opens.
+fn key_open_create(app: &mut AppState) {
+    use crate::tui::overlays::create_issue::{CreateForm, distinct_projects};
+    use crate::jira::types::ProjectField;
+
+    let team_keys = crate::tui::team_project_keys(app);
+    let issue_projects = distinct_projects(&app.issues);
+
+    // Build team_keys → ProjectField, borrowing names from loaded issues when
+    // available. `id` is empty: payload submission only uses `key`.
+    let mut projects: Vec<ProjectField> = Vec::with_capacity(team_keys.len() + issue_projects.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for key in &team_keys {
+        let up = key.to_uppercase();
+        if !seen.insert(up.clone()) {
+            continue;
+        }
+        let name = issue_projects
+            .iter()
+            .find(|p| p.key.to_uppercase() == up)
+            .map_or_else(|| key.clone(), |p| p.name.clone());
+        projects.push(ProjectField {
+            id: String::new(),
+            key: key.clone(),
+            name,
+        });
+    }
+    for p in issue_projects {
+        if seen.insert(p.key.to_uppercase()) {
+            projects.push(p);
+        }
+    }
+
+    let project = app
+        .selected_issue()
+        .map(|i| i.fields.project.clone())
+        .or_else(|| projects.first().cloned());
+    let Some(project) = project else {
+        // No project context to create against.
+        app.action_state = ActionState::Error {
+            error: Arc::new(anyhow::anyhow!(
+                "No project available to create an issue. Load some issues first."
+            )),
+            scroll: 0,
+        };
+        return;
+    };
+    app.action_state = ActionState::CreatingIssue(CreateForm::open(project, projects));
 }
 
 fn key_open_search(app: &mut AppState) {
@@ -3773,7 +3932,7 @@ fn handle_inline_edit_input(app: &mut AppState, event: crossterm::event::Event) 
     }
 }
 
-fn edit_text(input: &mut String, cursor: &mut usize, code: KeyCode) {
+pub fn edit_text(input: &mut String, cursor: &mut usize, code: KeyCode) {
     match code {
         KeyCode::Left => {
             if *cursor > 0 {

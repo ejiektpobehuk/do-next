@@ -360,6 +360,7 @@ fn drain_input_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) {
 
 /// Dispatch any pending typed action states.
 /// Transitions the state to `AwaitingAction` immediately to prevent re-dispatch.
+#[allow(clippy::too_many_lines)]
 fn dispatch_action(
     app: &mut AppState,
     client: &JiraClient,
@@ -464,6 +465,12 @@ fn dispatch_action(
         } => {
             dispatch_pending_attachment_upload(app, issue_key, file_path, client, tx);
         }
+        ActionState::CommittingCreate { payload } => {
+            app.action_state = ActionState::AwaitingAction {
+                description: "Creating issue…".into(),
+            };
+            spawn_create_issue(payload, client.clone(), tx.clone());
+        }
         _ => {}
     }
     Ok(())
@@ -530,6 +537,95 @@ fn dispatch_background_tasks(
         let team_idx = app.active_team_idx;
         spawn_projects_fetch(client.clone(), team_idx, tx.clone());
     }
+
+    dispatch_create_metadata(app, client, tx);
+}
+
+/// Lazily fetch issue types / field metadata for the create form when the
+/// selection changes. Each fetch carries the form's `meta_token` so stale
+/// responses are dropped.
+fn dispatch_create_metadata(
+    app: &mut AppState,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let mut want_projects = false;
+    {
+        let ActionState::CreatingIssue(ref mut form) = app.action_state else {
+            return;
+        };
+        if form.needs_issuetype_fetch {
+            form.needs_issuetype_fetch = false;
+            spawn_create_issuetypes(
+                client.clone(),
+                form.project.key.clone(),
+                form.meta_token,
+                tx.clone(),
+            );
+        } else if form.needs_field_fetch {
+            form.needs_field_fetch = false;
+            if let Some(it) = form.issuetype.clone() {
+                spawn_create_fields(
+                    client.clone(),
+                    form.project.key.clone(),
+                    it.id,
+                    form.meta_token,
+                    tx.clone(),
+                );
+            }
+        }
+        if form.needs_projects_fetch {
+            form.needs_projects_fetch = false;
+            want_projects = true;
+        }
+    }
+    if want_projects && app.project_cache.is_idle() {
+        app.project_cache = crate::tui::app::CacheState::Loading;
+        let team_idx = app.active_team_idx;
+        spawn_projects_fetch(client.clone(), team_idx, tx.clone());
+    }
+}
+
+fn spawn_create_issuetypes(
+    client: JiraClient,
+    project: String,
+    token: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = client.get_create_issuetypes(&project).await;
+        let _ = tx.send(AppEvent::CreateIssueTypesLoaded { token, result });
+    });
+}
+
+fn spawn_create_fields(
+    client: JiraClient,
+    project: String,
+    issuetype_id: String,
+    token: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = client.get_create_fields(&project, &issuetype_id).await;
+        let _ = tx.send(AppEvent::CreateFieldsLoaded { token, result });
+    });
+}
+
+fn spawn_create_issue(
+    payload: serde_json::Value,
+    client: JiraClient,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match client.create_issue(payload).await {
+            Ok(key) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::IssueCreated { key }));
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::Error(e)));
+            }
+        }
+    });
 }
 
 const SEARCH_DEBOUNCE_MS: u128 = 250;

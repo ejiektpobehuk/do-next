@@ -10,8 +10,8 @@ use tokio::sync::RwLock;
 use crate::jira::auth::Auth;
 use crate::jira::oauth;
 use crate::jira::types::{
-    Attachment, Comment, FieldMeta, FieldSchema, Issue, ProjectInfo, SearchResponse,
-    StatusCategory, StatusInfo, Transition, TransitionsResponse,
+    Attachment, Comment, FieldMeta, FieldSchema, Issue, IssueTypeField, ProjectInfo,
+    SearchResponse, StatusCategory, StatusInfo, Transition, TransitionsResponse,
 };
 
 const MAX_RESULTS: u32 = 100;
@@ -327,6 +327,123 @@ impl JiraClient {
             anyhow::bail!("Move issue failed {status}: {body}");
         }
         Ok(())
+    }
+
+    /// Fetch all pages of a paginated createmeta endpoint, returning the
+    /// concatenated array found under the first present key in `array_keys`.
+    /// Mirrors `fetch_jql`'s pagination (`startAt` / `isLast`).
+    async fn fetch_createmeta_pages(
+        &self,
+        url_path: &str,
+        array_keys: &[&str],
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut out = Vec::new();
+        let mut start_at = 0u32;
+        loop {
+            let url = format!("{}{url_path}", self.base_url);
+            self.maybe_refresh().await?;
+            let resp = self
+                .apply_auth(self.client.get(&url))
+                .await
+                .query(&[
+                    ("maxResults", MAX_RESULTS.to_string()),
+                    ("startAt", start_at.to_string()),
+                ])
+                .send()
+                .await
+                .context("Failed to fetch createmeta")?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Jira API error {status}: {body}");
+            }
+
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .context("Failed to parse createmeta response")?;
+            let page = array_keys
+                .iter()
+                .find_map(|k| body.get(*k))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let fetched = u32::try_from(page.len()).unwrap_or(0);
+            let is_last = body.get("isLast").and_then(serde_json::Value::as_bool);
+            out.extend(page);
+
+            // Stop when the server says it's the last page, when a page comes
+            // back empty, or when `isLast` is absent but the page was short.
+            if is_last == Some(true) || fetched == 0 || (is_last.is_none() && fetched < MAX_RESULTS)
+            {
+                break;
+            }
+            start_at += fetched;
+        }
+        Ok(out)
+    }
+
+    /// Get the issue types creatable in a project (new split createmeta endpoint).
+    pub async fn get_create_issuetypes(&self, project: &str) -> Result<Vec<IssueTypeField>> {
+        let path = format!("/rest/api/3/issue/createmeta/{project}/issuetypes");
+        let values = self
+            .fetch_createmeta_pages(&path, &["values", "issueTypes"])
+            .await?;
+        let types = values
+            .iter()
+            .filter_map(|v| {
+                let id = v.get("id").and_then(serde_json::Value::as_str)?.to_string();
+                let name = v
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                Some(IssueTypeField { id, name })
+            })
+            .collect();
+        Ok(types)
+    }
+
+    /// Get the field metadata for a project + issue type (new split createmeta
+    /// endpoint). Returns the raw field descriptors so the caller can map them.
+    pub async fn get_create_fields(
+        &self,
+        project: &str,
+        issuetype_id: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let path =
+            format!("/rest/api/3/issue/createmeta/{project}/issuetypes/{issuetype_id}");
+        self.fetch_createmeta_pages(&path, &["values", "fields"]).await
+    }
+
+    /// Create a new issue. `payload` must be the full `{ "fields": { … } }`
+    /// object. Returns the new issue's key.
+    pub async fn create_issue(&self, payload: serde_json::Value) -> Result<String> {
+        let url = format!("{}/rest/api/3/issue", self.base_url);
+        self.maybe_refresh().await?;
+        let resp = self
+            .apply_auth(self.client.post(&url))
+            .await
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to create issue")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Create issue failed {status}: {body}");
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse create issue response")?;
+        body.get("key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Create issue response had no key"))
     }
 
     /// Get the currently authenticated user's username/name.
