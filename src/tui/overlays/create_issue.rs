@@ -1290,22 +1290,22 @@ fn hints_line(mode: FormMode) -> Line<'static> {
         FormMode::Nav => vec![
             Span::raw("┤ "),
             Span::styled("j/k", Style::default().fg(Color::Blue)),
-            Span::raw(" move  "),
+            Span::raw(" move | "),
             Span::styled("↵", Style::default().fg(Color::Blue)),
-            Span::raw(" edit/pick  "),
+            Span::raw(" edit/pick | "),
             Span::styled("Alt+↵", Style::default().fg(Color::Green)),
-            Span::raw(" create  "),
+            Span::raw(" create | "),
             Span::styled("q", Style::default().fg(Color::Magenta)),
             Span::raw(" cancel ├──"),
         ],
         FormMode::Edit => vec![
             Span::raw("┤ "),
             Span::styled("↵", Style::default().fg(Color::Blue)),
-            Span::raw(" next  "),
+            Span::raw(" next | "),
             Span::styled("Tab", Style::default().fg(Color::Blue)),
-            Span::raw(" move  "),
+            Span::raw(" move | "),
             Span::styled("Alt+↵", Style::default().fg(Color::Green)),
-            Span::raw(" create  "),
+            Span::raw(" create | "),
             Span::styled("Esc", Style::default().fg(Color::Magenta)),
             Span::raw(" done ├──"),
         ],
@@ -1317,14 +1317,14 @@ fn picker_hints_line(multi: bool) -> Line<'static> {
     let mut spans = vec![
         Span::raw("┤ "),
         Span::styled("j/k", Style::default().fg(Color::Blue)),
-        Span::raw(" nav  "),
+        Span::raw(" nav | "),
     ];
     if multi {
         spans.push(Span::styled("Space", Style::default().fg(Color::Blue)));
-        spans.push(Span::raw(" toggle  "));
+        spans.push(Span::raw(" toggle | "));
     }
     spans.push(Span::styled("↵", Style::default().fg(Color::Green)));
-    spans.push(Span::raw(if multi { " done  " } else { " select  " }));
+    spans.push(Span::raw(if multi { " done | " } else { " select | " }));
     spans.push(Span::styled("q", Style::default().fg(Color::Magenta)));
     spans.push(Span::raw(" back ├──"));
     Line::from(spans).alignment(Alignment::Right)
@@ -1335,7 +1335,7 @@ fn project_picker_hints_line(searching: bool) -> Line<'static> {
         vec![
             Span::raw("┤ "),
             Span::styled("type", Style::default().fg(Color::Blue)),
-            Span::raw(" filter  "),
+            Span::raw(" filter | "),
             Span::styled("Esc", Style::default().fg(Color::Magenta)),
             Span::raw(" to list ├──"),
         ]
@@ -1343,11 +1343,11 @@ fn project_picker_hints_line(searching: bool) -> Line<'static> {
         vec![
             Span::raw("┤ "),
             Span::styled("j/k", Style::default().fg(Color::Blue)),
-            Span::raw(" nav  "),
+            Span::raw(" nav | "),
             Span::styled("/", Style::default().fg(Color::Blue)),
-            Span::raw(" search  "),
+            Span::raw(" search | "),
             Span::styled("↵", Style::default().fg(Color::Green)),
-            Span::raw(" select  "),
+            Span::raw(" select | "),
             Span::styled("q", Style::default().fg(Color::Magenta)),
             Span::raw(" back ├──"),
         ]
