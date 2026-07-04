@@ -280,8 +280,15 @@ pub enum ActionState {
     CreatingIssue(crate::tui::overlays::create_issue::CreateForm),
     /// New-issue create request ready to dispatch (`payload` is the full
     /// `{ "fields": { … } }` object). Transient, like `CommittingFieldEdit`.
+    /// Carries the form so a server-side failure can restore it.
     CommittingCreate {
         payload: serde_json::Value,
+        form: crate::tui::overlays::create_issue::CreateForm,
+    },
+    /// Create request in flight. Unlike the generic `AwaitingAction`, keeps
+    /// the form so an error returns to it instead of discarding the draft.
+    AwaitingCreate {
+        form: crate::tui::overlays::create_issue::CreateForm,
     },
     /// Confirmation popup shown after a successful create.
     IssueCreatedConfirm {
@@ -1084,10 +1091,7 @@ fn merge_projects_into_create_form(app: &mut AppState) {
     let ActionState::CreatingIssue(ref mut form) = app.action_state else {
         return;
     };
-    crate::tui::overlays::create_issue::merge_cached_projects(
-        &mut form.available_projects,
-        &cache,
-    );
+    crate::tui::overlays::create_issue::merge_cached_projects(&mut form.available_projects, &cache);
 }
 
 const fn status_picker_is_open(app: &AppState) -> bool {
@@ -1340,13 +1344,30 @@ fn apply_issue_refresh(
     }
 }
 
+/// Route an async-action failure. A failed create returns to the form with
+/// the error shown inline — the user's draft survives (Jira rejects creates
+/// server-side routinely: workflow validators, permission schemes, fields
+/// enforced but absent from createmeta). Everything else gets the error overlay.
+fn error_action_state(prev: ActionState, e: anyhow::Error) -> ActionState {
+    match prev {
+        ActionState::AwaitingCreate { mut form } => {
+            form.error = Some(format!("{e:#}"));
+            ActionState::CreatingIssue(form)
+        }
+        _ => ActionState::Error {
+            error: Arc::new(e),
+            scroll: 0,
+        },
+    }
+}
+
 fn handle_action_done(app: &mut AppState, result: ActionResult) {
     match result {
         ActionResult::Error(e) => {
-            app.action_state = ActionState::Error {
-                error: Arc::new(e),
-                scroll: 0,
-            };
+            app.action_state = error_action_state(
+                std::mem::replace(&mut app.action_state, ActionState::None),
+                e,
+            );
         }
         ActionResult::IssueCreated { key } => {
             app.action_state = ActionState::IssueCreatedConfirm { key };
@@ -2378,6 +2399,7 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
         | ActionState::OpeningAttachment { .. }
         | ActionState::PendingAttachmentUpload { .. }
         | ActionState::CommittingCreate { .. }
+        | ActionState::AwaitingCreate { .. }
         | ActionState::TypingAttachmentPath { .. } => {
             // Ignore input while waiting / handled by overlay
             return;
@@ -2498,15 +2520,16 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
 /// configured projects plus any projects seen in loaded issues; the full
 /// list of accessible projects is fetched lazily when the picker opens.
 fn key_open_create(app: &mut AppState) {
-    use crate::tui::overlays::create_issue::{CreateForm, distinct_projects};
     use crate::jira::types::ProjectField;
+    use crate::tui::overlays::create_issue::{CreateForm, distinct_projects};
 
     let team_keys = crate::tui::team_project_keys(app);
     let issue_projects = distinct_projects(&app.issues);
 
     // Build team_keys → ProjectField, borrowing names from loaded issues when
     // available. `id` is empty: payload submission only uses `key`.
-    let mut projects: Vec<ProjectField> = Vec::with_capacity(team_keys.len() + issue_projects.len());
+    let mut projects: Vec<ProjectField> =
+        Vec::with_capacity(team_keys.len() + issue_projects.len());
     let mut seen: HashSet<String> = HashSet::new();
     for key in &team_keys {
         let up = key.to_uppercase();
@@ -4363,5 +4386,41 @@ mod tests {
         // Flat list updated, source state untouched (still Loading).
         assert_eq!(issues[0].fields.status.name, "Done");
         assert!(matches!(sources.get(src), Some(SourceState::Loading)));
+    }
+
+    #[test]
+    fn create_error_returns_to_form_with_inline_error() {
+        let form = crate::tui::overlays::create_issue::CreateForm::open(
+            ProjectField {
+                id: "p1".into(),
+                key: "PROJ".into(),
+                name: "Project".into(),
+            },
+            Vec::new(),
+        );
+        let state = error_action_state(
+            ActionState::AwaitingCreate { form },
+            anyhow::anyhow!("Create issue failed 400: workflow validator rejected"),
+        );
+        let ActionState::CreatingIssue(form) = state else {
+            panic!("expected CreatingIssue, got a different state");
+        };
+        assert!(
+            form.error
+                .as_deref()
+                .unwrap()
+                .contains("workflow validator rejected")
+        );
+    }
+
+    #[test]
+    fn non_create_error_shows_error_overlay() {
+        let state = error_action_state(
+            ActionState::AwaitingAction {
+                description: "Applying transition…".into(),
+            },
+            anyhow::anyhow!("boom"),
+        );
+        assert!(matches!(state, ActionState::Error { .. }));
     }
 }

@@ -237,7 +237,7 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
         ActionState::CreatingIssue(_) => {
             overlays::create_issue::render_create_issue_overlay(f, app);
         }
-        ActionState::CommittingCreate { .. } => {
+        ActionState::CommittingCreate { .. } | ActionState::AwaitingCreate { .. } => {
             overlays::await_spinner::render_await(f, "Creating issue…", app.tick_count);
         }
         ActionState::IssueCreatedConfirm { key } => {

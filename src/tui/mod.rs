@@ -465,10 +465,8 @@ fn dispatch_action(
         } => {
             dispatch_pending_attachment_upload(app, issue_key, file_path, client, tx);
         }
-        ActionState::CommittingCreate { payload } => {
-            app.action_state = ActionState::AwaitingAction {
-                description: "Creating issue…".into(),
-            };
+        ActionState::CommittingCreate { payload, form } => {
+            app.action_state = ActionState::AwaitingCreate { form };
             spawn_create_issue(payload, client.clone(), tx.clone());
         }
         _ => {}

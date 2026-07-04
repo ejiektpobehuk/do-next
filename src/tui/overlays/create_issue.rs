@@ -78,11 +78,27 @@ pub struct FormField {
 /// A nested picker overlay opened on top of the form.
 #[derive(Debug, Clone)]
 pub enum CreatePicker {
-    Project { query: String, query_cursor: usize, cursor: usize, searching: bool },
-    IssueType { cursor: usize },
-    Select { field_idx: usize, cursor: usize },
-    MultiSelect { field_idx: usize, cursor: usize },
-    Date { field_idx: usize, picker: DatetimePicker },
+    Project {
+        query: String,
+        query_cursor: usize,
+        cursor: usize,
+        searching: bool,
+    },
+    IssueType {
+        cursor: usize,
+    },
+    Select {
+        field_idx: usize,
+        cursor: usize,
+    },
+    MultiSelect {
+        field_idx: usize,
+        cursor: usize,
+    },
+    Date {
+        field_idx: usize,
+        picker: DatetimePicker,
+    },
 }
 
 /// Form-level interaction mode. `Nav` uses Vim-style keys (j/k/q/Enter to
@@ -359,7 +375,9 @@ fn field_payload_value(field: &FormField) -> Option<Value> {
                 .map(|n| json!(n))
                 .or_else(|| t.parse::<f64>().ok().map(|n| json!(n)))
         }
-        (WidgetKind::Date, FieldValue::Date { value: Some(iso) }) => Some(Value::String(iso.clone())),
+        (WidgetKind::Date, FieldValue::Date { value: Some(iso) }) => {
+            Some(Value::String(iso.clone()))
+        }
         (WidgetKind::Select, FieldValue::SingleOption(Some(i))) => {
             field.options.get(*i).map(|o| option_ref(&o.raw))
         }
@@ -552,8 +570,9 @@ fn handle_edit_mode_key(form: &mut CreateForm, code: KeyCode) {
                 // Single-line: Enter commits & advances, returning to Nav.
                 form.mode = FormMode::Nav;
                 form.focus = (form.focus + 1) % n;
-            } else if let Some(FieldValue::Text { input, cursor } | FieldValue::Number { input, cursor }) =
-                form.fields.get_mut(idx).map(|f| &mut f.value)
+            } else if let Some(
+                FieldValue::Text { input, cursor } | FieldValue::Number { input, cursor },
+            ) = form.fields.get_mut(idx).map(|f| &mut f.value)
             {
                 edit_text(input, cursor, code);
             }
@@ -657,18 +676,22 @@ fn open_date_picker(form: &mut CreateForm, field_idx: usize) {
 }
 
 /// Validate and either move to the committing state or show an inline error.
+/// The form travels with the commit so a server-side rejection can restore it.
 fn submit(app: &mut AppState) {
-    let ActionState::CreatingIssue(ref mut form) = app.action_state else {
-        return;
+    let state = std::mem::replace(&mut app.action_state, ActionState::None);
+    app.action_state = match state {
+        ActionState::CreatingIssue(mut form) => match build_create_payload(&form) {
+            Ok(payload) => {
+                form.error = None;
+                ActionState::CommittingCreate { payload, form }
+            }
+            Err(msg) => {
+                form.error = Some(msg);
+                ActionState::CreatingIssue(form)
+            }
+        },
+        other => other,
     };
-    match build_create_payload(form) {
-        Ok(payload) => {
-            app.action_state = ActionState::CommittingCreate { payload };
-        }
-        Err(msg) => {
-            form.error = Some(msg);
-        }
-    }
 }
 
 fn filtered_project_idxs(form: &CreateForm, query: &str) -> Vec<usize> {
@@ -677,9 +700,7 @@ fn filtered_project_idxs(form: &CreateForm, query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|(_, p)| {
-            q.is_empty()
-                || p.key.to_lowercase().contains(&q)
-                || p.name.to_lowercase().contains(&q)
+            q.is_empty() || p.key.to_lowercase().contains(&q) || p.name.to_lowercase().contains(&q)
         })
         .map(|(i, _)| i)
         .collect()
@@ -785,7 +806,11 @@ fn handle_picker_input(app: &mut AppState, code: KeyCode, _modifiers: KeyModifie
                     form.picker = Some(CreatePicker::IssueType { cursor });
                 }
                 KeyCode::Enter => {
-                    if let Some(it) = form.issuetypes.loaded().and_then(|v| v.get(cursor)).cloned()
+                    if let Some(it) = form
+                        .issuetypes
+                        .loaded()
+                        .and_then(|v| v.get(cursor))
+                        .cloned()
                     {
                         form.set_issuetype(it);
                     }
@@ -887,7 +912,9 @@ pub fn render_create_issue_overlay(f: &mut Frame, app: &AppState) {
 
     let dim = form.picker.is_some();
     let title_style = if dim {
-        Style::default().fg(theme::MUTED).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme::MUTED)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
@@ -929,7 +956,9 @@ pub fn render_create_issue_overlay(f: &mut Frame, app: &AppState) {
     if form.fields_state.is_pending() && form.issuetype.is_some() {
         lines.push(Line::from(Span::styled(
             "  (loading fields…)",
-            Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::ITALIC),
         )));
     }
 
@@ -982,7 +1011,13 @@ pub fn render_create_issue_overlay(f: &mut Frame, app: &AppState) {
     }
 }
 
-fn field_row(label: &str, required: bool, value: &str, focused: bool, unsupported: bool) -> Line<'static> {
+fn field_row(
+    label: &str,
+    required: bool,
+    value: &str,
+    focused: bool,
+    unsupported: bool,
+) -> Line<'static> {
     let marker = if focused { "▶ " } else { "  " };
     let label_owned = format!("{label}{}", if required { "*" } else { "" });
     let label_style = if required {
@@ -991,7 +1026,9 @@ fn field_row(label: &str, required: bool, value: &str, focused: bool, unsupporte
         Style::default().fg(theme::MUTED)
     };
     let value_style = if unsupported {
-        Style::default().fg(theme::MUTED).add_modifier(Modifier::DIM)
+        Style::default()
+            .fg(theme::MUTED)
+            .add_modifier(Modifier::DIM)
     } else if focused {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
@@ -1114,7 +1151,10 @@ pub fn render_created_confirm_overlay(f: &mut Frame, key: &str) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("✓ Created ", Style::default().fg(Color::Green)),
-            Span::styled(key.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                key.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ]))
         .alignment(Alignment::Center),
         inner,
@@ -1168,7 +1208,9 @@ fn render_list(
         f.render_widget(
             Paragraph::new(Span::styled(
                 "No options",
-                Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(theme::MUTED)
+                    .add_modifier(Modifier::ITALIC),
             )),
             list_area,
         );
@@ -1198,7 +1240,9 @@ fn render_list(
         f.render_widget(
             Paragraph::new(Span::styled(
                 "  (loading more…)",
-                Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(theme::MUTED)
+                    .add_modifier(Modifier::ITALIC),
             )),
             area,
         );
@@ -1325,18 +1369,24 @@ mod tests {
             schema_to_widget(&json!({ "type": "string", "system": "description" }), false),
             WidgetKind::RichText
         );
-        assert_eq!(schema_to_widget(&schema("number"), false), WidgetKind::Number);
+        assert_eq!(
+            schema_to_widget(&schema("number"), false),
+            WidgetKind::Number
+        );
         assert_eq!(schema_to_widget(&schema("date"), false), WidgetKind::Date);
-        assert_eq!(schema_to_widget(&schema("datetime"), false), WidgetKind::Date);
-        assert_eq!(schema_to_widget(&schema("option"), true), WidgetKind::Select);
+        assert_eq!(
+            schema_to_widget(&schema("datetime"), false),
+            WidgetKind::Date
+        );
+        assert_eq!(
+            schema_to_widget(&schema("option"), true),
+            WidgetKind::Select
+        );
         assert_eq!(
             schema_to_widget(&json!({ "type": "array", "items": "option" }), true),
             WidgetKind::MultiSelect
         );
-        assert_eq!(
-            schema_to_widget(&schema("user"), true),
-            WidgetKind::Select
-        );
+        assert_eq!(schema_to_widget(&schema("user"), true), WidgetKind::Select);
         assert_eq!(schema_to_widget(&schema("user"), false), WidgetKind::Text);
         assert_eq!(
             schema_to_widget(&schema("timetracking"), false),
@@ -1450,8 +1500,14 @@ mod tests {
             widget: WidgetKind::MultiSelect,
             value: FieldValue::MultiOption(set),
             options: vec![
-                CreateOption { label: "a".into(), raw: json!({ "name": "a" }) },
-                CreateOption { label: "b".into(), raw: json!({ "name": "b" }) },
+                CreateOption {
+                    label: "a".into(),
+                    raw: json!({ "name": "a" }),
+                },
+                CreateOption {
+                    label: "b".into(),
+                    raw: json!({ "name": "b" }),
+                },
             ],
         }];
         let payload = build_create_payload(&form).expect("valid");
@@ -1502,14 +1558,34 @@ mod tests {
     #[test]
     fn merge_cached_appends_new_and_skips_dupes() {
         let mut current = vec![
-            ProjectField { id: "10".into(), key: "DEV".into(), name: "Development".into() },
-            ProjectField { id: "11".into(), key: "OPS".into(), name: "Operations".into() },
+            ProjectField {
+                id: "10".into(),
+                key: "DEV".into(),
+                name: "Development".into(),
+            },
+            ProjectField {
+                id: "11".into(),
+                key: "OPS".into(),
+                name: "Operations".into(),
+            },
         ];
         let cached = vec![
-            ProjectInfo { key: "dev".into(), name: "Development (cached)".into() }, // dupe (case)
-            ProjectInfo { key: "MKTG".into(), name: "Marketing".into() },
-            ProjectInfo { key: "HR".into(), name: "HR".into() },
-            ProjectInfo { key: "MKTG".into(), name: "Dup".into() }, // dupe within cache
+            ProjectInfo {
+                key: "dev".into(),
+                name: "Development (cached)".into(),
+            }, // dupe (case)
+            ProjectInfo {
+                key: "MKTG".into(),
+                name: "Marketing".into(),
+            },
+            ProjectInfo {
+                key: "HR".into(),
+                name: "HR".into(),
+            },
+            ProjectInfo {
+                key: "MKTG".into(),
+                name: "Dup".into(),
+            }, // dupe within cache
         ];
         merge_cached_projects(&mut current, &cached);
         // Original two preserved in order, then new ones appended in cache order,
@@ -1530,11 +1606,17 @@ mod tests {
             key: format!("{key}-1"),
             fields: crate::jira::types::IssueFields {
                 summary: String::new(),
-                status: crate::jira::types::StatusField { id: "1".into(), name: "Open".into() },
+                status: crate::jira::types::StatusField {
+                    id: "1".into(),
+                    name: "Open".into(),
+                },
                 priority: None,
                 assignee: None,
                 reporter: None,
-                issuetype: IssueTypeField { id: "1".into(), name: "Task".into() },
+                issuetype: IssueTypeField {
+                    id: "1".into(),
+                    name: "Task".into(),
+                },
                 project: ProjectField {
                     id: "1".into(),
                     key: key.into(),
