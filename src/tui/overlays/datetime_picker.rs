@@ -31,6 +31,9 @@ pub struct DatetimePicker {
     pub minute: u32,
     pub time_focus: TimeFocus,
     pub tz: FixedOffset,
+    /// Date-only fields (Jira schema type `date`) skip the time step and
+    /// serialize as `yyyy-MM-dd`.
+    pub date_only: bool,
     /// Buffer holding the first digit of a two-digit time input.
     pub digit_buf: Option<u32>,
     /// Tracks first `g` press for `gg` (go to first day of month) motion.
@@ -38,15 +41,23 @@ pub struct DatetimePicker {
 }
 
 impl DatetimePicker {
-    pub fn from_value(value: &serde_json::Value, tz: FixedOffset) -> Self {
+    pub fn from_value(value: &serde_json::Value, tz: FixedOffset, date_only: bool) -> Self {
         let dt: DateTime<FixedOffset> = value
             .as_str()
             .and_then(|s| {
                 chrono::DateTime::parse_from_rfc3339(s)
                     .or_else(|_| chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3f%z"))
+                    .map(|dt| dt.with_timezone(&tz))
                     .ok()
+                    .or_else(|| {
+                        // Date-only fields come back as bare `yyyy-MM-dd`.
+                        NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                            .ok()
+                            .and_then(|d| d.and_hms_opt(0, 0, 0))
+                            .and_then(|ndt| ndt.and_local_timezone(tz).single())
+                    })
             })
-            .map_or_else(|| Utc::now().with_timezone(&tz), |dt| dt.with_timezone(&tz));
+            .unwrap_or_else(|| Utc::now().with_timezone(&tz));
 
         Self {
             mode: DatetimePickerMode::Date,
@@ -57,6 +68,7 @@ impl DatetimePicker {
             minute: dt.minute(),
             time_focus: TimeFocus::Hour,
             tz,
+            date_only,
             digit_buf: None,
             pending_g: false,
         }
@@ -65,6 +77,11 @@ impl DatetimePicker {
     pub fn to_iso_string(&self) -> String {
         let date = NaiveDate::from_ymd_opt(self.view_year, self.view_month, self.day)
             .unwrap_or_else(|| NaiveDate::from_ymd_opt(2000, 1, 1).expect("static date"));
+        if self.date_only {
+            // Jira `date` fields take a bare calendar date; no tz conversion,
+            // which could shift it to a neighboring day.
+            return date.format("%Y-%m-%d").to_string();
+        }
         let time = NaiveTime::from_hms_opt(self.hour, self.minute, 0).unwrap_or_default();
         let naive = NaiveDateTime::new(date, time);
         // Convert local naive → UTC naive, then attach offset
@@ -196,7 +213,9 @@ pub fn handle_date_key(picker: &mut DatetimePicker, code: crossterm::event::KeyC
             picker.clamp_day();
         }
         KeyCode::Char('t') | KeyCode::Tab => {
-            picker.mode = DatetimePickerMode::Time;
+            if !picker.date_only {
+                picker.mode = DatetimePickerMode::Time;
+            }
         }
         _ => {}
     }
@@ -320,16 +339,20 @@ pub fn render_datetime_picker_in(
     let main_area = vert[0];
     let bottom_area = vert[1];
 
-    // Horizontal split: calendar (left) | time picker (right, fixed width)
+    // Horizontal split: calendar (left) | time picker (right, fixed width).
+    // Date-only pickers have no time step, so the calendar gets the full width.
+    let time_width = if picker.date_only { 0 } else { 13 };
     let horiz = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(13)])
+        .constraints([Constraint::Min(0), Constraint::Length(time_width)])
         .split(main_area);
     let cal_area = horiz[0];
     let time_area = horiz[1];
 
     render_calendar(f, cal_area, picker);
-    render_time_side(f, time_area, picker);
+    if !picker.date_only {
+        render_time_side(f, time_area, picker);
+    }
     render_bottom_datetime(f, bottom_area, picker);
 }
 
@@ -443,6 +466,14 @@ fn render_bottom_datetime(f: &mut Frame, area: Rect, picker: &DatetimePicker) {
     let min_str = format!("{:02}", picker.minute);
     let tz_str = format_tz_offset(picker.tz);
 
+    if picker.date_only {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(date_str, rev))).alignment(Alignment::Center),
+            area,
+        );
+        return;
+    }
+
     let spans: Vec<Span> = match picker.mode {
         DatetimePickerMode::Date => vec![
             Span::styled(date_str, rev),
@@ -522,6 +553,63 @@ const fn month_name(month: u32) -> &'static str {
         11 => "November",
         12 => "December",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+    use serde_json::json;
+
+    fn utc() -> FixedOffset {
+        FixedOffset::east_opt(0).expect("static offset")
+    }
+
+    #[test]
+    fn datetime_round_trips_full_format() {
+        let tz = FixedOffset::east_opt(3 * 3600).expect("static offset");
+        let picker = DatetimePicker::from_value(&json!("2026-07-04T13:45:00.000+0300"), tz, false);
+        assert_eq!(picker.to_iso_string(), "2026-07-04T13:45:00.000+0300");
+    }
+
+    #[test]
+    fn date_only_emits_short_format() {
+        let picker = DatetimePicker::from_value(&json!("2026-07-04"), utc(), true);
+        assert_eq!(picker.to_iso_string(), "2026-07-04");
+    }
+
+    #[test]
+    fn date_only_ignores_timezone_shift() {
+        // A calendar date must not move a day when the local offset is negative.
+        let tz = FixedOffset::west_opt(11 * 3600).expect("static offset");
+        let picker = DatetimePicker::from_value(&json!("2026-07-04"), tz, true);
+        assert_eq!(picker.to_iso_string(), "2026-07-04");
+    }
+
+    #[test]
+    fn from_value_parses_plain_date() {
+        let picker = DatetimePicker::from_value(&json!("2026-12-31"), utc(), true);
+        assert_eq!(
+            (picker.view_year, picker.view_month, picker.day),
+            (2026, 12, 31)
+        );
+    }
+
+    #[test]
+    fn date_only_blocks_time_mode() {
+        let mut picker = DatetimePicker::from_value(&json!("2026-07-04"), utc(), true);
+        handle_date_key(&mut picker, KeyCode::Tab);
+        assert_eq!(picker.mode, DatetimePickerMode::Date);
+        handle_date_key(&mut picker, KeyCode::Char('t'));
+        assert_eq!(picker.mode, DatetimePickerMode::Date);
+    }
+
+    #[test]
+    fn datetime_still_switches_to_time_mode() {
+        let mut picker = DatetimePicker::from_value(&json!(null), utc(), false);
+        handle_date_key(&mut picker, KeyCode::Tab);
+        assert_eq!(picker.mode, DatetimePickerMode::Time);
     }
 }
 

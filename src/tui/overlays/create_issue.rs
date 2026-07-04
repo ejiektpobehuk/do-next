@@ -35,8 +35,10 @@ pub enum WidgetKind {
     /// Rich text (ADF); converted via `markdown_to_adf` on submit.
     RichText,
     Number,
-    /// Date or datetime, edited via the shared datetime picker.
+    /// Date only (`yyyy-MM-dd`), edited via the shared picker in date-only mode.
     Date,
+    /// Date with time, edited via the full datetime picker.
+    DateTime,
     /// Single-select from `allowedValues`.
     Select,
     /// Multi-select array from `allowedValues`.
@@ -244,7 +246,8 @@ pub fn schema_to_widget(schema: &Value, has_options: bool) -> WidgetKind {
             }
         }
         "number" => WidgetKind::Number,
-        "date" | "datetime" => WidgetKind::Date,
+        "date" => WidgetKind::Date,
+        "datetime" => WidgetKind::DateTime,
         "option" | "priority" | "version" | "component" | "resolution" | "group" => {
             WidgetKind::Select
         }
@@ -300,7 +303,7 @@ fn initial_value(widget: WidgetKind) -> FieldValue {
             input: String::new(),
             cursor: 0,
         },
-        WidgetKind::Date => FieldValue::Date { value: None },
+        WidgetKind::Date | WidgetKind::DateTime => FieldValue::Date { value: None },
         WidgetKind::Select => FieldValue::SingleOption(None),
         WidgetKind::MultiSelect => FieldValue::MultiOption(HashSet::new()),
         WidgetKind::Unsupported => FieldValue::Unsupported,
@@ -375,7 +378,7 @@ fn field_payload_value(field: &FormField) -> Option<Value> {
                 .map(|n| json!(n))
                 .or_else(|| t.parse::<f64>().ok().map(|n| json!(n)))
         }
-        (WidgetKind::Date, FieldValue::Date { value: Some(iso) }) => {
+        (WidgetKind::Date | WidgetKind::DateTime, FieldValue::Date { value: Some(iso) }) => {
             Some(Value::String(iso.clone()))
         }
         (WidgetKind::Select, FieldValue::SingleOption(Some(i))) => {
@@ -401,6 +404,20 @@ pub fn build_create_payload(form: &CreateForm) -> Result<Value, String> {
         .issuetype
         .as_ref()
         .ok_or_else(|| "Select an issue type".to_string())?;
+
+    // Without field metadata `form.fields` is empty and the payload would be
+    // missing required fields (e.g. summary) — surface that before the server does.
+    match &form.fields_state {
+        CacheState::Loaded(()) => {}
+        CacheState::Failed(e) => {
+            return Err(format!(
+                "Fields failed to load: {e} — reselect Type to retry"
+            ));
+        }
+        CacheState::Idle | CacheState::Loading => {
+            return Err("Fields are still loading…".to_string());
+        }
+    }
 
     let mut fields = serde_json::Map::new();
     fields.insert("project".into(), json!({ "key": form.project.key }));
@@ -530,7 +547,7 @@ fn activate_field(form: &mut CreateForm) {
         }
         WidgetKind::Select => open_select_picker(form, idx),
         WidgetKind::MultiSelect => open_multiselect_picker(form, idx),
-        WidgetKind::Date => open_date_picker(form, idx),
+        WidgetKind::Date | WidgetKind::DateTime => open_date_picker(form, idx),
         WidgetKind::Unsupported => {}
     }
 }
@@ -665,13 +682,17 @@ fn open_multiselect_picker(form: &mut CreateForm, field_idx: usize) {
 
 fn open_date_picker(form: &mut CreateForm, field_idx: usize) {
     let tz = crate::tui::views::custom::resolve_tz(None);
+    let date_only = form
+        .fields
+        .get(field_idx)
+        .is_some_and(|f| f.widget == WidgetKind::Date);
     let start = match form.fields.get(field_idx).map(|f| &f.value) {
         Some(FieldValue::Date { value: Some(iso) }) => Value::String(iso.clone()),
         _ => Value::Null,
     };
     form.picker = Some(CreatePicker::Date {
         field_idx,
-        picker: DatetimePicker::from_value(&start, tz),
+        picker: DatetimePicker::from_value(&start, tz, date_only),
     });
 }
 
@@ -877,10 +898,12 @@ fn handle_picker_input(app: &mut AppState, code: KeyCode, _modifiers: KeyModifie
         } => match code {
             KeyCode::Esc | KeyCode::Char('q') => {}
             KeyCode::Enter => {
-                if picker.mode == DatetimePickerMode::Date {
+                // Date-only pickers commit straight from Date mode; otherwise
+                // Enter walks Date → Time/Hour → Minute → commit.
+                if !picker.date_only && picker.mode == DatetimePickerMode::Date {
                     picker.mode = DatetimePickerMode::Time;
                     form.picker = Some(CreatePicker::Date { field_idx, picker });
-                } else if picker.time_focus == TimeFocus::Hour {
+                } else if !picker.date_only && picker.time_focus == TimeFocus::Hour {
                     picker.time_focus = TimeFocus::Minute;
                     form.picker = Some(CreatePicker::Date { field_idx, picker });
                 } else if let Some(field) = form.fields.get_mut(field_idx) {
@@ -901,6 +924,24 @@ fn handle_picker_input(app: &mut AppState, code: KeyCode, _modifiers: KeyModifie
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
+
+/// Status row shown under the Type field while its field metadata isn't loaded.
+fn fields_status_line(form: &CreateForm) -> Option<Line<'static>> {
+    form.issuetype.as_ref()?;
+    match &form.fields_state {
+        CacheState::Loading | CacheState::Idle => Some(Line::from(Span::styled(
+            "  (loading fields…)",
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::ITALIC),
+        ))),
+        CacheState::Failed(e) => Some(Line::from(Span::styled(
+            format!("  (fields failed: {e} — reselect Type to retry)"),
+            Style::default().fg(Color::Red),
+        ))),
+        CacheState::Loaded(()) => None,
+    }
+}
 
 pub fn render_create_issue_overlay(f: &mut Frame, app: &AppState) {
     let ActionState::CreatingIssue(ref form) = app.action_state else {
@@ -953,13 +994,8 @@ pub fn render_create_issue_overlay(f: &mut Frame, app: &AppState) {
         false,
     ));
 
-    if form.fields_state.is_pending() && form.issuetype.is_some() {
-        lines.push(Line::from(Span::styled(
-            "  (loading fields…)",
-            Style::default()
-                .fg(theme::MUTED)
-                .add_modifier(Modifier::ITALIC),
-        )));
+    if let Some(status) = fields_status_line(form) {
+        lines.push(status);
     }
 
     for (i, field) in form.fields.iter().enumerate() {
@@ -1051,7 +1087,7 @@ fn field_value_display(field: &FormField) -> String {
                 input.replace('\n', "⏎")
             }
         }
-        (WidgetKind::Date, FieldValue::Date { value }) => {
+        (WidgetKind::Date | WidgetKind::DateTime, FieldValue::Date { value }) => {
             value.clone().unwrap_or_else(|| "— ▾".to_string())
         }
         (WidgetKind::Select, FieldValue::SingleOption(sel)) => sel
@@ -1376,7 +1412,7 @@ mod tests {
         assert_eq!(schema_to_widget(&schema("date"), false), WidgetKind::Date);
         assert_eq!(
             schema_to_widget(&schema("datetime"), false),
-            WidgetKind::Date
+            WidgetKind::DateTime
         );
         assert_eq!(
             schema_to_widget(&schema("option"), true),
@@ -1420,6 +1456,7 @@ mod tests {
             id: "10001".into(),
             name: "Task".into(),
         });
+        form.fields_state = CacheState::Loaded(());
         form
     }
 
@@ -1552,6 +1589,24 @@ mod tests {
     fn missing_issuetype_errors() {
         let mut form = base_form();
         form.issuetype = None;
+        assert!(build_create_payload(&form).is_err());
+    }
+
+    #[test]
+    fn failed_fields_fetch_blocks_submit() {
+        let mut form = base_form();
+        form.fields_state = CacheState::Failed("HTTP 500".into());
+        let err = build_create_payload(&form).expect_err("must not submit without fields");
+        assert!(
+            err.contains("HTTP 500"),
+            "error should surface the cause: {err}"
+        );
+    }
+
+    #[test]
+    fn pending_fields_fetch_blocks_submit() {
+        let mut form = base_form();
+        form.fields_state = CacheState::Loading;
         assert!(build_create_payload(&form).is_err());
     }
 

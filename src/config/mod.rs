@@ -103,6 +103,13 @@ fn validate_team_config(team: &TeamConfig) -> Result<()> {
                         field.field_id
                     ));
                 }
+                if field.date == Some(true) && field.datetime == Some(true) {
+                    return Err(anyhow!(
+                        "view '{}', field '{}': set either `date` or `datetime`, not both",
+                        view_id,
+                        field.field_id
+                    ));
+                }
                 if let Some(entries) = &field.templates {
                     for (i, entry) in entries.iter().enumerate() {
                         if entry.name.trim().is_empty() {
@@ -127,6 +134,62 @@ fn validate_team_config(team: &TeamConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::{
+        CustomViewConfig, CustomViewFieldConfig, CustomViewSectionConfig, TeamConfig,
+    };
+
+    fn team_with_field(field: CustomViewFieldConfig) -> TeamConfig {
+        let view = CustomViewConfig {
+            timezone: None,
+            sections: vec![CustomViewSectionConfig {
+                title: "Section".into(),
+                description: None,
+                fields: vec![field],
+            }],
+        };
+        TeamConfig {
+            views: std::iter::once(("view".to_string(), view)).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn date_and_datetime_together_is_an_error() {
+        let team = team_with_field(CustomViewFieldConfig {
+            field_id: "duedate".into(),
+            date: Some(true),
+            datetime: Some(true),
+            ..Default::default()
+        });
+        let err = validate_team_config(&team).expect_err("conflict must be rejected");
+        assert!(err.to_string().contains("`date` or `datetime`"));
+    }
+
+    #[test]
+    fn date_alone_is_valid() {
+        let team = team_with_field(CustomViewFieldConfig {
+            field_id: "duedate".into(),
+            date: Some(true),
+            ..Default::default()
+        });
+        assert!(validate_team_config(&team).is_ok());
+    }
+
+    #[test]
+    fn explicit_false_does_not_conflict() {
+        let team = team_with_field(CustomViewFieldConfig {
+            field_id: "duedate".into(),
+            date: Some(true),
+            datetime: Some(false),
+            ..Default::default()
+        });
+        assert!(validate_team_config(&team).is_ok());
+    }
 }
 
 /// Walk template references and report paths that can't be read or are empty.
