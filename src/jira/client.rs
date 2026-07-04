@@ -412,9 +412,9 @@ impl JiraClient {
         project: &str,
         issuetype_id: &str,
     ) -> Result<Vec<serde_json::Value>> {
-        let path =
-            format!("/rest/api/3/issue/createmeta/{project}/issuetypes/{issuetype_id}");
-        self.fetch_createmeta_pages(&path, &["values", "fields"]).await
+        let path = format!("/rest/api/3/issue/createmeta/{project}/issuetypes/{issuetype_id}");
+        self.fetch_createmeta_pages(&path, &["values", "fields"])
+            .await
     }
 
     /// Create a new issue. `payload` must be the full `{ "fields": { … } }`

@@ -3430,16 +3430,25 @@ fn key_edit_detail_field(app: &mut AppState) {
 
     // Datetime picker: triggered by `datetime: true` config flag or editmeta schema type
     if !use_editor {
-        let by_config = field_cfg.as_ref().and_then(|f| f.datetime).unwrap_or(false);
-        let by_schema = app
-            .field_schemas
-            .get(&field_id)
-            .is_some_and(|s| s.ty == "date" || s.ty == "datetime");
-        if by_config || by_schema {
+        let cfg_kind = field_cfg
+            .as_ref()
+            .and_then(crate::config::types::CustomViewFieldConfig::date_kind);
+        let schema_ty = app.field_schemas.get(&field_id).map(|s| s.ty.as_str());
+        let by_schema = matches!(schema_ty, Some("date" | "datetime"));
+        if cfg_kind.is_some() || by_schema {
+            // Jira `date` fields take `yyyy-MM-dd`; the schema wins over the
+            // config flags so we never send a rejected format. The flags
+            // decide only when no schema is available.
+            let date_only = match schema_ty {
+                Some("date") => true,
+                Some("datetime") => false,
+                _ => cfg_kind == Some(crate::config::types::DateFieldKind::Date),
+            };
             let tz = crate::tui::views::custom::resolve_tz(view_cfg);
             let picker = crate::tui::overlays::datetime_picker::DatetimePicker::from_value(
                 &original_json,
                 tz,
+                date_only,
             );
             app.action_state = ActionState::EditingDatetimeField {
                 issue_key: issue.key,
@@ -4173,11 +4182,14 @@ fn handle_datetime_picker_input(app: &mut AppState, event: crossterm::event::Eve
                 return;
             };
             // Date mode → switch to Time; Time/Hour → advance to Minute; Time/Minute → commit.
-            if picker.mode == DatetimePickerMode::Date {
+            // Date-only pickers skip the time steps and commit immediately.
+            if !picker.date_only && picker.mode == DatetimePickerMode::Date {
                 picker.mode = DatetimePickerMode::Time;
                 return;
             }
-            if picker.time_focus == crate::tui::overlays::datetime_picker::TimeFocus::Hour {
+            if !picker.date_only
+                && picker.time_focus == crate::tui::overlays::datetime_picker::TimeFocus::Hour
+            {
                 picker.time_focus = crate::tui::overlays::datetime_picker::TimeFocus::Minute;
                 return;
             }

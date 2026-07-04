@@ -87,6 +87,7 @@ fn left_column() -> Vec<Line<'static>> {
 fn right_column() -> Vec<Line<'static>> {
     vec![
         section_header("Actions"),
+        key_line("n", "new issue"),
         key_line("o", "open in browser"),
         key_line("t", "transition"),
         key_line("c", "comment"),

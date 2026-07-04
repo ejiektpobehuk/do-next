@@ -201,7 +201,12 @@ pub struct CustomViewFieldConfig {
     /// Always open $EDITOR regardless of field type.
     pub use_editor: Option<bool>,
     /// Display value as a formatted datetime using the configured timezone.
+    /// When editing, opens the full datetime picker. Mutually exclusive with `date`.
     pub datetime: Option<bool>,
+    /// Treat value as a calendar date (`yyyy-MM-dd`, e.g. Due Date): display
+    /// without a time part and edit with a date-only picker. Mutually
+    /// exclusive with `datetime`.
+    pub date: Option<bool>,
     /// Duration row role: "start", "end", or `"jira_value"`.
     /// When a section has both "start" and "end" fields, a read-only duration
     /// row is rendered after that section. `"jira_value"` (float hours) is used
@@ -220,7 +225,28 @@ pub struct CustomViewFieldConfig {
     pub templates: Option<Vec<TemplateEntry>>,
 }
 
+/// Normalized meaning of the `date`/`datetime` field flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateFieldKind {
+    /// Calendar date only (`yyyy-MM-dd`).
+    Date,
+    /// Date with time, timezone-aware.
+    DateTime,
+}
+
 impl CustomViewFieldConfig {
+    /// Normalizes the `date`/`datetime` flags into one kind.
+    /// Caller should have validated that they aren't both set.
+    pub fn date_kind(&self) -> Option<DateFieldKind> {
+        if self.date == Some(true) {
+            Some(DateFieldKind::Date)
+        } else if self.datetime == Some(true) {
+            Some(DateFieldKind::DateTime)
+        } else {
+            None
+        }
+    }
+
     /// Returns the unified list of templates from `template` and `templates`.
     /// Caller should have validated that they aren't both set.
     pub fn effective_templates(&self) -> Vec<TemplateEntry> {
@@ -264,4 +290,43 @@ pub struct CacheConfig {
     pub enabled: bool,
     pub max_age_seconds: Option<u64>,
     pub path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_kind_is_none_by_default() {
+        let field = CustomViewFieldConfig::default();
+        assert_eq!(field.date_kind(), None);
+    }
+
+    #[test]
+    fn date_kind_from_date_flag() {
+        let field = CustomViewFieldConfig {
+            date: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(field.date_kind(), Some(DateFieldKind::Date));
+    }
+
+    #[test]
+    fn date_kind_from_datetime_flag() {
+        let field = CustomViewFieldConfig {
+            datetime: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(field.date_kind(), Some(DateFieldKind::DateTime));
+    }
+
+    #[test]
+    fn date_kind_ignores_explicit_false() {
+        let field = CustomViewFieldConfig {
+            date: Some(false),
+            datetime: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(field.date_kind(), None);
+    }
 }

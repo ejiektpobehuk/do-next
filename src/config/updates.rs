@@ -21,10 +21,7 @@ pub fn check_team_update(team: &ResolvedTeam) -> Option<String> {
         .args(["fetch", "--quiet"])
         .current_dir(&path)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env(
-            "GIT_SSH_COMMAND",
-            format!("{ssh_command} -o BatchMode=yes"),
-        )
+        .env("GIT_SSH_COMMAND", format!("{ssh_command} -o BatchMode=yes"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

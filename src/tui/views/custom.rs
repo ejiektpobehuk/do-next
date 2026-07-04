@@ -22,7 +22,7 @@ const CORNERS_ONLY: BorderSet = BorderSet {
     horizontal_bottom: " ",
 };
 
-use crate::config::types::{CustomViewConfig, CustomViewFieldConfig};
+use crate::config::types::{CustomViewConfig, CustomViewFieldConfig, DateFieldKind};
 use crate::jira::types::Issue;
 use crate::tui::app::{ActionState, AppState, DetailFocus};
 use crate::tui::markdown::markdown_to_lines;
@@ -524,11 +524,16 @@ fn get_field_content(issue: &Issue, field: &CustomViewFieldConfig, tz: FixedOffs
     if raw.is_null() {
         return String::new();
     }
-    if field.datetime == Some(true)
+    // Bare `yyyy-MM-dd` values fail parse_dt and fall through to val_to_str,
+    // which already displays them as-is.
+    if let Some(kind) = field.date_kind()
         && let Some(s) = raw.as_str()
         && let Some(dt) = parse_dt(s)
     {
-        return fmt_dt(&dt, tz);
+        return match kind {
+            DateFieldKind::Date => dt.with_timezone(&tz).format("%Y-%m-%d").to_string(),
+            DateFieldKind::DateTime => fmt_dt(&dt, tz),
+        };
     }
     val_to_str(raw)
 }
