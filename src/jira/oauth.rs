@@ -122,7 +122,7 @@ pub fn run_oauth_flow(
     // conflicts with the main runtime (which we're called from synchronously).
     let client_id_owned = client_id.to_string();
     let client_secret_owned = client_secret.to_string();
-    let (token_data, resources) = std::thread::spawn(move || {
+    let (token_data, mut resources) = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -183,6 +183,12 @@ pub fn run_oauth_flow(
     .map_err(|_| anyhow::anyhow!("Token exchange thread panicked"))??;
 
     let expires_at = Utc::now() + ChronoDuration::seconds(token_data.expires_in);
+
+    // The endpoint returns one entry per site per product, so a site
+    // accessible through both Jira and Confluence scopes appears twice
+    // with the same cloud id.
+    let mut seen_ids = std::collections::HashSet::new();
+    resources.retain(|r| seen_ids.insert(r.id.clone()));
 
     if resources.is_empty() {
         bail!(
