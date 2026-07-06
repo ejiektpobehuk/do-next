@@ -106,10 +106,7 @@ pub fn run_oauth_flow(
     }
 
     // Respond to the browser.
-    let response = tiny_http::Response::from_string(
-        "<html><body><h2>Authorization complete!</h2>\
-         <p>You can close this tab and return to the terminal.</p></body></html>",
-    )
+    let response = tiny_http::Response::from_string(include_str!("authorization_complete.html"))
     .with_header(
         "Content-Type: text/html"
             .parse::<tiny_http::Header>()
