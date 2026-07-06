@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::items::WorkItem;
 use crate::jira::types::{
     Attachment, Comment, FieldOption, FieldSchema, Issue, IssueTypeField, ProjectInfo, StatusInfo,
     Transition,
@@ -10,7 +11,7 @@ pub enum AppEvent {
     /// Keyboard or mouse event from the terminal.
     Input(crossterm::event::Event),
     /// A background fetch completed successfully.
-    SourceLoaded(String, Vec<Issue>),
+    SourceLoaded(String, Vec<WorkItem>),
     /// A whole-source fetch failed (no subsources).
     SourceError(String, anyhow::Error),
     /// One subsource fetch failed; other subsources continue.
@@ -29,7 +30,7 @@ pub enum AppEvent {
     /// Git-based update warnings for team configs (sent once on startup).
     UpdateWarnings(Vec<String>),
     /// A single-issue background refresh completed successfully.
-    IssueRefreshed(Box<Issue>),
+    IssueRefreshed(Box<WorkItem>),
     /// A single-issue background refresh failed.
     IssueRefreshError {
         issue_key: String,
@@ -146,6 +147,10 @@ pub enum ActionResult {
     /// A new issue was created; carries its key for the confirmation popup.
     IssueCreated {
         key: String,
+    },
+    /// A Confluence inline task was marked complete.
+    TaskCompleted {
+        item_key: String,
     },
     Error(anyhow::Error),
 }

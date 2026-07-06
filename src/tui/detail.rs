@@ -27,8 +27,8 @@ pub fn render_detail(
     // Show issue key in panel border for detail views (and while a refresh
     // is in flight, also for the Comments/Attachments subview modes — so the
     // user sees the spinner regardless of which subview they triggered it from).
-    let title = app.selected_issue().and_then(|i| {
-        let refreshing = app.refreshing_issues.contains(&i.key);
+    let title = app.selected_item().and_then(|i| {
+        let refreshing = app.refreshing_issues.contains(i.key());
         let show_title =
             matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) || refreshing;
         if !show_title {
@@ -37,9 +37,9 @@ pub fn render_detail(
         let text = if refreshing {
             let frame = usize::try_from(app.tick_count).unwrap_or(0)
                 % crate::tui::list::SPINNER_FRAMES.len();
-            format!(" {} {} ", i.key, crate::tui::list::SPINNER_FRAMES[frame])
+            format!(" {} {} ", i.key(), crate::tui::list::SPINNER_FRAMES[frame])
         } else {
-            format!(" {} ", i.key)
+            format!(" {} ", i.key())
         };
         Some(Span::styled(
             text,
@@ -81,18 +81,21 @@ fn render_detail_content(
             0
         }
         Some(NavItem::Issue(_)) => {
-            let Some(issue) = app.selected_issue() else {
+            let Some(item) = app.selected_item() else {
                 return 0;
             };
-            let issue = issue.clone();
+            let item = item.clone();
             match app.view_mode {
                 ViewMode::Default | ViewMode::Custom(_) => {
-                    views::custom::render_detail_view(f, area, &issue, app, render_out)
+                    views::custom::render_detail_view(f, area, &item, app, render_out)
                 }
-                ViewMode::Comments => views::comments::render_comments(f, area, &issue, app),
-                ViewMode::Attachments => {
-                    views::attachments::render_attachments(f, area, &issue, app)
-                }
+                // Comments/Attachments are Jira-only sub-views.
+                ViewMode::Comments => item.as_jira().map_or(0, |issue| {
+                    views::comments::render_comments(f, area, issue, app)
+                }),
+                ViewMode::Attachments => item.as_jira().map_or(0, |issue| {
+                    views::attachments::render_attachments(f, area, issue, app)
+                }),
             }
         }
         None => {

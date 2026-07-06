@@ -24,6 +24,25 @@ pub fn resolve_auth(jira: &JiraConfig) -> Result<Auth> {
     resolve_basic(jira)
 }
 
+/// Resolve Confluence authentication from the effective Confluence connection
+/// config (a `JiraConfig`-shaped value). Same resolution as [`resolve_auth`],
+/// except `DO_NEXT_CONFLUENCE_API_TOKEN` takes precedence over everything.
+pub fn resolve_confluence_auth(conf: &JiraConfig) -> Result<Auth> {
+    if conf.auth_method.as_deref() == Some("oauth") {
+        return resolve_oauth();
+    }
+    let email = resolve_email(conf)?;
+    if let Ok(token) = std::env::var("DO_NEXT_CONFLUENCE_API_TOKEN") {
+        log::debug!("credentials: using DO_NEXT_CONFLUENCE_API_TOKEN env var");
+        return Ok(Auth::Basic(BasicCredentials {
+            email,
+            api_token: token,
+        }));
+    }
+    let api_token = resolve_api_token(conf)?;
+    Ok(Auth::Basic(BasicCredentials { email, api_token }))
+}
+
 fn resolve_oauth() -> Result<Auth> {
     match oauth::load_oauth_tokens()? {
         Some(creds) => Ok(Auth::OAuth(creds)),

@@ -428,7 +428,12 @@ fn find_issue<'a>(
     hit: &RankedHit,
     jira: &'a JiraSearchState,
 ) -> Option<&'a Issue> {
-    if let Some(issue) = app.issues.iter().find(|i| i.key == hit.issue_key) {
+    if let Some(issue) = app
+        .issues
+        .iter()
+        .find(|i| i.key() == hit.issue_key)
+        .and_then(crate::items::WorkItem::as_jira)
+    {
         return Some(issue);
     }
     if let JiraSearchState::Loaded { issues, .. } = jira {

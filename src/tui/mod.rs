@@ -25,9 +25,11 @@ use tokio::time::{Duration, interval};
 
 use crate::config::LoadedConfig;
 use crate::config::hidden::{HiddenState, hidden_path};
+use crate::confluence::ConfluenceClient;
 use crate::events::{ActionResult, AppEvent};
 use crate::jira::JiraClient;
 use crate::sources::{
+    Clients,
     fetcher::{
         spawn_all_statuses_fetch, spawn_jira_search, spawn_projects_fetch, spawn_refresh_issue,
         spawn_team_statuses_fetch,
@@ -41,10 +43,7 @@ use crate::tui::app::{
 use crate::tui::render::{RenderOut, render};
 
 /// Entry point for the interactive TUI.
-pub async fn run(
-    loaded: LoadedConfig,
-    clients: std::collections::HashMap<String, JiraClient>,
-) -> Result<()> {
+pub async fn run(loaded: LoadedConfig, clients: Clients) -> Result<()> {
     // Terminal setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -65,7 +64,7 @@ pub async fn run(
 async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     loaded: LoadedConfig,
-    clients: std::collections::HashMap<String, JiraClient>,
+    clients: Clients,
 ) -> Result<()> {
     let (tx, mut rx) = unbounded_channel::<AppEvent>();
     let mut app = AppState::new(loaded.teams.clone());
@@ -105,9 +104,10 @@ async fn run_inner(
         if app.flags.pending_team_fetch {
             app.flags.pending_team_fetch = false;
             if let Some(team) = app.resolved_teams.get(app.active_team_idx)
-                && let Some(team_client) = clients_map.get(&team.jira.base_url)
+                && let Some(team_client) = clients_map.jira.get(&team.jira.base_url)
             {
-                spawn_fetches(team_client, app.team_config(), &tx);
+                let team_confluence = clients_map.confluence.get(&team.confluence.base_url);
+                spawn_fetches(team_client, team_confluence, app.team_config(), &tx);
                 for state in app.sources.values_mut() {
                     if matches!(state, crate::tui::app::SourceState::Pending) {
                         *state = crate::tui::app::SourceState::Loading;
@@ -136,12 +136,13 @@ async fn run_inner(
             h.abort();
         }
 
-        // Resolve the current team's client for actions
-        let active_client_ref = app
-            .resolved_teams
-            .get(app.active_team_idx)
-            .and_then(|t| clients_map.get(&t.jira.base_url))
+        // Resolve the current team's clients for actions
+        let active_team = app.resolved_teams.get(app.active_team_idx);
+        let active_client_ref = active_team
+            .and_then(|t| clients_map.jira.get(&t.jira.base_url))
             .unwrap_or(&client);
+        let active_confluence_ref =
+            active_team.and_then(|t| clients_map.confluence.get(&t.confluence.base_url));
 
         maybe_spawn_field_names_fetch(&mut app, active_client_ref, &tx);
 
@@ -157,7 +158,14 @@ async fn run_inner(
         handle_pending_comment_edit(terminal, &mut app, &mut rx, &mut input_task, &tx);
 
         // Dispatch any pending action signals (transition fetch, hide, assign, move)
-        dispatch_action(&mut app, active_client_ref, &tx, &mut hidden, &hidden_file)?;
+        dispatch_action(
+            &mut app,
+            active_client_ref,
+            active_confluence_ref,
+            &tx,
+            &mut hidden,
+            &hidden_file,
+        )?;
 
         if app.should_quit {
             break;
@@ -186,15 +194,19 @@ async fn run_inner(
 fn spawn_initial_tasks(
     app: &mut AppState,
     loaded: &LoadedConfig,
-    clients: &std::collections::HashMap<String, JiraClient>,
+    clients: &Clients,
     tx: &UnboundedSender<AppEvent>,
 ) -> Result<JiraClient> {
     let active_client = app
         .resolved_teams
         .first()
-        .and_then(|t| clients.get(&t.jira.base_url))
+        .and_then(|t| clients.jira.get(&t.jira.base_url))
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("No teams configured. Run do-next to set up a team."))?;
+    let active_confluence = app
+        .resolved_teams
+        .first()
+        .and_then(|t| clients.confluence.get(&t.confluence.base_url));
 
     // Fetch current user (best-effort; subsource sorting depends on it)
     let user_client = active_client.clone();
@@ -206,7 +218,7 @@ fn spawn_initial_tasks(
     });
 
     // Spawn fetch tasks for the active team's sources
-    spawn_fetches(&active_client, app.team_config(), tx);
+    spawn_fetches(&active_client, active_confluence, app.team_config(), tx);
     for state in app.sources.values_mut() {
         *state = crate::tui::app::SourceState::Loading;
     }
@@ -364,11 +376,12 @@ fn drain_input_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) {
 fn dispatch_action(
     app: &mut AppState,
     client: &JiraClient,
+    confluence: Option<&ConfluenceClient>,
     tx: &UnboundedSender<AppEvent>,
     hidden: &mut HiddenState,
     hidden_file: &std::path::PathBuf,
 ) -> Result<()> {
-    dispatch_background_tasks(app, client, tx);
+    dispatch_background_tasks(app, client, confluence, tx);
 
     match app.action_state.clone() {
         ActionState::LoadingTransitions { issue_key } => {
@@ -385,6 +398,23 @@ fn dispatch_action(
                 description: "Applying transition…".into(),
             };
             spawn_transition(issue_key, transition_id, client.clone(), tx.clone());
+        }
+        ActionState::PendingCompleteTask { item_key, task_id } => {
+            app.action_state = ActionState::AwaitingAction {
+                description: "Completing task…".into(),
+            };
+            if let Some(conf) = confluence {
+                crate::sources::fetcher::spawn_complete_task(
+                    conf.clone(),
+                    item_key,
+                    task_id,
+                    tx.clone(),
+                );
+            } else {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::Error(anyhow::anyhow!(
+                    "Confluence is not configured for this team"
+                ))));
+            }
         }
         ActionState::PendingHide { issue_key } => {
             dispatch_pending_hide(app, issue_key, tx, hidden, hidden_file)?;
@@ -477,6 +507,7 @@ fn dispatch_action(
 fn dispatch_background_tasks(
     app: &mut AppState,
     client: &JiraClient,
+    confluence: Option<&ConfluenceClient>,
     tx: &UnboundedSender<AppEvent>,
 ) {
     // Silent background attachment fetch (not ActionState-driven)
@@ -494,7 +525,7 @@ fn dispatch_background_tasks(
             *state = crate::tui::app::SourceState::Loading;
         }
         app.subsource_errors.clear();
-        spawn_fetches(client, app.team_config(), tx);
+        spawn_fetches(client, confluence, app.team_config(), tx);
     }
 
     // Single-issue refresh requested via `r` (detail focus).

@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 
 use crate::config::types::{ResolvedTeam, SourceConfig, TeamConfig};
 use crate::events::{ActionResult, AppEvent};
+use crate::items::WorkItem;
 use crate::jira::types::{Comment, FieldOption, FieldSchema, Issue, ProjectInfo, StatusInfo};
 use crate::tui::search::{RankedHit, SearchFilters};
 
@@ -14,7 +15,7 @@ use crate::tui::search::{RankedHit, SearchFilters};
 #[derive(Debug, Clone)]
 pub struct PerTeamState {
     pub sources: IndexMap<String, SourceState>,
-    pub issues: Vec<Issue>,
+    pub issues: Vec<WorkItem>,
     pub subsource_errors: IndexMap<String, Vec<(usize, Arc<anyhow::Error>)>>,
     pub nav_items: Vec<NavItem>,
     pub nav_idx: usize,
@@ -33,12 +34,12 @@ pub enum NavItem {
     SubsourceError(String, usize),
 }
 
-/// Loading state for a single issue source.
+/// Loading state for a single work-item source.
 #[derive(Debug, Clone)]
 pub enum SourceState {
     Pending,
     Loading,
-    Loaded(Vec<Issue>),
+    Loaded(Vec<WorkItem>),
     Error(Arc<anyhow::Error>),
 }
 
@@ -228,6 +229,19 @@ pub enum ActionState {
     DeletingComment {
         issue_key: String,
         comment_id: String,
+    },
+    /// Yes/No popup confirming marking a Confluence task complete.
+    /// `selected` 0=Yes 1=No.
+    ConfirmingCompleteTask {
+        item_key: String,
+        task_id: String,
+        /// Default 1 (No) for safety.
+        selected: usize,
+    },
+    /// Confluence complete-task call ready to be dispatched.
+    PendingCompleteTask {
+        item_key: String,
+        task_id: String,
     },
     /// Yes/No popup confirming attachment deletion. `selected` 0=Yes 1=No.
     ConfirmingAttachmentDelete {
@@ -453,8 +467,8 @@ pub struct AppState {
     /// Saved per-team state for inactive tabs.
     pub saved_team_states: HashMap<usize, PerTeamState>,
     pub sources: IndexMap<String, SourceState>,
-    /// Flat ordered list of all visible issues (after dedup).
-    pub issues: Vec<Issue>,
+    /// Flat ordered list of all visible items (after dedup).
+    pub issues: Vec<WorkItem>,
     /// Per-source subsource errors: `source_id` → [(`subsource_idx`, error)].
     pub subsource_errors: IndexMap<String, Vec<(usize, Arc<anyhow::Error>)>>,
     /// Ordered navigable items: issues and error rows.
@@ -740,27 +754,43 @@ impl AppState {
         )
     }
 
-    pub fn selected_issue(&self) -> Option<&Issue> {
+    pub fn selected_item(&self) -> Option<&WorkItem> {
         match self.nav_items.get(self.nav_idx)? {
             NavItem::Issue(idx) => self.issues.get(*idx),
             NavItem::SourceError(_) | NavItem::SubsourceError(_, _) => None,
         }
     }
 
+    /// The selected item's Jira payload; `None` on error rows and non-Jira
+    /// items. Jira-only flows (transitions, comments, attachments, editmeta)
+    /// gate through this.
+    pub fn selected_issue(&self) -> Option<&Issue> {
+        self.selected_item().and_then(WorkItem::as_jira)
+    }
+
+    /// Mutable access to a Jira issue in the flat list by key. Used by the
+    /// `apply_*` mutators, which are only ever reached for Jira items.
+    fn jira_issue_mut(&mut self, key: &str) -> Option<&mut Issue> {
+        self.issues
+            .iter_mut()
+            .find(|i| i.key() == key)
+            .and_then(WorkItem::as_jira_mut)
+    }
+
     pub fn selected_nav_item(&self) -> Option<&NavItem> {
         self.nav_items.get(self.nav_idx)
     }
 
-    /// Rebuild the flat issues list from loaded source states (in priority order, deduped),
+    /// Rebuild the flat items list from loaded source states (in priority order, deduped),
     /// then rebuild navigable items.
     fn rebuild_issues(&mut self) {
         let mut seen = std::collections::HashSet::new();
         let mut issues = Vec::new();
         for (_, state) in &self.sources {
-            if let SourceState::Loaded(source_issues) = state {
-                for issue in source_issues {
-                    if seen.insert(issue.key.clone()) {
-                        issues.push(issue.clone());
+            if let SourceState::Loaded(source_items) = state {
+                for item in source_items {
+                    if seen.insert(item.key().to_owned()) {
+                        issues.push(item.clone());
                     }
                 }
             }
@@ -780,7 +810,7 @@ impl AppState {
                 SourceState::Loaded(_) => {
                     let start = issue_pos;
                     while issue_pos < self.issues.len()
-                        && self.issues[issue_pos].source_id.as_deref() == Some(source_id.as_str())
+                        && self.issues[issue_pos].source_id() == Some(source_id.as_str())
                     {
                         issue_pos += 1;
                     }
@@ -806,9 +836,9 @@ impl AppState {
         if let Some(old) = old_item {
             match old {
                 NavItem::Issue(old_idx) => {
-                    if let Some(key) = self.issues.get(old_idx).map(|i| i.key.clone())
+                    if let Some(key) = self.issues.get(old_idx).map(|i| i.key().to_owned())
                         && let Some(pos) = self.nav_items.iter().position(|n| {
-                            matches!(n, NavItem::Issue(i) if self.issues.get(*i).map(|iss| &iss.key) == Some(&key))
+                            matches!(n, NavItem::Issue(i) if self.issues.get(*i).map(WorkItem::key) == Some(key.as_str()))
                         })
                     {
                         self.nav_idx = pos;
@@ -849,9 +879,9 @@ pub fn source_config_for<'a>(team_config: &'a TeamConfig, id: &str) -> Option<&'
     team_config.sources.iter().find(|s| s.id == id)
 }
 
-/// Determine the auto view mode for an issue based on its source config.
-fn auto_view_mode(issue: &Issue, team_config: &TeamConfig) -> ViewMode {
-    let Some(source_id) = issue.source_id.as_deref() else {
+/// Determine the auto view mode for an item based on its source config.
+fn auto_view_mode(item: &WorkItem, team_config: &TeamConfig) -> ViewMode {
+    let Some(source_id) = item.source_id() else {
         return ViewMode::Default;
     };
     let view_id = source_config_for(team_config, source_id).and_then(|s| s.view_mode.as_deref());
@@ -867,13 +897,13 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
             app.tick_count = app.tick_count.wrapping_add(1);
         }
 
-        AppEvent::SourceLoaded(source_id, issues) => {
-            app.sources.insert(source_id, SourceState::Loaded(issues));
+        AppEvent::SourceLoaded(source_id, items) => {
+            app.sources.insert(source_id, SourceState::Loaded(items));
             app.rebuild_issues();
-            // Auto-update view mode for newly selected issue
-            if let Some(issue) = app.selected_issue() {
-                let issue = issue.clone();
-                let mode = auto_view_mode(&issue, app.team_config());
+            // Auto-update view mode for newly selected item
+            if let Some(item) = app.selected_item() {
+                let item = item.clone();
+                let mode = auto_view_mode(&item, app.team_config());
                 if app.view_mode == ViewMode::Default {
                     app.view_mode = mode;
                 }
@@ -926,10 +956,10 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
             app.update_warnings = warnings;
         }
 
-        AppEvent::IssueRefreshed(issue) => {
-            let issue = *issue;
-            app.refreshing_issues.remove(&issue.key);
-            apply_issue_refresh(&mut app.issues, &mut app.sources, issue);
+        AppEvent::IssueRefreshed(item) => {
+            let item = *item;
+            app.refreshing_issues.remove(item.key());
+            apply_issue_refresh(&mut app.issues, &mut app.sources, item);
         }
 
         AppEvent::IssueRefreshError { issue_key, error } => {
@@ -1186,7 +1216,7 @@ fn rebuild_project_picker_items(app: &mut AppState) {
 
     // Names for team projects come from any loaded issue we've seen.
     let mut team_names: HashMap<String, String> = HashMap::new();
-    for issue in &app.issues {
+    for issue in app.issues.iter().filter_map(WorkItem::as_jira) {
         let k = issue.fields.project.key.to_uppercase();
         if team_keys_set.contains(&k) {
             team_names
@@ -1302,7 +1332,8 @@ fn apply_search_jira_result(
                 if local_keys.contains(issue.key.as_str()) {
                     continue;
                 }
-                if let Some(mut hit) = crate::tui::search::score_local(query, filters, issue) {
+                if let Some(mut hit) = crate::tui::search::score_local_issue(query, filters, issue)
+                {
                     hit.origin = crate::tui::search::HitOrigin::Jira;
                     hits.push(hit);
                 }
@@ -1324,23 +1355,23 @@ fn apply_search_jira_result(
     }
 }
 
-/// Patch a refreshed issue into both the flat `issues` list and the owning
-/// source's `Vec<Issue>`. Silently drops if the issue isn't found in either
+/// Patch a refreshed item into both the flat `issues` list and the owning
+/// source's item list. Silently drops if the item isn't found in either
 /// — e.g. team switched while the refresh was in flight, or the issue was
 /// deleted server-side.
 fn apply_issue_refresh(
-    issues: &mut [Issue],
+    issues: &mut [WorkItem],
     sources: &mut IndexMap<String, SourceState>,
-    issue: Issue,
+    item: WorkItem,
 ) {
-    if let Some(slot) = issues.iter_mut().find(|i| i.key == issue.key) {
-        *slot = issue.clone();
+    if let Some(slot) = issues.iter_mut().find(|i| i.key() == item.key()) {
+        *slot = item.clone();
     }
-    if let Some(source_id) = &issue.source_id
-        && let Some(SourceState::Loaded(source_issues)) = sources.get_mut(source_id)
-        && let Some(slot) = source_issues.iter_mut().find(|i| i.key == issue.key)
+    if let Some(source_id) = item.source_id().map(str::to_owned)
+        && let Some(SourceState::Loaded(source_items)) = sources.get_mut(&source_id)
+        && let Some(slot) = source_items.iter_mut().find(|i| i.key() == item.key())
     {
-        *slot = issue;
+        *slot = item;
     }
 }
 
@@ -1372,6 +1403,7 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
         ActionResult::IssueCreated { key } => {
             app.action_state = ActionState::IssueCreatedConfirm { key };
         }
+        ActionResult::TaskCompleted { ref item_key } => apply_task_completed(app, item_key),
         ActionResult::Hidden { ref issue_key } => apply_hidden(app, issue_key),
         ActionResult::TransitionApplied {
             ref issue_key,
@@ -1452,8 +1484,24 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
     }
 }
 
+/// Flip a completed Confluence task's status in both the flat list and the
+/// owning source's list (mirrors `apply_issue_refresh`).
+fn apply_task_completed(app: &mut AppState, item_key: &str) {
+    if let Some(WorkItem::Confluence(task)) = app.issues.iter_mut().find(|i| i.key() == item_key) {
+        task.set_complete();
+    }
+    for state in app.sources.values_mut() {
+        if let SourceState::Loaded(items) = state
+            && let Some(WorkItem::Confluence(task)) = items.iter_mut().find(|i| i.key() == item_key)
+        {
+            task.set_complete();
+        }
+    }
+    app.action_state = ActionState::None;
+}
+
 fn apply_hidden(app: &mut AppState, issue_key: &str) {
-    app.issues.retain(|i| i.key != issue_key);
+    app.issues.retain(|i| i.key() != issue_key);
     app.rebuild_nav();
     app.action_state = ActionState::None;
 }
@@ -1485,14 +1533,14 @@ fn apply_field_names_loaded(
 }
 
 fn apply_transition_applied(app: &mut AppState, issue_key: &str, new_status: &str) {
-    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key) {
+    if let Some(issue) = app.jira_issue_mut(issue_key) {
         issue.fields.status.name = new_status.to_string();
     }
     app.action_state = ActionState::None;
 }
 
 fn apply_moved_to_project(app: &mut AppState, issue_key: &str, project: &str) {
-    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key) {
+    if let Some(issue) = app.jira_issue_mut(issue_key) {
         issue.fields.project.key = project.to_string();
     }
     app.action_state = ActionState::None;
@@ -1503,7 +1551,7 @@ fn apply_attachment_uploaded(
     issue_key: &str,
     new_attachment: crate::jira::types::Attachment,
 ) {
-    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key) {
+    if let Some(issue) = app.jira_issue_mut(issue_key) {
         issue
             .fields
             .attachment
@@ -1546,7 +1594,7 @@ fn handle_attachment_cached(
 }
 
 fn apply_comment_posted(app: &mut AppState, issue_key: &str, new_comment: Comment) {
-    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key) {
+    if let Some(issue) = app.jira_issue_mut(issue_key) {
         let list = issue
             .fields
             .comment
@@ -1567,7 +1615,7 @@ fn apply_field_updated(
     new_value: &serde_json::Value,
 ) {
     // Update in-memory field value immediately (no re-fetch needed)
-    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key) {
+    if let Some(issue) = app.jira_issue_mut(issue_key) {
         issue
             .fields
             .extra
@@ -1579,7 +1627,7 @@ fn apply_field_updated(
 fn apply_assigned_to_me(app: &mut AppState, issue_key: &str) {
     // Mark assignee as current user in the list (best-effort display update)
     if let Some(ref me) = app.current_user.clone()
-        && let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key)
+        && let Some(issue) = app.jira_issue_mut(issue_key)
     {
         issue.fields.assignee = Some(crate::jira::types::UserField {
             name: None,
@@ -1590,7 +1638,7 @@ fn apply_assigned_to_me(app: &mut AppState, issue_key: &str) {
 }
 
 fn apply_comment_edit(app: &mut AppState, issue_key: &str, updated_comment: &Comment) {
-    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key)
+    if let Some(issue) = app.jira_issue_mut(issue_key)
         && let Some(list) = &mut issue.fields.comment
         && let Some(c) = list
             .comments
@@ -1603,7 +1651,7 @@ fn apply_comment_edit(app: &mut AppState, issue_key: &str, updated_comment: &Com
 }
 
 fn apply_comment_deleted(app: &mut AppState, issue_key: &str, comment_id: &str) {
-    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key)
+    if let Some(issue) = app.jira_issue_mut(issue_key)
         && let Some(list) = &mut issue.fields.comment
     {
         list.comments.retain(|c| c.id != comment_id);
@@ -1622,7 +1670,7 @@ fn apply_comment_deleted(app: &mut AppState, issue_key: &str, comment_id: &str) 
 }
 
 fn apply_attachment_deleted(app: &mut AppState, issue_key: &str, attachment_id: &str) {
-    if let Some(issue) = app.issues.iter_mut().find(|i| i.key == issue_key)
+    if let Some(issue) = app.jira_issue_mut(issue_key)
         && let Some(ref mut atts) = issue.fields.attachment
     {
         atts.retain(|a| a.id != attachment_id);
@@ -2308,6 +2356,7 @@ fn start_attachment_delete(app: &mut AppState) {
     };
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
     use crossterm::event::{Event, KeyEvent};
 
@@ -2355,6 +2404,10 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
             handle_confirm_field_edit_input(app, &event);
             return;
         }
+        ActionState::ConfirmingCompleteTask { .. } => {
+            handle_complete_task_confirm_input(app, &event);
+            return;
+        }
         ActionState::Searching { .. } => {
             handle_search_input(app, event);
             return;
@@ -2382,6 +2435,7 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
         ActionState::AwaitingAction { .. }
         | ActionState::LoadingTransitions { .. }
         | ActionState::PendingTransition { .. }
+        | ActionState::PendingCompleteTask { .. }
         | ActionState::PendingHide { .. }
         | ActionState::PendingAssign { .. }
         | ActionState::PendingMove { .. }
@@ -2464,14 +2518,16 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
             }
         }
         (KeyCode::Char('v'), _) => {
-            // Cycle view modes manually
+            // Cycle view modes manually. Items without comments/attachments
+            // (non-Jira) skip those modes entirely.
+            let has_subviews = app.selected_item().is_none_or(WorkItem::supports_comments);
             app.view_mode = match &app.view_mode {
-                ViewMode::Default | ViewMode::Custom(_) => ViewMode::Comments,
-                ViewMode::Comments => ViewMode::Attachments,
-                ViewMode::Attachments => {
-                    // Return to the natural view for the current issue
-                    app.selected_issue().map_or(ViewMode::Default, |issue| {
-                        auto_view_mode(&issue.clone(), app.team_config())
+                ViewMode::Default | ViewMode::Custom(_) if has_subviews => ViewMode::Comments,
+                ViewMode::Comments if has_subviews => ViewMode::Attachments,
+                _ => {
+                    // Return to the natural view for the current item
+                    app.selected_item().map_or(ViewMode::Default, |item| {
+                        auto_view_mode(&item.clone(), app.team_config())
                     })
                 }
             };
@@ -2484,17 +2540,12 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
             app.detail_scroll = app.detail_scroll.saturating_sub(10);
         }
         (KeyCode::Char('o'), _) => {
-            if let Some(issue) = app.selected_issue() {
-                let url = format!("{}/browse/{}", app.team_jira().base_url, issue.key);
+            if let Some(item) = app.selected_item() {
+                let url = item.browse_url(&app.team_jira().base_url);
                 let _ = open::that(url);
             }
         }
-        (KeyCode::Char('t'), _) => {
-            if let Some(issue) = app.selected_issue() {
-                let key = issue.key.clone();
-                app.action_state = ActionState::LoadingTransitions { issue_key: key };
-            }
-        }
+        (KeyCode::Char('t'), _) => key_change_status(app),
         (KeyCode::Char('c'), _) => {
             if let Some(issue) = app.selected_issue() {
                 let key = issue.key.clone();
@@ -2575,7 +2626,7 @@ fn key_open_search(app: &mut AppState) {
     let mut local_results: Vec<RankedHit> = app
         .issues
         .iter()
-        .filter_map(|i| crate::tui::search::score_local("", &filters, i))
+        .filter_map(|item| crate::tui::search::score_local("", &filters, item))
         .collect();
     sort_hits(&mut local_results);
     app.action_state = ActionState::Searching {
@@ -2746,10 +2797,10 @@ fn handle_search_input(app: &mut AppState, event: crossterm::event::Event) {
     }
 }
 
-fn recompute_local(issues: &[Issue], query: &str, filters: &SearchFilters) -> Vec<RankedHit> {
-    let mut hits: Vec<RankedHit> = issues
+fn recompute_local(items: &[WorkItem], query: &str, filters: &SearchFilters) -> Vec<RankedHit> {
+    let mut hits: Vec<RankedHit> = items
         .iter()
-        .filter_map(|i| crate::tui::search::score_local(query, filters, i))
+        .filter_map(|item| crate::tui::search::score_local(query, filters, item))
         .collect();
     sort_hits(&mut hits);
     hits
@@ -3072,7 +3123,7 @@ fn commit_search_selection(app: &mut AppState) {
                     let key = hits.get(jira_idx).map(|h| h.issue_key.clone());
                     let is_in_local = key
                         .as_deref()
-                        .is_some_and(|k| app.issues.iter().any(|i| i.key == k));
+                        .is_some_and(|k| app.issues.iter().any(|i| i.key() == k));
                     if let Some(k) = key {
                         if !is_in_local
                             && let Some(issue) = issues.iter().find(|i| i.key == k).cloned()
@@ -3092,7 +3143,7 @@ fn commit_search_selection(app: &mut AppState) {
     app.action_state = ActionState::None;
     // Focus the picked issue in the main list.
     if let Some(pos) = app.nav_items.iter().position(
-        |n| matches!(n, NavItem::Issue(idx) if app.issues.get(*idx).is_some_and(|i| i.key == key)),
+        |n| matches!(n, NavItem::Issue(idx) if app.issues.get(*idx).is_some_and(|i| i.key() == key)),
     ) {
         app.nav_idx = pos;
     }
@@ -3106,17 +3157,17 @@ const SEARCH_RESULTS_SOURCE_ID: &str = "_search_results";
 
 /// Inject a Jira-only search hit into the team's local list under a synthetic
 /// "Search Results" source group so the issue stays navigable + actionable.
-fn inject_jira_search_result(app: &mut AppState, mut issue: Issue) {
-    issue.source_id = Some(SEARCH_RESULTS_SOURCE_ID.into());
-    issue.subsource_idx = 0;
+fn inject_jira_search_result(app: &mut AppState, issue: Issue) {
+    let mut item = WorkItem::Jira(issue);
+    item.set_source(SEARCH_RESULTS_SOURCE_ID.into(), 0);
     if let Some(SourceState::Loaded(existing)) = app.sources.get_mut(SEARCH_RESULTS_SOURCE_ID) {
-        if !existing.iter().any(|i| i.key == issue.key) {
-            existing.push(issue);
+        if !existing.iter().any(|i| i.key() == item.key()) {
+            existing.push(item);
         }
     } else {
         app.sources.insert(
             SEARCH_RESULTS_SOURCE_ID.into(),
-            SourceState::Loaded(vec![issue]),
+            SourceState::Loaded(vec![item]),
         );
     }
     app.rebuild_issues();
@@ -3149,6 +3200,7 @@ fn key_refresh_focused(app: &mut AppState) {
 }
 
 fn key_refresh_current_issue(app: &mut AppState) {
+    // Single-item refresh is a Jira-only capability (fetch by issue key).
     let Some(issue) = app.selected_issue() else {
         return;
     };
@@ -3171,7 +3223,7 @@ fn key_nav_down(app: &mut AppState) {
         && matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
     {
         let view_cfg = crate::tui::views::custom::current_view_config(app);
-        let num_fields = crate::tui::views::custom::num_view_fields(view_cfg, app.selected_issue());
+        let num_fields = crate::tui::views::custom::num_view_fields(view_cfg, app.selected_item());
         app.detail_focus = match &app.detail_focus {
             DetailFocus::Comments => DetailFocus::Attachments,
             DetailFocus::Attachments => {
@@ -3202,9 +3254,16 @@ fn key_nav_up(app: &mut AppState) {
     if app.focused_panel == FocusedPanel::Detail
         && matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
     {
+        let has_widgets = app.selected_item().is_none_or(WorkItem::supports_comments);
         app.detail_focus = match &app.detail_focus {
             DetailFocus::Comments | DetailFocus::Attachments => DetailFocus::Comments,
-            DetailFocus::Field(0) => DetailFocus::Attachments,
+            DetailFocus::Field(0) => {
+                if has_widgets {
+                    DetailFocus::Attachments
+                } else {
+                    DetailFocus::Field(0)
+                }
+            }
             DetailFocus::Field(i) => DetailFocus::Field(i - 1),
         };
         auto_scroll_to_field(app);
@@ -3216,10 +3275,20 @@ fn key_nav_up(app: &mut AppState) {
     }
 }
 
+/// The first focusable detail element: the Comments widget for Jira issues,
+/// the first field for items without comment/attachment widgets.
+fn first_detail_focus(item: Option<&WorkItem>) -> DetailFocus {
+    if item.is_none_or(WorkItem::supports_comments) {
+        DetailFocus::Comments
+    } else {
+        DetailFocus::Field(0)
+    }
+}
+
 fn key_jump_first(app: &mut AppState) {
     if app.focused_panel == FocusedPanel::Detail {
         if matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) {
-            app.detail_focus = DetailFocus::Comments;
+            app.detail_focus = first_detail_focus(app.selected_item());
             auto_scroll_to_field(app);
         } else {
             app.detail_scroll = 0;
@@ -3235,7 +3304,7 @@ fn key_jump_last(app: &mut AppState) {
         if matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) {
             let view_cfg = crate::tui::views::custom::current_view_config(app);
             let num_fields =
-                crate::tui::views::custom::num_view_fields(view_cfg, app.selected_issue());
+                crate::tui::views::custom::num_view_fields(view_cfg, app.selected_item());
             app.detail_focus = if num_fields > 0 {
                 DetailFocus::Field(num_fields - 1)
             } else {
@@ -3253,12 +3322,80 @@ fn key_jump_last(app: &mut AppState) {
     }
 }
 
+/// `t` — "change status": Jira issues open the transition picker; Confluence
+/// tasks get a mark-complete confirmation.
+fn key_change_status(app: &mut AppState) {
+    let Some(item) = app.selected_item() else {
+        return;
+    };
+    if item.supports_complete() {
+        if let Some(task) = item.as_confluence()
+            && task.status == crate::confluence::types::TaskStatus::Incomplete
+        {
+            app.action_state = ActionState::ConfirmingCompleteTask {
+                item_key: item.key().to_owned(),
+                task_id: task.id.clone(),
+                selected: 1, // default to No
+            };
+        }
+        return;
+    }
+    if let Some(issue) = item.as_jira() {
+        app.action_state = ActionState::LoadingTransitions {
+            issue_key: issue.key.clone(),
+        };
+    }
+}
+
+fn handle_complete_task_confirm_input(app: &mut AppState, event: &crossterm::event::Event) {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let Event::Key(KeyEvent {
+        code, modifiers, ..
+    }) = *event
+    else {
+        return;
+    };
+    let ActionState::ConfirmingCompleteTask {
+        item_key,
+        task_id,
+        selected,
+    } = &app.action_state.clone()
+    else {
+        return;
+    };
+    match (code, modifiers) {
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        (KeyCode::Esc | KeyCode::Char('q'), _) => {
+            app.action_state = ActionState::None;
+        }
+        (KeyCode::Left | KeyCode::Char('h' | 'l') | KeyCode::Right | KeyCode::Tab, _) => {
+            app.action_state = ActionState::ConfirmingCompleteTask {
+                item_key: item_key.clone(),
+                task_id: task_id.clone(),
+                selected: 1 - selected,
+            };
+        }
+        (KeyCode::Enter, _) => {
+            if *selected == 0 {
+                app.action_state = ActionState::PendingCompleteTask {
+                    item_key: item_key.clone(),
+                    task_id: task_id.clone(),
+                };
+            } else {
+                app.action_state = ActionState::None;
+            }
+        }
+        _ => {}
+    }
+}
+
 fn key_hide(app: &mut AppState) {
-    if let Some(issue) = app.selected_issue() {
-        let key = issue.key.clone();
-        let can_hide = issue
-            .source_id
-            .as_deref()
+    if let Some(item) = app.selected_item() {
+        let key = item.key().to_owned();
+        let can_hide = item
+            .source_id()
             .and_then(|id| source_config_for(app.team_config(), id))
             .is_some_and(|s| s.allow_hide_for_a_day);
         if can_hide {
@@ -3305,13 +3442,13 @@ fn key_move(app: &mut AppState) {
 }
 
 fn update_view_mode_on_navigate(app: &mut AppState) {
-    if let Some(issue) = app.selected_issue() {
-        let issue = issue.clone();
-        app.view_mode = auto_view_mode(&issue, app.team_config());
+    if let Some(item) = app.selected_item() {
+        let item = item.clone();
+        app.view_mode = auto_view_mode(&item, app.team_config());
     }
     app.detail_scroll = 0;
     app.overlay = None;
-    app.detail_focus = DetailFocus::Comments;
+    app.detail_focus = first_detail_focus(app.selected_item());
     app.detail_focus_offsets.clear();
     app.flags.field_names = FieldNamesState::Idle;
 }
@@ -3362,23 +3499,28 @@ fn slack_deep_link(url: &str, team_id: Option<&str>) -> Option<String> {
 
 #[allow(clippy::too_many_lines)]
 fn key_edit_detail_field(app: &mut AppState) {
-    let Some(issue) = app.selected_issue() else {
+    let Some(item) = app.selected_item() else {
         return;
     };
-    let issue = issue.clone();
+    let item = item.clone();
 
-    // Nav widget: open as popup overlay (one layer deeper)
+    // Nav widget: open as popup overlay (one layer deeper). Only Jira items
+    // have these widgets.
     match &app.detail_focus {
         DetailFocus::Comments => {
-            app.overlay = Some(SubView::Comments);
-            app.overlay_scroll = 0;
+            if item.supports_comments() {
+                app.overlay = Some(SubView::Comments);
+                app.overlay_scroll = 0;
+            }
             return;
         }
         DetailFocus::Attachments => {
-            app.overlay = Some(SubView::Attachments);
-            app.overlay_scroll = 0;
-            app.overlay_focused_attachment = 0;
-            maybe_fetch_attachment_preview(app);
+            if item.supports_comments() {
+                app.overlay = Some(SubView::Attachments);
+                app.overlay_scroll = 0;
+                app.overlay_focused_attachment = 0;
+                maybe_fetch_attachment_preview(app);
+            }
             return;
         }
         DetailFocus::Field(_) => {}
@@ -3390,17 +3532,18 @@ fn key_edit_detail_field(app: &mut AppState) {
     };
     let view_cfg = crate::tui::views::custom::current_view_config(app);
     let (field_id, original_json) =
-        crate::tui::views::custom::view_editable_field_spec(view_cfg, &issue, field_idx);
+        crate::tui::views::custom::view_editable_field_spec(view_cfg, &item, field_idx);
 
     if field_id.is_empty() {
         return;
     }
 
-    let field_cfg = crate::tui::views::custom::view_field_cfg(view_cfg, Some(&issue), field_idx);
+    let field_cfg = crate::tui::views::custom::view_field_cfg(view_cfg, Some(&item), field_idx);
 
     // Readonly fields: open URL if the value is a link, otherwise do nothing.
+    // Items without field editing (non-Jira) treat every field as readonly.
     // Slack URLs are opened in the Slack desktop app by default.
-    if field_cfg.as_ref().and_then(|f| f.readonly).unwrap_or(false) {
+    if field_cfg.as_ref().and_then(|f| f.readonly).unwrap_or(false) || !item.supports_field_edit() {
         if let serde_json::Value::String(s) = &original_json
             && (s.starts_with("http://") || s.starts_with("https://"))
         {
@@ -3451,7 +3594,7 @@ fn key_edit_detail_field(app: &mut AppState) {
                 date_only,
             );
             app.action_state = ActionState::EditingDatetimeField {
-                issue_key: issue.key,
+                issue_key: item.key().to_owned(),
                 field_id,
                 label,
                 description,
@@ -3474,7 +3617,7 @@ fn key_edit_detail_field(app: &mut AppState) {
         let field_is_empty = original_json.is_null() || current_value.is_empty();
         if field_is_empty && !templates.is_empty() {
             app.action_state = ActionState::OfferingTemplate {
-                issue_key: issue.key,
+                issue_key: item.key().to_owned(),
                 field_id,
                 templates,
                 cursor: 0,
@@ -3485,7 +3628,7 @@ fn key_edit_detail_field(app: &mut AppState) {
             return;
         }
         app.action_state = ActionState::PendingFieldEdit {
-            issue_key: issue.key,
+            issue_key: item.key().to_owned(),
             field_id,
             current_value,
             original_json,
@@ -3495,7 +3638,7 @@ fn key_edit_detail_field(app: &mut AppState) {
 
     set_detail_edit_state(
         app,
-        issue.key,
+        item.key().to_owned(),
         field_id,
         field_idx,
         label,
@@ -4312,6 +4455,14 @@ mod tests {
     use super::*;
     use crate::jira::types::{IssueFields, IssueTypeField, ProjectField, StatusField};
 
+    fn make_item(key: &str, status: &str, source_id: Option<&str>) -> WorkItem {
+        WorkItem::Jira(make_issue(key, status, source_id))
+    }
+
+    fn item_status(item: &WorkItem) -> &str {
+        item.status_name()
+    }
+
     fn make_issue(key: &str, status: &str, source_id: Option<&str>) -> Issue {
         Issue {
             id: format!("id-{key}"),
@@ -4348,55 +4499,55 @@ mod tests {
     fn apply_issue_refresh_replaces_in_both_lists() {
         let src = "src-1";
         let mut issues = vec![
-            make_issue("A-1", "To Do", Some(src)),
-            make_issue("A-2", "To Do", Some(src)),
+            make_item("A-1", "To Do", Some(src)),
+            make_item("A-2", "To Do", Some(src)),
         ];
         let mut sources = IndexMap::new();
         sources.insert(src.to_string(), SourceState::Loaded(issues.clone()));
 
-        let refreshed = make_issue("A-1", "Done", Some(src));
+        let refreshed = make_item("A-1", "Done", Some(src));
         apply_issue_refresh(&mut issues, &mut sources, refreshed);
 
-        assert_eq!(issues[0].fields.status.name, "Done");
-        assert_eq!(issues[1].fields.status.name, "To Do");
+        assert_eq!(item_status(&issues[0]), "Done");
+        assert_eq!(item_status(&issues[1]), "To Do");
         let SourceState::Loaded(src_issues) = sources.get(src).unwrap() else {
             panic!("expected Loaded");
         };
-        assert_eq!(src_issues[0].fields.status.name, "Done");
-        assert_eq!(src_issues[1].fields.status.name, "To Do");
+        assert_eq!(item_status(&src_issues[0]), "Done");
+        assert_eq!(item_status(&src_issues[1]), "To Do");
     }
 
     #[test]
     fn apply_issue_refresh_silently_drops_missing_key() {
         let src = "src-1";
-        let mut issues = vec![make_issue("A-1", "To Do", Some(src))];
+        let mut issues = vec![make_item("A-1", "To Do", Some(src))];
         let mut sources = IndexMap::new();
         sources.insert(src.to_string(), SourceState::Loaded(issues.clone()));
 
-        let refreshed = make_issue("Z-9", "Done", Some(src));
+        let refreshed = make_item("Z-9", "Done", Some(src));
         apply_issue_refresh(&mut issues, &mut sources, refreshed);
 
         assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].key, "A-1");
+        assert_eq!(issues[0].key(), "A-1");
         let SourceState::Loaded(src_issues) = sources.get(src).unwrap() else {
             panic!("expected Loaded");
         };
         assert_eq!(src_issues.len(), 1);
-        assert_eq!(src_issues[0].key, "A-1");
+        assert_eq!(src_issues[0].key(), "A-1");
     }
 
     #[test]
     fn apply_issue_refresh_skips_source_when_not_loaded() {
         let src = "src-1";
-        let mut issues = vec![make_issue("A-1", "To Do", Some(src))];
+        let mut issues = vec![make_item("A-1", "To Do", Some(src))];
         let mut sources = IndexMap::new();
         sources.insert(src.to_string(), SourceState::Loading);
 
-        let refreshed = make_issue("A-1", "Done", Some(src));
+        let refreshed = make_item("A-1", "Done", Some(src));
         apply_issue_refresh(&mut issues, &mut sources, refreshed);
 
         // Flat list updated, source state untouched (still Loading).
-        assert_eq!(issues[0].fields.status.name, "Done");
+        assert_eq!(item_status(&issues[0]), "Done");
         assert!(matches!(sources.get(src), Some(SourceState::Loading)));
     }
 

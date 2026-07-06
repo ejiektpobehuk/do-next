@@ -6,7 +6,10 @@ pub mod updates;
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
-use types::{Config, JiraConfig, ResolvedTeam, TeamConfig, TeamJiraOverride, TeamRef};
+use types::{
+    Config, ConfluenceConfig, JiraConfig, ResolvedTeam, SourceKind, TeamConfig, TeamJiraOverride,
+    TeamRef,
+};
 
 /// Result of loading user config + all team configs.
 pub struct LoadedConfig {
@@ -35,6 +38,11 @@ pub fn load() -> Result<LoadedConfig> {
                     load_errors.push(format!("team '{}': {w}", team_ref.id));
                 }
                 let jira = resolve_team_jira(&config.jira, &team_config);
+                let confluence = resolve_team_confluence(
+                    &jira,
+                    config.confluence.as_ref(),
+                    team_config.confluence.as_ref(),
+                );
                 let open_slack_in_app = team_config
                     .open_slack_in_app
                     .or(config.open_slack_in_app)
@@ -48,6 +56,7 @@ pub fn load() -> Result<LoadedConfig> {
                     path: team_ref.path.clone(),
                     config: team_config,
                     jira,
+                    confluence,
                     open_slack_in_app,
                     slack_team_id,
                 });
@@ -93,6 +102,9 @@ fn load_team_config(team_ref: &TeamRef) -> Result<(TeamConfig, Vec<String>)> {
 }
 
 fn validate_team_config(team: &TeamConfig) -> Result<()> {
+    for source in &team.sources {
+        validate_source_config(source)?;
+    }
     for (view_id, view) in &team.views {
         for section in &view.sections {
             for field in &section.fields {
@@ -189,6 +201,244 @@ mod tests {
             ..Default::default()
         });
         assert!(validate_team_config(&team).is_ok());
+    }
+
+    // ── Source kinds ─────────────────────────────────────────────────────
+
+    use crate::config::types::{ConfluenceFilters, SourceConfig};
+
+    #[test]
+    fn source_without_kind_parses_as_jira() {
+        let src: SourceConfig =
+            json5::from_str(r#"{ id: "mine", jql: "assignee = currentUser()" }"#).unwrap();
+        assert_eq!(src.kind, SourceKind::Jira);
+        assert_eq!(src.jql, "assignee = currentUser()");
+        assert!(src.confluence.is_none());
+    }
+
+    #[test]
+    fn confluence_source_parses_with_filters() {
+        let src: SourceConfig = json5::from_str(
+            r#"{
+                id: "actions",
+                kind: "confluence",
+                confluence: { spaces: ["ENG"], status: "incomplete", due_before: "2026-08-01" },
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(src.kind, SourceKind::Confluence);
+        let filters = src.confluence.unwrap();
+        assert_eq!(filters.spaces, vec!["ENG"]);
+        assert_eq!(filters.status.as_deref(), Some("incomplete"));
+        assert!(!filters.include_blank);
+        assert!(
+            validate_source_config(
+                &json5::from_str::<SourceConfig>(r#"{ id: "actions", kind: "confluence" }"#)
+                    .unwrap()
+            )
+            .is_ok()
+        );
+    }
+
+    fn confluence_source(filters: ConfluenceFilters) -> SourceConfig {
+        SourceConfig {
+            id: "actions".into(),
+            kind: SourceKind::Confluence,
+            confluence: Some(filters),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn jira_source_rejects_confluence_block() {
+        let src = SourceConfig {
+            id: "mine".into(),
+            jql: "assignee = currentUser()".into(),
+            confluence: Some(ConfluenceFilters::default()),
+            ..Default::default()
+        };
+        let err = validate_source_config(&src).expect_err("must reject");
+        assert!(err.to_string().contains("confluence"));
+    }
+
+    #[test]
+    fn confluence_source_rejects_jql() {
+        let src = SourceConfig {
+            id: "actions".into(),
+            kind: SourceKind::Confluence,
+            jql: "assignee = currentUser()".into(),
+            ..Default::default()
+        };
+        assert!(validate_source_config(&src).is_err());
+    }
+
+    #[test]
+    fn confluence_filters_validate_status_dates_and_pages() {
+        let bad_status = confluence_source(ConfluenceFilters {
+            status: Some("done".into()),
+            ..Default::default()
+        });
+        assert!(validate_source_config(&bad_status).is_err());
+
+        let bad_date = confluence_source(ConfluenceFilters {
+            due_before: Some("next week".into()),
+            ..Default::default()
+        });
+        assert!(validate_source_config(&bad_date).is_err());
+
+        let bad_page = confluence_source(ConfluenceFilters {
+            pages: vec!["My Page".into()],
+            ..Default::default()
+        });
+        assert!(validate_source_config(&bad_page).is_err());
+
+        let ok = confluence_source(ConfluenceFilters {
+            status: Some("any".into()),
+            due_before: Some("2026-08-01".into()),
+            pages: vec!["12345".into()],
+            assignee: Some("me".into()),
+            ..Default::default()
+        });
+        assert!(validate_source_config(&ok).is_ok());
+    }
+
+    // ── Confluence connection resolution ─────────────────────────────────
+
+    #[test]
+    fn confluence_defaults_to_effective_jira() {
+        let jira = JiraConfig {
+            base_url: "https://acme.atlassian.net".into(),
+            email: Some("me@acme.com".into()),
+            ..Default::default()
+        };
+        let conf = resolve_team_confluence(&jira, None, None);
+        assert_eq!(conf, jira);
+    }
+
+    #[test]
+    fn confluence_override_precedence_is_team_over_user_over_jira() {
+        let jira = JiraConfig {
+            base_url: "https://acme.atlassian.net".into(),
+            email: Some("me@acme.com".into()),
+            ..Default::default()
+        };
+        let user = ConfluenceConfig {
+            base_url: Some("https://wiki.acme.com".into()),
+            credential_key: Some("user-key".into()),
+            ..Default::default()
+        };
+        let team = ConfluenceConfig {
+            credential_key: Some("team-key".into()),
+            ..Default::default()
+        };
+        let conf = resolve_team_confluence(&jira, Some(&user), Some(&team));
+        assert_eq!(conf.base_url, "https://wiki.acme.com");
+        assert_eq!(conf.credential_key.as_deref(), Some("team-key"));
+        assert_eq!(conf.email.as_deref(), Some("me@acme.com"));
+    }
+}
+
+fn validate_source_config(source: &types::SourceConfig) -> Result<()> {
+    match source.kind {
+        SourceKind::Jira => {
+            if source.confluence.is_some() {
+                return Err(anyhow!(
+                    "source '{}': `confluence` filters are only valid with `kind: \"confluence\"`",
+                    source.id
+                ));
+            }
+        }
+        SourceKind::Confluence => {
+            if !source.jql.is_empty() {
+                return Err(anyhow!(
+                    "source '{}': `jql` is not valid for a confluence source",
+                    source.id
+                ));
+            }
+            if !source.subsources.is_empty() {
+                return Err(anyhow!(
+                    "source '{}': `subsources` are not valid for a confluence source",
+                    source.id
+                ));
+            }
+            if source.expected_project.is_some() {
+                return Err(anyhow!(
+                    "source '{}': `expected_project` is not valid for a confluence source",
+                    source.id
+                ));
+            }
+            if let Some(filters) = &source.confluence {
+                validate_confluence_filters(&source.id, filters)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_confluence_filters(source_id: &str, filters: &types::ConfluenceFilters) -> Result<()> {
+    if let Some(status) = filters.status.as_deref()
+        && !matches!(status, "incomplete" | "complete" | "any")
+    {
+        return Err(anyhow!(
+            "source '{source_id}': `status` must be \"incomplete\", \"complete\" or \"any\" (got \"{status}\")"
+        ));
+    }
+    for (label, value) in [
+        ("due_before", &filters.due_before),
+        ("due_after", &filters.due_after),
+    ] {
+        if let Some(date) = value
+            && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err()
+        {
+            return Err(anyhow!(
+                "source '{source_id}': `{label}` must be a YYYY-MM-DD date (got \"{date}\")"
+            ));
+        }
+    }
+    for page in &filters.pages {
+        if page.is_empty() || !page.chars().all(|c| c.is_ascii_digit()) {
+            return Err(anyhow!(
+                "source '{source_id}': `pages` entries must be numeric page IDs (got \"{page}\")"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Merge the effective Confluence connection config: team confluence override
+/// → user confluence config → the team's effective Jira config. Expressed as
+/// a `JiraConfig` so `credentials::resolve_auth` applies unchanged.
+fn resolve_team_confluence(
+    effective_jira: &JiraConfig,
+    user: Option<&ConfluenceConfig>,
+    team: Option<&ConfluenceConfig>,
+) -> JiraConfig {
+    let mut conf = effective_jira.clone();
+    for overlay in [user, team].into_iter().flatten() {
+        apply_confluence_override(&mut conf, overlay);
+    }
+    conf
+}
+
+fn apply_confluence_override(base: &mut JiraConfig, overlay: &ConfluenceConfig) {
+    if let Some(ref v) = overlay.base_url {
+        base.base_url.clone_from(v);
+    }
+    if overlay.email.is_some() {
+        base.email.clone_from(&overlay.email);
+    }
+    if overlay.credential_command.is_some() {
+        base.credential_command
+            .clone_from(&overlay.credential_command);
+    }
+    if overlay.credential_store.is_some() {
+        base.credential_store.clone_from(&overlay.credential_store);
+    }
+    if overlay.credential_key.is_some() {
+        base.credential_key.clone_from(&overlay.credential_key);
+    }
+    if overlay.auth_method.is_some() {
+        base.auth_method.clone_from(&overlay.auth_method);
     }
 }
 

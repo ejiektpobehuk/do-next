@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::config::types::SourceConfig;
+use crate::items::WorkItem;
 use crate::tui::app::{AppState, NavItem, SourceState, source_config_for};
 use crate::tui::theme;
 use crate::tui::widgets::scrollbar::render_scrollbar;
@@ -129,14 +130,12 @@ fn push_loaded_source_items(
     issue_pos: &mut usize,
 ) {
     let start = *issue_pos;
-    while *issue_pos < app.issues.len()
-        && app.issues[*issue_pos].source_id.as_deref() == Some(source_id)
-    {
+    while *issue_pos < app.issues.len() && app.issues[*issue_pos].source_id() == Some(source_id) {
         *issue_pos += 1;
     }
-    let source_issues = &app.issues[start..*issue_pos];
+    let source_items = &app.issues[start..*issue_pos];
 
-    if source_issues.is_empty() {
+    if source_items.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "  (no issues)",
             Style::default().add_modifier(Modifier::DIM),
@@ -144,10 +143,10 @@ fn push_loaded_source_items(
         item_nav_indices.push(None);
     }
 
-    for (i, issue) in source_issues.iter().enumerate() {
+    for (i, item) in source_items.iter().enumerate() {
         let abs_idx = start + i;
-        let sub = issue.subsource_idx;
-        let is_sub_break = i > 0 && sub != source_issues[i - 1].subsource_idx;
+        let sub = item.subsource_idx();
+        let is_sub_break = i > 0 && sub != source_items[i - 1].subsource_idx();
         if is_sub_break {
             items.push(ListItem::new(Line::from(Span::raw(""))));
             item_nav_indices.push(None);
@@ -157,7 +156,7 @@ fn push_loaded_source_items(
             .iter()
             .position(|n| *n == NavItem::Issue(abs_idx));
         let is_selected = nav_pos == Some(app.nav_idx);
-        let row = issue_row(issue, src_cfg, app, is_selected);
+        let row = issue_row(item, src_cfg, app, is_selected);
         items.push(ListItem::new(row));
         item_nav_indices.push(nav_pos);
     }
@@ -207,7 +206,7 @@ fn source_separator_text(source_id: &str, src_cfg: Option<&SourceConfig>) -> Str
 }
 
 fn issue_row(
-    issue: &crate::jira::types::Issue,
+    item: &WorkItem,
     src_cfg: Option<&SourceConfig>,
     app: &AppState,
     selected: bool,
@@ -220,23 +219,44 @@ fn issue_row(
     let color = parse_color(&indication.color);
     let symbol = indication.symbol;
 
-    let key = format!("{:<12}", issue.key);
-    let priority = issue
-        .fields
-        .priority
-        .as_ref()
-        .map_or("·", super::super::jira::types::PriorityField::symbol);
-    let status = format!("{:>16}", truncate(&issue.fields.status.name, 16));
-
-    let badges = issue_badges(issue, src_cfg);
-    let summary_raw = format!("{} {}", issue.fields.summary, badges);
-    let summary = truncate(&summary_raw, 60).to_string();
-
     let base_style = if selected {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default().fg(color)
     };
+
+    // Confluence tasks have no meaningful key — label them by content and/or
+    // page name per the source's `label` option.
+    if let Some(task) = item.as_confluence() {
+        let mode = src_cfg
+            .and_then(|s| s.confluence.as_ref())
+            .map(|c| c.label)
+            .unwrap_or_default();
+        let badges = issue_badges(item, src_cfg);
+        let label_raw = if badges.is_empty() {
+            task.list_label(mode)
+        } else {
+            format!("{} {}", task.list_label(mode), badges)
+        };
+        let label = truncate(&label_raw, 74).to_string();
+        let status = format!("{:>16}", truncate(item.status_name(), 16));
+        return Line::from(vec![
+            Span::styled(format!("{symbol} "), base_style),
+            Span::styled(label, base_style),
+            Span::styled(
+                format!(" {status}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]);
+    }
+
+    let key = format!("{:<12}", item.key());
+    let priority = item.priority_symbol();
+    let status = format!("{:>16}", truncate(item.status_name(), 16));
+
+    let badges = issue_badges(item, src_cfg);
+    let summary_raw = format!("{} {}", item.title(), badges);
+    let summary = truncate(&summary_raw, 60).to_string();
 
     Line::from(vec![
         Span::styled(format!("{symbol} "), base_style),
@@ -250,15 +270,17 @@ fn issue_row(
     ])
 }
 
-fn issue_badges(issue: &crate::jira::types::Issue, src_cfg: Option<&SourceConfig>) -> String {
+fn issue_badges(item: &WorkItem, src_cfg: Option<&SourceConfig>) -> String {
     let mut badges = Vec::new();
     let Some(cfg) = src_cfg else {
         return String::new();
     };
 
-    // Wrong project badge
+    // Wrong project badge (project is a Jira concept)
     if let Some(ref expected) = cfg.expected_project
-        && issue.fields.project.key != *expected
+        && item
+            .as_jira()
+            .is_some_and(|issue| issue.fields.project.key != *expected)
     {
         badges.push("[!proj]".to_string());
     }
@@ -268,8 +290,8 @@ fn issue_badges(issue: &crate::jira::types::Issue, src_cfg: Option<&SourceConfig
         match badge.as_str() {
             "stale" => badges.push("[stale]".to_string()),
             "assignee" => {
-                if let Some(ref a) = issue.fields.assignee {
-                    badges.push(format!("@{}", a.display()));
+                if let Some(a) = item.assignee_display() {
+                    badges.push(format!("@{a}"));
                 }
             }
             _ => {}
@@ -277,7 +299,7 @@ fn issue_badges(issue: &crate::jira::types::Issue, src_cfg: Option<&SourceConfig
     }
 
     // Subsource-level badge (unassigned, reviewing, etc.)
-    if let Some(sub_cfg) = cfg.subsources.get(issue.subsource_idx)
+    if let Some(sub_cfg) = cfg.subsources.get(item.subsource_idx())
         && let Some(ref badge) = sub_cfg.badge
     {
         match badge.as_str() {

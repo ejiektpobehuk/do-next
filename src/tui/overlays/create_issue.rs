@@ -18,7 +18,7 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 
-use crate::jira::types::{FieldSchema, Issue, IssueTypeField, ProjectField, ProjectInfo};
+use crate::jira::types::{FieldSchema, IssueTypeField, ProjectField, ProjectInfo};
 use crate::tui::app::{ActionState, AppState, CacheState, edit_text};
 use crate::tui::overlays::datetime_picker::{
     self, DatetimePicker, DatetimePickerMode, TimeFocus, handle_date_key, handle_time_key,
@@ -209,11 +209,12 @@ pub fn merge_cached_projects(current: &mut Vec<ProjectField>, cached: &[ProjectI
     }
 }
 
-/// Distinct projects across the loaded issues, deduped by key, order preserved.
-pub fn distinct_projects(issues: &[Issue]) -> Vec<ProjectField> {
+/// Distinct projects across the loaded items, deduped by key, order preserved.
+/// Only Jira items carry a project.
+pub fn distinct_projects(items: &[crate::items::WorkItem]) -> Vec<ProjectField> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for issue in issues {
+    for issue in items.iter().filter_map(crate::items::WorkItem::as_jira) {
         if seen.insert(issue.fields.project.key.clone()) {
             out.push(issue.fields.project.clone());
         }
@@ -1656,34 +1657,36 @@ mod tests {
 
     #[test]
     fn distinct_projects_dedupes_by_key() {
-        let mk = |key: &str| Issue {
-            id: "1".into(),
-            key: format!("{key}-1"),
-            fields: crate::jira::types::IssueFields {
-                summary: String::new(),
-                status: crate::jira::types::StatusField {
-                    id: "1".into(),
-                    name: "Open".into(),
+        let mk = |key: &str| {
+            crate::items::WorkItem::Jira(crate::jira::types::Issue {
+                id: "1".into(),
+                key: format!("{key}-1"),
+                fields: crate::jira::types::IssueFields {
+                    summary: String::new(),
+                    status: crate::jira::types::StatusField {
+                        id: "1".into(),
+                        name: "Open".into(),
+                    },
+                    priority: None,
+                    assignee: None,
+                    reporter: None,
+                    issuetype: IssueTypeField {
+                        id: "1".into(),
+                        name: "Task".into(),
+                    },
+                    project: ProjectField {
+                        id: "1".into(),
+                        key: key.into(),
+                        name: key.into(),
+                    },
+                    description: None,
+                    comment: None,
+                    attachment: None,
+                    extra: std::collections::HashMap::new(),
                 },
-                priority: None,
-                assignee: None,
-                reporter: None,
-                issuetype: IssueTypeField {
-                    id: "1".into(),
-                    name: "Task".into(),
-                },
-                project: ProjectField {
-                    id: "1".into(),
-                    key: key.into(),
-                    name: key.into(),
-                },
-                description: None,
-                comment: None,
-                attachment: None,
-                extra: std::collections::HashMap::new(),
-            },
-            source_id: None,
-            subsource_idx: 0,
+                source_id: None,
+                subsource_idx: 0,
+            })
         };
         let issues = vec![mk("AAA"), mk("BBB"), mk("AAA")];
         let projects = distinct_projects(&issues);

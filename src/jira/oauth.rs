@@ -14,18 +14,38 @@ const AUTH_URL: &str = "https://auth.atlassian.com/authorize";
 const TOKEN_URL: &str = "https://auth.atlassian.com/oauth/token";
 const RESOURCES_URL: &str = "https://api.atlassian.com/oauth/token/accessible-resources";
 
-const SCOPES: &str = "read:jira-work write:jira-work read:jira-user offline_access";
+const JIRA_SCOPES: &str = "read:jira-work write:jira-work read:jira-user offline_access";
+
+/// Granular scopes for the Confluence v2 tasks API (read/complete inline
+/// tasks, resolve page titles and space keys, look up the current user).
+const CONFLUENCE_SCOPES: &str = "read:task:confluence write:task:confluence \
+     read:page:confluence read:space:confluence read:content-details:confluence";
+
+/// The scope string to request. Confluence granular scopes are appended only
+/// when a team defines confluence sources, since mixing classic Jira scopes
+/// with granular ones in a single authorization is not officially supported
+/// by Atlassian — if the consent screen rejects the combined set, use
+/// `auth_method: "basic"` for Confluence instead.
+fn scopes(include_confluence: bool) -> String {
+    if include_confluence {
+        format!("{JIRA_SCOPES} {CONFLUENCE_SCOPES}")
+    } else {
+        JIRA_SCOPES.to_owned()
+    }
+}
 
 /// Run the full OAuth 2.0 (3LO) authorization flow with PKCE.
 ///
 /// Opens the user's browser for Atlassian authorization, listens for the
 /// callback on a local HTTP server, exchanges the code for tokens, and
-/// resolves the cloud ID.
+/// resolves the cloud ID. `include_confluence` adds the Confluence task
+/// scopes for teams with confluence sources.
 #[allow(clippy::too_many_lines)]
 pub fn run_oauth_flow(
     client_id: &str,
     client_secret: &str,
     store: OAuthStore,
+    include_confluence: bool,
 ) -> Result<OAuthCredentials> {
     // 1. Start local HTTP server on a fixed port (must match the callback URL
     //    registered in the Atlassian Developer Console).
@@ -52,7 +72,7 @@ pub fn run_oauth_flow(
          prompt=consent&\
          code_challenge={code_challenge}&\
          code_challenge_method=S256",
-        scopes = urlencoded(SCOPES),
+        scopes = urlencoded(&scopes(include_confluence)),
         redirect_uri = urlencoded(&redirect_uri),
     );
 

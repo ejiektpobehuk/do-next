@@ -214,6 +214,18 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
                 "This action cannot be undone.",
             );
         }
+        ActionState::ConfirmingCompleteTask { selected, .. } => {
+            overlays::delete_confirm::render_delete_confirm_overlay(
+                f,
+                " Mark task complete? ",
+                *selected,
+                ("Yes", "No"),
+                "The checkbox on the Confluence page will be ticked.",
+            );
+        }
+        ActionState::PendingCompleteTask { .. } => {
+            overlays::await_spinner::render_await(f, "Completing task…", app.tick_count);
+        }
         ActionState::InlineEditingField { .. }
         | ActionState::TypingAttachmentPath { .. }
         | ActionState::None => {

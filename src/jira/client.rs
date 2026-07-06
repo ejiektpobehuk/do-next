@@ -2,13 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use reqwest::{Client, RequestBuilder};
 use serde_json::json;
 use tokio::sync::RwLock;
 
 use crate::jira::auth::Auth;
-use crate::jira::oauth;
 use crate::jira::types::{
     Attachment, Comment, FieldMeta, FieldSchema, Issue, IssueTypeField, ProjectInfo,
     SearchResponse, StatusCategory, StatusInfo, Transition, TransitionsResponse,
@@ -39,37 +37,18 @@ impl JiraClient {
         })
     }
 
+    /// The shared auth handle — passed to a `ConfluenceClient` for the same
+    /// Atlassian site so OAuth token refresh stays coordinated.
+    pub fn auth_handle(&self) -> Arc<RwLock<Auth>> {
+        self.auth.clone()
+    }
+
     async fn maybe_refresh(&self) -> Result<()> {
-        let needs_refresh = {
-            let auth = self.auth.read().await;
-            match &*auth {
-                Auth::OAuth(o) => o.expires_at - Utc::now() < chrono::Duration::seconds(60),
-                Auth::Basic(_) => false,
-            }
-        };
-
-        if needs_refresh {
-            let mut auth = self.auth.write().await;
-            // Double-check after acquiring write lock (another task may have refreshed).
-            if let Auth::OAuth(o) = &*auth
-                && o.expires_at - Utc::now() < chrono::Duration::seconds(60)
-            {
-                log::debug!("OAuth token expiring soon, refreshing");
-                let refreshed = oauth::refresh_access_token(o).await?;
-                oauth::save_oauth_tokens(&refreshed)?;
-                *auth = Auth::OAuth(refreshed);
-            }
-        }
-
-        Ok(())
+        crate::jira::auth::maybe_refresh(&self.auth).await
     }
 
     async fn apply_auth(&self, req: RequestBuilder) -> RequestBuilder {
-        let auth = self.auth.read().await;
-        match &*auth {
-            Auth::Basic(creds) => req.basic_auth(&creds.email, Some(&creds.api_token)),
-            Auth::OAuth(creds) => req.bearer_auth(&creds.access_token),
-        }
+        crate::jira::auth::apply(&self.auth, req).await
     }
 
     /// Fetch all issues matching a JQL query, paginating automatically.

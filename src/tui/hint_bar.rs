@@ -89,7 +89,7 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
     let can_move_vertical = if list_focused {
         !app.nav_items.is_empty()
     } else {
-        app.selected_issue().is_some()
+        app.selected_item().is_some()
     };
     let nav_color = |active: bool| {
         if active { Color::Blue } else { Color::DarkGray }
@@ -97,28 +97,29 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
 
     let in_detail_view = app.focused_panel == FocusedPanel::Detail
         && matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
-        && app.selected_issue().is_some();
+        && app.selected_item().is_some();
 
     let mut hints: Vec<Span> = vec![Span::raw("┤ ")];
     if in_detail_view {
         let view_cfg = crate::tui::views::custom::current_view_config(app);
-        let selected_issue = app.selected_issue();
+        let selected_item = app.selected_item();
         let enter_label = match &app.detail_focus {
             DetailFocus::Comments => Some("view comments"),
             DetailFocus::Attachments => Some("view attachments"),
             DetailFocus::Field(field_idx) => {
                 let field_idx = *field_idx;
                 let field_cfg =
-                    crate::tui::views::custom::view_field_cfg(view_cfg, selected_issue, field_idx);
-                let is_readonly = field_cfg.as_ref().and_then(|f| f.readonly).unwrap_or(false);
+                    crate::tui::views::custom::view_field_cfg(view_cfg, selected_item, field_idx);
+                let is_readonly = field_cfg.as_ref().and_then(|f| f.readonly).unwrap_or(false)
+                    || selected_item.is_some_and(|i| !i.supports_field_edit());
                 if is_readonly {
                     let field_id = field_cfg
                         .as_ref()
                         .map(|f| f.field_id.clone())
                         .unwrap_or_default();
                     let url_str = app
-                        .selected_issue()
-                        .and_then(|i| i.fields.extra.get(&field_id))
+                        .selected_item()
+                        .and_then(|i| i.field(&field_id))
                         .and_then(|v| v.as_str())
                         .filter(|s| s.starts_with("http://") || s.starts_with("https://"));
                     url_str.map(|url| {

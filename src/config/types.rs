@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default)]
     pub jira: JiraConfig,
+    /// Confluence connection settings. Anything unset falls back to the
+    /// effective Jira config (same Atlassian site: one API token covers both).
+    #[serde(default)]
+    pub confluence: Option<ConfluenceConfig>,
     #[serde(default)]
     pub cache: CacheConfig,
     /// Team references. Onboarding creates at least one ("personal").
@@ -58,6 +62,11 @@ pub struct TeamConfig {
     pub list: ListConfig,
     #[serde(default)]
     pub hide_for_a_day: HideForADayConfig,
+    /// Optional Confluence connection overrides for this team. Unset fields
+    /// fall back to the user's `confluence` config, then the effective Jira
+    /// config.
+    #[serde(default)]
+    pub confluence: Option<ConfluenceConfig>,
     /// Named custom views. Source `view_mode` references a key in this map.
     #[serde(default)]
     pub views: HashMap<String, CustomViewConfig>,
@@ -76,13 +85,17 @@ pub struct ResolvedTeam {
     pub config: TeamConfig,
     /// Effective Jira config (team override merged on top of user default).
     pub jira: JiraConfig,
+    /// Effective Confluence connection config (team confluence override →
+    /// user confluence → effective Jira). Expressed as a `JiraConfig` so the
+    /// same credential resolution applies.
+    pub confluence: JiraConfig,
     /// Effective setting: open `*.slack.com` links in the Slack desktop app.
     pub open_slack_in_app: bool,
     /// Effective Slack workspace (team) ID for deep links.
     pub slack_team_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct JiraConfig {
     pub base_url: String,
     pub default_project: String,
@@ -102,11 +115,76 @@ pub struct JiraConfig {
     pub oauth_client_secret: Option<String>,
 }
 
+/// Which backend a source fetches from. Absent in config = Jira.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    #[default]
+    Jira,
+    Confluence,
+}
+
+/// What identifies a Confluence task in the list: its content, the page it
+/// lives on, or both ("content · page").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfluenceLabel {
+    Task,
+    Page,
+    #[default]
+    Both,
+}
+
+/// Per-source Confluence inline-task filters.
+/// An absent block means "my incomplete tasks".
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ConfluenceFilters {
+    /// Space keys (e.g. "ENG"); resolved to numeric space IDs at fetch time.
+    #[serde(default)]
+    pub spaces: Vec<String>,
+    /// Numeric page IDs (kept as strings for JSON5 friendliness).
+    #[serde(default)]
+    pub pages: Vec<String>,
+    /// "me" (default) | "any" | an explicit Atlassian account id.
+    pub assignee: Option<String>,
+    /// "incomplete" (default) | "complete" | "any".
+    pub status: Option<String>,
+    /// Calendar dates "YYYY-MM-DD", inclusive bounds on the task due date.
+    pub due_before: Option<String>,
+    pub due_after: Option<String>,
+    /// Include checkbox items with empty text. Defaults to false.
+    #[serde(default)]
+    pub include_blank: bool,
+    /// How a task is labeled in the list: "task" (its content), "page"
+    /// (the page it lives on) or "both" (default, "content · page").
+    #[serde(default)]
+    pub label: ConfluenceLabel,
+}
+
+/// Partial Confluence connection overrides. All fields optional — anything
+/// unset falls back to the effective Jira config (same site, same token).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ConfluenceConfig {
+    pub base_url: Option<String>,
+    pub email: Option<String>,
+    pub credential_command: Option<String>,
+    pub credential_store: Option<String>,
+    pub credential_key: Option<String>,
+    pub auth_method: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SourceConfig {
     pub id: String,
     pub display_name: Option<String>,
+    /// Which backend this source fetches from. Defaults to Jira.
+    #[serde(default)]
+    pub kind: SourceKind,
+    #[serde(default)]
     pub jql: String,
+    /// Confluence task filters; only meaningful when `kind` is `confluence`.
+    #[serde(default)]
+    pub confluence: Option<ConfluenceFilters>,
     /// Project key for wrong-project detection (e.g. incidents).
     pub expected_project: Option<String>,
     /// Sort order within source: "updated", "created", "priority".

@@ -89,7 +89,7 @@ fn right_column() -> Vec<Line<'static>> {
         section_header("Actions"),
         key_line("n", "new issue"),
         key_line("o", "open in browser"),
-        key_line("t", "transition"),
+        key_line("t", "transition / complete task"),
         key_line("c", "comment"),
         key_line("i", "hide for a day"),
         key_line("a", "assign to me"),

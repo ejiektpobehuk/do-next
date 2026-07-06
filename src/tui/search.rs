@@ -3,6 +3,7 @@
 //! Local scoring filters issues already loaded; JQL is built for parallel
 //! escalation to the Jira search API.
 
+use crate::items::WorkItem;
 use crate::jira::types::Issue;
 
 /// User-selected filters in the search overlay.
@@ -49,19 +50,50 @@ const SCORE_KEY_SUBSTR: i32 = 250;
 const SCORE_SUMMARY_TOKEN_PREFIX: i32 = 200;
 const SCORE_SUMMARY_SUBSTR: i32 = 100;
 
-/// Score an issue against a local search query + filters.
+/// Score a work item against a local search query + filters.
 ///
-/// Returns `None` if the issue should be hidden. When `query` is empty and no
-/// filter rejects the issue, returns a hit with `score = 0`.
-pub fn score_local(query: &str, filters: &SearchFilters, issue: &Issue) -> Option<RankedHit> {
-    if !filters_match(filters, issue) {
+/// Returns `None` if the item should be hidden. When `query` is empty and no
+/// filter rejects the item, returns a hit with `score = 0`.
+pub fn score_local(query: &str, filters: &SearchFilters, item: &WorkItem) -> Option<RankedHit> {
+    score_parts(
+        query,
+        filters,
+        item.key(),
+        item.title(),
+        item.status_name(),
+        item.project_key(),
+    )
+}
+
+/// Score a raw Jira issue (used for Jira-side search results, which arrive
+/// as bare issues before being wrapped into `WorkItem`s).
+pub fn score_local_issue(query: &str, filters: &SearchFilters, issue: &Issue) -> Option<RankedHit> {
+    score_parts(
+        query,
+        filters,
+        &issue.key,
+        &issue.fields.summary,
+        &issue.fields.status.name,
+        Some(&issue.fields.project.key),
+    )
+}
+
+fn score_parts(
+    query: &str,
+    filters: &SearchFilters,
+    key: &str,
+    summary: &str,
+    status: &str,
+    project: Option<&str>,
+) -> Option<RankedHit> {
+    if !filters_match(filters, status, project) {
         return None;
     }
 
     let q = query.trim();
     if q.is_empty() {
         return Some(RankedHit {
-            issue_key: issue.key.clone(),
+            issue_key: key.to_owned(),
             score: 0,
             key_ranges: Vec::new(),
             summary_ranges: Vec::new(),
@@ -70,8 +102,8 @@ pub fn score_local(query: &str, filters: &SearchFilters, issue: &Issue) -> Optio
     }
 
     let q_lower = q.to_lowercase();
-    let key_lower = issue.key.to_lowercase();
-    let summary_lower = issue.fields.summary.to_lowercase();
+    let key_lower = key.to_lowercase();
+    let summary_lower = summary.to_lowercase();
 
     let mut score = 0;
     let mut key_ranges = Vec::new();
@@ -82,7 +114,7 @@ pub fn score_local(query: &str, filters: &SearchFilters, issue: &Issue) -> Optio
         score = score.max(SCORE_KEY_EXACT);
         key_ranges.push(MatchRange {
             start: 0,
-            end: issue.key.len(),
+            end: key.len(),
         });
     } else if key_lower.starts_with(&q_lower) {
         score = score.max(SCORE_KEY_PREFIX);
@@ -123,7 +155,7 @@ pub fn score_local(query: &str, filters: &SearchFilters, issue: &Issue) -> Optio
     }
 
     Some(RankedHit {
-        issue_key: issue.key.clone(),
+        issue_key: key.to_owned(),
         score,
         key_ranges,
         summary_ranges,
@@ -167,13 +199,12 @@ fn match_summary_token(summary_lower: &str, token: &str) -> Option<TokenHit> {
     })
 }
 
-fn filters_match(filters: &SearchFilters, issue: &Issue) -> bool {
-    let issue_status = issue.fields.status.name.as_str();
+fn filters_match(filters: &SearchFilters, status: &str, project: Option<&str>) -> bool {
     if !filters.statuses.is_empty() {
         let matched = filters
             .statuses
             .iter()
-            .any(|s| s.eq_ignore_ascii_case(issue_status));
+            .any(|s| s.eq_ignore_ascii_case(status));
         if !matched {
             return false;
         }
@@ -181,16 +212,19 @@ fn filters_match(filters: &SearchFilters, issue: &Issue) -> bool {
     if filters
         .statuses_exclude
         .iter()
-        .any(|s| s.eq_ignore_ascii_case(issue_status))
+        .any(|s| s.eq_ignore_ascii_case(status))
     {
         return false;
     }
     if !filters.projects.is_empty() {
-        let issue_project = issue.fields.project.key.as_str();
+        // Items without a project (non-Jira sources) never match a project filter.
+        let Some(item_project) = project else {
+            return false;
+        };
         let matched = filters
             .projects
             .iter()
-            .any(|p| p.eq_ignore_ascii_case(issue_project));
+            .any(|p| p.eq_ignore_ascii_case(item_project));
         if !matched {
             return false;
         }
@@ -323,7 +357,7 @@ mod tests {
     #[test]
     fn empty_query_no_filters_keeps_issue_with_zero_score() {
         let issue = make_issue("PROJ-1", "Fix login bug");
-        let hit = score_local("", &SearchFilters::default(), &issue).unwrap();
+        let hit = score_local_issue("", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, 0);
         assert_eq!(hit.issue_key, "PROJ-1");
         assert!(hit.key_ranges.is_empty());
@@ -333,7 +367,7 @@ mod tests {
     #[test]
     fn exact_key_match_wins_over_summary() {
         let issue = make_issue("PROJ-12", "Fix login bug");
-        let hit = score_local("PROJ-12", &SearchFilters::default(), &issue).unwrap();
+        let hit = score_local_issue("PROJ-12", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, SCORE_KEY_EXACT);
         assert_eq!(
             hit.key_ranges,
@@ -347,21 +381,21 @@ mod tests {
     #[test]
     fn key_match_is_case_insensitive() {
         let issue = make_issue("PROJ-12", "Whatever");
-        let hit = score_local("proj-12", &SearchFilters::default(), &issue).unwrap();
+        let hit = score_local_issue("proj-12", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, SCORE_KEY_EXACT);
     }
 
     #[test]
     fn key_prefix_scores_below_exact() {
         let issue = make_issue("PROJ-12", "Fix login bug");
-        let hit = score_local("PROJ", &SearchFilters::default(), &issue).unwrap();
+        let hit = score_local_issue("PROJ", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, SCORE_KEY_PREFIX);
     }
 
     #[test]
     fn summary_token_prefix_outranks_substring() {
         let issue = make_issue("PROJ-12", "Fix login bug");
-        let hit = score_local("log", &SearchFilters::default(), &issue).unwrap();
+        let hit = score_local_issue("log", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, SCORE_SUMMARY_TOKEN_PREFIX);
         assert_eq!(hit.summary_ranges.len(), 1);
     }
@@ -369,27 +403,27 @@ mod tests {
     #[test]
     fn summary_substring_falls_back_to_lower_score() {
         let issue = make_issue("PROJ-12", "Refactor authentication");
-        let hit = score_local("entic", &SearchFilters::default(), &issue).unwrap();
+        let hit = score_local_issue("entic", &SearchFilters::default(), &issue).unwrap();
         assert_eq!(hit.score, SCORE_SUMMARY_SUBSTR);
     }
 
     #[test]
     fn multi_token_query_requires_all_tokens_to_match() {
         let issue = make_issue("PROJ-12", "Fix login bug");
-        assert!(score_local("fix bug", &SearchFilters::default(), &issue).is_some());
-        assert!(score_local("fix banana", &SearchFilters::default(), &issue).is_none());
+        assert!(score_local_issue("fix bug", &SearchFilters::default(), &issue).is_some());
+        assert!(score_local_issue("fix banana", &SearchFilters::default(), &issue).is_none());
     }
 
     #[test]
     fn no_match_returns_none() {
         let issue = make_issue("PROJ-12", "Fix login bug");
-        assert!(score_local("banana", &SearchFilters::default(), &issue).is_none());
+        assert!(score_local_issue("banana", &SearchFilters::default(), &issue).is_none());
     }
 
     #[test]
     fn unicode_summary_matches() {
         let issue = make_issue("PROJ-12", "Починить вход тёмной темы");
-        let hit = score_local("тёмной", &SearchFilters::default(), &issue).unwrap();
+        let hit = score_local_issue("тёмной", &SearchFilters::default(), &issue).unwrap();
         assert!(hit.score >= SCORE_SUMMARY_TOKEN_PREFIX);
         let r = &hit.summary_ranges[0];
         assert_eq!(
@@ -401,7 +435,7 @@ mod tests {
     #[test]
     fn digit_only_query_matches_key_substring() {
         let issue = make_issue("PROJ-123", "Anything");
-        let hit = score_local("123", &SearchFilters::default(), &issue).unwrap();
+        let hit = score_local_issue("123", &SearchFilters::default(), &issue).unwrap();
         assert!(hit.score >= SCORE_KEY_SUBSTR);
     }
 
@@ -410,7 +444,7 @@ mod tests {
     #[test]
     fn empty_filters_accept_everything() {
         let issue = make_issue("PROJ-1", "x");
-        assert!(score_local("", &SearchFilters::default(), &issue).is_some());
+        assert!(score_local_issue("", &SearchFilters::default(), &issue).is_some());
     }
 
     #[test]
@@ -420,7 +454,7 @@ mod tests {
             statuses: vec!["in progress".into()],
             ..SearchFilters::default()
         };
-        assert!(score_local("", &filters, &issue).is_some());
+        assert!(score_local_issue("", &filters, &issue).is_some());
     }
 
     #[test]
@@ -430,7 +464,7 @@ mod tests {
             statuses: vec!["In Progress".into(), "In Review".into()],
             ..SearchFilters::default()
         };
-        assert!(score_local("", &filters, &issue).is_none());
+        assert!(score_local_issue("", &filters, &issue).is_none());
     }
 
     #[test]
@@ -440,7 +474,7 @@ mod tests {
             projects: vec!["plat".into()],
             ..SearchFilters::default()
         };
-        assert!(score_local("", &filters, &issue).is_some());
+        assert!(score_local_issue("", &filters, &issue).is_some());
     }
 
     #[test]
@@ -450,7 +484,7 @@ mod tests {
             projects: vec!["PLAT".into(), "PROJ".into()],
             ..SearchFilters::default()
         };
-        assert!(score_local("", &filters, &issue).is_none());
+        assert!(score_local_issue("", &filters, &issue).is_none());
     }
 
     #[test]
@@ -460,8 +494,8 @@ mod tests {
             statuses: vec!["In Progress".into()],
             ..SearchFilters::default()
         };
-        assert!(score_local("login", &filters, &issue).is_some());
-        assert!(score_local("banana", &filters, &issue).is_none());
+        assert!(score_local_issue("login", &filters, &issue).is_some());
+        assert!(score_local_issue("banana", &filters, &issue).is_none());
     }
 
     // ── build_jql ────────────────────────────────────────────────────────────
@@ -520,7 +554,7 @@ mod tests {
             statuses_exclude: vec!["done".into()],
             ..SearchFilters::default()
         };
-        assert!(score_local("", &filters, &issue).is_none());
+        assert!(score_local_issue("", &filters, &issue).is_none());
     }
 
     #[test]
@@ -533,8 +567,8 @@ mod tests {
             statuses_exclude: vec!["In Review".into()],
             ..SearchFilters::default()
         };
-        assert!(score_local("", &filters, &in_progress).is_some());
-        assert!(score_local("", &filters, &in_review).is_none());
+        assert!(score_local_issue("", &filters, &in_progress).is_some());
+        assert!(score_local_issue("", &filters, &in_review).is_none());
     }
 
     #[test]

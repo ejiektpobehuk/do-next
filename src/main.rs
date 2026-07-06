@@ -1,5 +1,7 @@
 mod config;
+mod confluence;
 mod events;
+mod items;
 mod jira;
 mod sources;
 mod subcommands;
@@ -50,6 +52,7 @@ enum Commands {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -78,7 +81,15 @@ async fn main() -> Result<()> {
 
     // Auth reset runs before credential resolution (auth may currently be broken).
     if matches!(&cli.command, Some(Commands::Auth)) {
-        tui::onboarding::run_auth_reset(&mut loaded.config).context("Auth reset failed")?;
+        // Teams with confluence sources need the Confluence OAuth scopes.
+        let include_confluence = loaded.teams.iter().any(|t| {
+            t.config
+                .sources
+                .iter()
+                .any(|s| s.kind == config::types::SourceKind::Confluence)
+        });
+        tui::onboarding::run_auth_reset(&mut loaded.config, include_confluence)
+            .context("Auth reset failed")?;
         return Ok(());
     }
 
@@ -103,22 +114,61 @@ async fn main() -> Result<()> {
     }
 
     // Build one JiraClient per unique base_url across all teams.
-    let mut clients: std::collections::HashMap<String, jira::JiraClient> =
-        std::collections::HashMap::new();
+    let mut clients = sources::Clients {
+        jira: std::collections::HashMap::new(),
+        confluence: std::collections::HashMap::new(),
+    };
     for team in &loaded.teams {
         let url = &team.jira.base_url;
-        if !clients.contains_key(url) {
+        if !clients.jira.contains_key(url) {
             let auth = config::credentials::resolve_auth(&team.jira)
                 .with_context(|| format!("Failed to resolve auth for team '{}'", team.id))?;
             let client = jira::JiraClient::new(url.clone(), auth)
                 .with_context(|| format!("Failed to create Jira client for team '{}'", team.id))?;
-            clients.insert(url.clone(), client);
+            clients.jira.insert(url.clone(), client);
         }
+    }
+
+    // Build one ConfluenceClient per unique Confluence base_url, but only for
+    // teams that define confluence sources. When the effective Confluence
+    // connection equals the team's Jira one, share the auth handle so OAuth
+    // refresh stays coordinated (and no second credential lookup runs).
+    for team in &loaded.teams {
+        let needs_confluence = team
+            .config
+            .sources
+            .iter()
+            .any(|s| s.kind == config::types::SourceKind::Confluence);
+        if !needs_confluence {
+            continue;
+        }
+        let url = team.confluence.base_url.clone();
+        if clients.confluence.contains_key(&url) {
+            continue;
+        }
+        let same_as_jira =
+            team.confluence == team.jira && std::env::var("DO_NEXT_CONFLUENCE_API_TOKEN").is_err();
+        let client = if same_as_jira {
+            let jira_client = clients
+                .jira
+                .get(&team.jira.base_url)
+                .context("No Jira client for shared Confluence auth")?;
+            confluence::ConfluenceClient::from_shared(&url, jira_client.auth_handle())
+        } else {
+            let auth = config::credentials::resolve_confluence_auth(&team.confluence)
+                .with_context(|| {
+                    format!("Failed to resolve Confluence auth for team '{}'", team.id)
+                })?;
+            confluence::ConfluenceClient::new(&url, auth)
+        }
+        .with_context(|| format!("Failed to create Confluence client for team '{}'", team.id))?;
+        clients.confluence.insert(url, client);
     }
 
     // For subcommands, use the first team's client (or default jira).
     let default_client = if let Some(first_team) = loaded.teams.first() {
         clients
+            .jira
             .get(&first_team.jira.base_url)
             .cloned()
             .context("No Jira client available")?

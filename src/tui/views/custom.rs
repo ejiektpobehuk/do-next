@@ -23,6 +23,7 @@ const CORNERS_ONLY: BorderSet = BorderSet {
 };
 
 use crate::config::types::{CustomViewConfig, CustomViewFieldConfig, DateFieldKind};
+use crate::items::WorkItem;
 use crate::jira::types::Issue;
 use crate::tui::app::{ActionState, AppState, DetailFocus};
 use crate::tui::markdown::markdown_to_lines;
@@ -59,18 +60,18 @@ enum Segment {
 
 /// Number of focusable fields in the view.
 /// For custom views: total configured fields. For the default view (cfg=None): all extra fields.
-pub fn num_view_fields(cfg: Option<&CustomViewConfig>, issue: Option<&Issue>) -> usize {
+pub fn num_view_fields(cfg: Option<&CustomViewConfig>, item: Option<&WorkItem>) -> usize {
     cfg.map_or_else(
-        || issue.map_or(0, |i| i.fields.extra.len()),
+        || item.map_or(0, |i| i.fields_map().len()),
         |c| c.sections.iter().map(|s| s.fields.len()).sum(),
     )
 }
 
 /// Retrieve the field config at flat index `idx`.
-/// For the default view (cfg=None), synthesizes a config from the issue's extra fields.
+/// For the default view (cfg=None), synthesizes a config from the item's field map.
 pub fn view_field_cfg(
     cfg: Option<&CustomViewConfig>,
-    issue: Option<&Issue>,
+    item: Option<&WorkItem>,
     idx: usize,
 ) -> Option<CustomViewFieldConfig> {
     if let Some(cfg) = cfg {
@@ -84,8 +85,8 @@ pub fn view_field_cfg(
             }
         }
         None
-    } else if let Some(issue) = issue {
-        let mut keys: Vec<&String> = issue.fields.extra.keys().collect();
+    } else if let Some(item) = item {
+        let mut keys: Vec<&String> = item.fields_map().keys().collect();
         keys.sort();
         let key = keys.into_iter().nth(idx)?;
         Some(CustomViewFieldConfig {
@@ -97,7 +98,8 @@ pub fn view_field_cfg(
     }
 }
 
-/// Resolve the display label for a field, consulting API names as fallback.
+/// Resolve the display label for a field, consulting API names, then the
+/// builtin Confluence field names, as fallbacks.
 pub fn resolve_field_label(
     field: &CustomViewFieldConfig,
     field_names: &HashMap<String, String>,
@@ -106,6 +108,7 @@ pub fn resolve_field_label(
         .name
         .as_deref()
         .or_else(|| field_names.get(&field.field_id).map(String::as_str))
+        .or_else(|| crate::confluence::types::field_name(&field.field_id))
         .unwrap_or(&field.field_id)
         .to_string()
 }
@@ -113,17 +116,15 @@ pub fn resolve_field_label(
 /// Public helper used by app.rs to get (`field_id`, current JSON value) for editing.
 pub fn view_editable_field_spec(
     cfg: Option<&CustomViewConfig>,
-    issue: &Issue,
+    item: &WorkItem,
     idx: usize,
 ) -> (String, serde_json::Value) {
-    let Some(field_cfg) = view_field_cfg(cfg, Some(issue), idx) else {
+    let Some(field_cfg) = view_field_cfg(cfg, Some(item), idx) else {
         return (String::new(), serde_json::Value::Null);
     };
     let field_id = field_cfg.field_id;
-    let value = issue
-        .fields
-        .extra
-        .get(&field_id)
+    let value = item
+        .field(&field_id)
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     (field_id, value)
@@ -132,11 +133,11 @@ pub fn view_editable_field_spec(
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Render the detail view — either a configured custom view or the auto-generated default view.
-/// `cfg = None` activates the default view (all issue fields).
+/// `cfg = None` activates the default view (all item fields).
 pub fn render_detail_view(
     f: &mut Frame,
     area: Rect,
-    issue: &Issue,
+    item: &WorkItem,
     app: &AppState,
     render_out: &mut RenderOut,
 ) -> usize {
@@ -144,14 +145,14 @@ pub fn render_detail_view(
     let tz = resolve_tz(cfg);
     let w = area.width;
 
-    let segments = build_segments(issue, cfg, tz, w, &app.field_names);
+    let segments = build_segments(item, cfg, tz, w, &app.field_names);
 
     let scroll = app.detail_scroll;
     let viewport_h = area.height as usize;
     let mut virtual_y: usize = 0;
 
     // Ensure offsets vec is large enough: Comments(0), Attachments(1), Field(i)=2+i
-    let num_fields = num_view_fields(cfg, Some(issue));
+    let num_fields = num_view_fields(cfg, Some(item));
     render_out
         .detail_focus_offsets
         .resize(2 + num_fields, (0, 0));
@@ -357,7 +358,7 @@ fn render_editable_field(
 // ── Segment builder ──────────────────────────────────────────────────────────
 
 fn build_segments(
-    issue: &Issue,
+    item: &WorkItem,
     cfg: Option<&CustomViewConfig>,
     tz: FixedOffset,
     width: u16,
@@ -367,27 +368,29 @@ fn build_segments(
 
     // Header (read-only) — expanded for default view
     segs.push(Segment::ReadOnly {
-        lines: header_lines(issue, cfg.is_none()),
+        lines: header_lines(item, cfg.is_none()),
     });
 
-    // Nav widgets: Comments and Attachments
-    let comment_count = issue.fields.comment.as_ref().map_or(0, |c| c.total);
-    segs.push(Segment::NavWidget {
-        nav: DetailNavKind::Comments,
-        content: format!("Comments  ({comment_count})"),
-    });
-    let attachment_count = issue.fields.attachment.as_ref().map_or(0, Vec::len);
-    segs.push(Segment::NavWidget {
-        nav: DetailNavKind::Attachments,
-        content: format!("Attachments  ({attachment_count})"),
-    });
+    // Nav widgets: Comments and Attachments (Jira items only)
+    if let Some(issue) = item.as_jira() {
+        let comment_count = issue.fields.comment.as_ref().map_or(0, |c| c.total);
+        segs.push(Segment::NavWidget {
+            nav: DetailNavKind::Comments,
+            content: format!("Comments  ({comment_count})"),
+        });
+        let attachment_count = issue.fields.attachment.as_ref().map_or(0, Vec::len);
+        segs.push(Segment::NavWidget {
+            nav: DetailNavKind::Attachments,
+            content: format!("Attachments  ({attachment_count})"),
+        });
+    }
 
     match cfg {
         Some(cfg) => {
-            build_custom_segments(&mut segs, issue, cfg, tz, width, field_names);
+            build_custom_segments(&mut segs, item, cfg, tz, width, field_names);
         }
         None => {
-            build_default_segments(&mut segs, issue, width, field_names);
+            build_default_segments(&mut segs, item, width, field_names);
         }
     }
 
@@ -396,7 +399,7 @@ fn build_segments(
 
 fn build_custom_segments(
     segs: &mut Vec<Segment>,
-    issue: &Issue,
+    item: &WorkItem,
     cfg: &CustomViewConfig,
     tz: FixedOffset,
     width: u16,
@@ -430,9 +433,12 @@ fn build_custom_segments(
         // Fields
         for field in &section.fields {
             let label = resolve_field_label(field, field_names);
-            let content = get_field_content(issue, field, tz);
-            let readonly = field.readonly.unwrap_or(false);
-            let is_markdown = issue.fields.extra.get(&field.field_id).is_some_and(is_adf);
+            let content = get_field_content(item, field, tz);
+            // Items without field editing render every field readonly.
+            let readonly = field.readonly.unwrap_or(false) || !item.supports_field_edit();
+            let is_markdown = item.field(&field.field_id).is_some_and(is_adf)
+                || (field.field_id == crate::confluence::types::FIELD_TASK
+                    && item.as_confluence().is_some());
             segs.push(Segment::EditableField {
                 label,
                 content,
@@ -455,13 +461,13 @@ fn build_custom_segments(
 
         if start_field.is_some() && end_field.is_some() {
             let start_dt =
-                start_field.and_then(|f| parse_field_dt(issue, Some(f.field_id.as_str())));
-            let end_dt = end_field.and_then(|f| parse_field_dt(issue, Some(f.field_id.as_str())));
+                start_field.and_then(|f| parse_field_dt(item, Some(f.field_id.as_str())));
+            let end_dt = end_field.and_then(|f| parse_field_dt(item, Some(f.field_id.as_str())));
             let jira_h = section
                 .fields
                 .iter()
                 .find(|f| f.duration_role.as_deref() == Some("jira_value"))
-                .and_then(|f| issue.fields.extra.get(&f.field_id))
+                .and_then(|f| item.field(&f.field_id))
                 .and_then(serde_json::Value::as_f64);
             segs.push(Segment::ReadOnly {
                 lines: duration_lines(start_dt.as_ref(), end_dt.as_ref(), jira_h),
@@ -472,12 +478,14 @@ fn build_custom_segments(
 
 fn build_default_segments(
     segs: &mut Vec<Segment>,
-    issue: &Issue,
+    item: &WorkItem,
     width: u16,
     field_names: &HashMap<String, String>,
 ) {
-    // Description section
-    if let Some(ref desc) = issue.fields.description {
+    // Description section (Jira issues carry an ADF description)
+    if let Some(issue) = item.as_jira()
+        && let Some(ref desc) = issue.fields.description
+    {
         let text = json_to_text(desc);
         if !text.is_empty() {
             segs.push(Segment::ReadOnly {
@@ -493,32 +501,34 @@ fn build_default_segments(
     }
 
     // Extra fields section
-    if !issue.fields.extra.is_empty() {
+    if !item.fields_map().is_empty() {
         segs.push(Segment::ReadOnly {
             lines: vec![Line::from(""), section_sep("Fields", width), Line::from("")],
         });
         let mut extra_fields: Vec<(&String, &serde_json::Value)> =
-            issue.fields.extra.iter().collect();
+            item.fields_map().iter().collect();
         extra_fields.sort_by_key(|(k, _)| k.as_str());
         for (field_idx, (field_id, value)) in extra_fields.into_iter().enumerate() {
-            let label = field_names
-                .get(field_id)
-                .cloned()
-                .unwrap_or_else(|| field_id.clone());
+            let label = field_names.get(field_id).cloned().unwrap_or_else(|| {
+                crate::confluence::types::field_name(field_id)
+                    .map_or_else(|| field_id.clone(), str::to_owned)
+            });
             let content = val_to_str(value);
             segs.push(Segment::EditableField {
                 label,
                 content,
                 field_idx,
-                readonly: false,
-                is_markdown: is_adf(value),
+                readonly: !item.supports_field_edit(),
+                is_markdown: is_adf(value)
+                    || (field_id == crate::confluence::types::FIELD_TASK
+                        && item.as_confluence().is_some()),
             });
         }
     }
 }
 
-fn get_field_content(issue: &Issue, field: &CustomViewFieldConfig, tz: FixedOffset) -> String {
-    let Some(raw) = issue.fields.extra.get(&field.field_id) else {
+fn get_field_content(item: &WorkItem, field: &CustomViewFieldConfig, tz: FixedOffset) -> String {
+    let Some(raw) = item.field(&field.field_id) else {
         return String::new();
     };
     if raw.is_null() {
@@ -589,7 +599,44 @@ fn measure_line(line: &Line, width: u16) -> usize {
 
 // ── Header section ────────────────────────────────────────────────────────────
 
-fn header_lines(issue: &Issue, full: bool) -> Vec<Line<'static>> {
+fn header_lines(item: &WorkItem, full: bool) -> Vec<Line<'static>> {
+    match item {
+        WorkItem::Jira(issue) => jira_header_lines(issue, full),
+        WorkItem::Confluence(task) => confluence_header_lines(task, full),
+    }
+}
+
+fn confluence_header_lines(
+    task: &crate::confluence::types::Task,
+    full: bool,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::raw(task.title.clone()),
+        Span::raw("  "),
+        Span::styled(
+            match task.status {
+                crate::confluence::types::TaskStatus::Incomplete => "To do",
+                crate::confluence::types::TaskStatus::Complete => "Done",
+            },
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ])];
+
+    if full {
+        if let Some(page) = &task.page_title {
+            lines.push(kv_line("Page", page));
+        }
+        if let Some(due) = task.due_at {
+            lines.push(kv_line("Due", &due.format("%Y-%m-%d").to_string()));
+        }
+        lines.push(kv_line("Key", &task.key));
+    }
+
+    lines.push(Line::from(""));
+    lines
+}
+
+fn jira_header_lines(issue: &Issue, full: bool) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(Line::from(vec![
@@ -717,9 +764,9 @@ fn kv_line(label: &str, value: &str) -> Line<'static> {
 
 // ── Data extraction ──────────────────────────────────────────────────────────
 
-fn parse_field_dt(issue: &Issue, field_id: Option<&str>) -> Option<DateTime<FixedOffset>> {
+fn parse_field_dt(item: &WorkItem, field_id: Option<&str>) -> Option<DateTime<FixedOffset>> {
     let fid = field_id?;
-    let v = issue.fields.extra.get(fid)?;
+    let v = item.field(fid)?;
     if v.is_null() {
         return None;
     }

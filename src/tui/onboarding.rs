@@ -137,7 +137,8 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
                 StorageChoice::Keyring => OAuthStore::Keyring,
                 _ => OAuthStore::File,
             };
-            crate::jira::oauth::run_oauth_flow(&client_id, &client_secret, store)?;
+            // First run: no team sources exist yet, so no Confluence scopes.
+            crate::jira::oauth::run_oauth_flow(&client_id, &client_secret, store, false)?;
             jira_config.auth_method = Some("oauth".into());
             jira_config.oauth_client_id = Some(client_id);
             jira_config.oauth_client_secret = Some(client_secret);
@@ -192,6 +193,7 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
         id: "personal".into(),
         path: team_dir.to_string_lossy().into_owned(),
         config: team_config,
+        confluence: jira_config.clone(),
         jira: jira_config,
         open_slack_in_app: true,
         slack_team_id: None,
@@ -208,7 +210,7 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
 
 /// Reconfigure authentication for an existing install without overwriting other config.
 #[allow(clippy::too_many_lines)]
-pub fn run_auth_reset(config: &mut Config) -> Result<()> {
+pub fn run_auth_reset(config: &mut Config, include_confluence: bool) -> Result<()> {
     if config.jira.base_url.is_empty() {
         return Err(anyhow::anyhow!(
             "No configuration found. Run do-next first to complete initial setup."
@@ -248,7 +250,12 @@ pub fn run_auth_reset(config: &mut Config) -> Result<()> {
                 StorageChoice::Keyring => OAuthStore::Keyring,
                 _ => OAuthStore::File,
             };
-            crate::jira::oauth::run_oauth_flow(&client_id, &client_secret, store)?;
+            crate::jira::oauth::run_oauth_flow(
+                &client_id,
+                &client_secret,
+                store,
+                include_confluence,
+            )?;
             config.jira.auth_method = Some("oauth".into());
             config.jira.oauth_client_id = Some(client_id);
             config.jira.oauth_client_secret = Some(client_secret);
@@ -396,6 +403,7 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
         id: team_ref.id,
         path: team_ref.path,
         config: team_config,
+        confluence: team_jira.clone(),
         jira: team_jira,
         open_slack_in_app: true,
         slack_team_id: None,

@@ -64,6 +64,54 @@ Linux depends on:
 
 ---
 
+## Confluence tasks
+
+Besides Jira sources, a team config can list Confluence inline tasks (the
+checkbox action items on pages) as a source:
+
+```json5
+{
+  sources: [
+    {
+      id: "confluence-actions",
+      kind: "confluence",
+      display_name: "Action items",
+      // All filters optional; the default is "my incomplete tasks".
+      confluence: {
+        spaces: ["ENG"],          // space keys
+        pages: ["123456"],        // numeric page IDs
+        assignee: "me",           // "me" (default) | "any" | an account id
+        status: "incomplete",     // "incomplete" (default) | "complete" | "any"
+        due_before: "2026-08-01", // YYYY-MM-DD, inclusive
+        due_after: "2026-07-01",
+        label: "both",            // list label: "task" (content) | "page" | "both" (default)
+      },
+      indication: { symbol: "☐", color: "cyan" },
+    },
+  ],
+}
+```
+
+Pressing `t` on a Confluence task marks it complete (ticks the checkbox on
+the page); `o` opens the page in the browser.
+
+Authentication reuses the Jira connection by default — the same Atlassian
+site, email and API token work for Confluence. To point at a different site
+or credentials, add a `confluence` block (same optional fields at the user
+config or team config level):
+
+```json5
+confluence: { base_url: "https://other.atlassian.net", credential_key: "other" }
+```
+
+The `DO_NEXT_CONFLUENCE_API_TOKEN` env var overrides the token. With
+`auth_method: "oauth"`, re-run `do-next auth` after adding a confluence
+source so the token is granted the Confluence scopes; if Atlassian rejects
+the combined Jira + Confluence consent, use an API token (`basic`) for
+Confluence instead.
+
+---
+
 ## Development
 
 Dependencies:
