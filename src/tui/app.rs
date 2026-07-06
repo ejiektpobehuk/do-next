@@ -3575,7 +3575,7 @@ fn key_edit_detail_field(app: &mut AppState) {
     if !use_editor {
         let cfg_kind = field_cfg
             .as_ref()
-            .and_then(crate::config::types::CustomViewFieldConfig::date_kind);
+            .and_then(crate::config::types::CustomViewFieldConfig::effective_type);
         let schema_ty = app.field_schemas.get(&field_id).map(|s| s.ty.as_str());
         let by_schema = matches!(schema_ty, Some("date" | "datetime"));
         if cfg_kind.is_some() || by_schema {
@@ -3585,7 +3585,7 @@ fn key_edit_detail_field(app: &mut AppState) {
             let date_only = match schema_ty {
                 Some("date") => true,
                 Some("datetime") => false,
-                _ => cfg_kind == Some(crate::config::types::DateFieldKind::Date),
+                _ => cfg_kind == Some(crate::config::types::FieldType::Date),
             };
             let tz = crate::tui::views::custom::resolve_tz(view_cfg);
             let picker = crate::tui::overlays::datetime_picker::DatetimePicker::from_value(

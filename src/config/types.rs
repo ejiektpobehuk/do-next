@@ -278,12 +278,14 @@ pub struct CustomViewFieldConfig {
     pub readonly: Option<bool>,
     /// Always open $EDITOR regardless of field type.
     pub use_editor: Option<bool>,
-    /// Display value as a formatted datetime using the configured timezone.
-    /// When editing, opens the full datetime picker. Mutually exclusive with `date`.
+    /// Value type. `"date"`: calendar date (`yyyy-MM-dd`, e.g. Due Date),
+    /// displayed without a time part and edited with a date-only picker.
+    /// `"datetime"`: displayed as a formatted datetime using the configured
+    /// timezone; editing opens the full datetime picker.
+    pub r#type: Option<FieldType>,
+    /// Deprecated: use `type: "datetime"` instead.
     pub datetime: Option<bool>,
-    /// Treat value as a calendar date (`yyyy-MM-dd`, e.g. Due Date): display
-    /// without a time part and edit with a date-only picker. Mutually
-    /// exclusive with `datetime`.
+    /// Deprecated: use `type: "date"` instead.
     pub date: Option<bool>,
     /// Duration row role: "start", "end", or `"jira_value"`.
     /// When a section has both "start" and "end" fields, a read-only duration
@@ -303,9 +305,11 @@ pub struct CustomViewFieldConfig {
     pub templates: Option<Vec<TemplateEntry>>,
 }
 
-/// Normalized meaning of the `date`/`datetime` field flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DateFieldKind {
+/// Field value type, set via `type` in config (the deprecated `date`/`datetime`
+/// boolean flags map onto the same variants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldType {
     /// Calendar date only (`yyyy-MM-dd`).
     Date,
     /// Date with time, timezone-aware.
@@ -313,16 +317,25 @@ pub enum DateFieldKind {
 }
 
 impl CustomViewFieldConfig {
-    /// Normalizes the `date`/`datetime` flags into one kind.
-    /// Caller should have validated that they aren't both set.
-    pub fn date_kind(&self) -> Option<DateFieldKind> {
+    /// Resolves the field's kind: `type` when set, otherwise the deprecated
+    /// `date`/`datetime` flags. Caller should have validated that the
+    /// combination is consistent.
+    pub fn effective_type(&self) -> Option<FieldType> {
+        if self.r#type.is_some() {
+            return self.r#type;
+        }
         if self.date == Some(true) {
-            Some(DateFieldKind::Date)
+            Some(FieldType::Date)
         } else if self.datetime == Some(true) {
-            Some(DateFieldKind::DateTime)
+            Some(FieldType::DateTime)
         } else {
             None
         }
+    }
+
+    /// True when the deprecated `date`/`datetime` boolean flags are present.
+    pub const fn uses_legacy_date_flags(&self) -> bool {
+        self.date.is_some() || self.datetime.is_some()
     }
 
     /// Returns the unified list of templates from `template` and `templates`.
@@ -375,36 +388,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn date_kind_is_none_by_default() {
+    fn effective_type_is_none_by_default() {
         let field = CustomViewFieldConfig::default();
-        assert_eq!(field.date_kind(), None);
+        assert_eq!(field.effective_type(), None);
     }
 
     #[test]
-    fn date_kind_from_date_flag() {
+    fn effective_type_from_type() {
+        let field = CustomViewFieldConfig {
+            r#type: Some(FieldType::Date),
+            ..Default::default()
+        };
+        assert_eq!(field.effective_type(), Some(FieldType::Date));
+
+        let field = CustomViewFieldConfig {
+            r#type: Some(FieldType::DateTime),
+            ..Default::default()
+        };
+        assert_eq!(field.effective_type(), Some(FieldType::DateTime));
+    }
+
+    #[test]
+    fn type_deserializes_from_lowercase_names() {
+        let field: CustomViewFieldConfig =
+            json5::from_str(r#"{ field_id: "duedate", type: "date" }"#).expect("valid config");
+        assert_eq!(field.effective_type(), Some(FieldType::Date));
+
+        let field: CustomViewFieldConfig =
+            json5::from_str(r#"{ field_id: "created", type: "datetime" }"#).expect("valid config");
+        assert_eq!(field.effective_type(), Some(FieldType::DateTime));
+    }
+
+    #[test]
+    fn effective_type_from_legacy_date_flag() {
         let field = CustomViewFieldConfig {
             date: Some(true),
             ..Default::default()
         };
-        assert_eq!(field.date_kind(), Some(DateFieldKind::Date));
+        assert_eq!(field.effective_type(), Some(FieldType::Date));
     }
 
     #[test]
-    fn date_kind_from_datetime_flag() {
+    fn effective_type_from_legacy_datetime_flag() {
         let field = CustomViewFieldConfig {
             datetime: Some(true),
             ..Default::default()
         };
-        assert_eq!(field.date_kind(), Some(DateFieldKind::DateTime));
+        assert_eq!(field.effective_type(), Some(FieldType::DateTime));
     }
 
     #[test]
-    fn date_kind_ignores_explicit_false() {
+    fn type_wins_over_legacy_flags() {
+        let field = CustomViewFieldConfig {
+            r#type: Some(FieldType::DateTime),
+            date: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(field.effective_type(), Some(FieldType::DateTime));
+    }
+
+    #[test]
+    fn effective_type_ignores_explicit_false() {
         let field = CustomViewFieldConfig {
             date: Some(false),
             datetime: Some(false),
             ..Default::default()
         };
-        assert_eq!(field.date_kind(), None);
+        assert_eq!(field.effective_type(), None);
     }
 }

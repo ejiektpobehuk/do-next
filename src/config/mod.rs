@@ -115,6 +115,13 @@ fn validate_team_config(team: &TeamConfig) -> Result<()> {
                         field.field_id
                     ));
                 }
+                if field.r#type.is_some() && field.uses_legacy_date_flags() {
+                    return Err(anyhow!(
+                        "view '{}', field '{}': set `type`, not the deprecated `date`/`datetime` flags alongside it",
+                        view_id,
+                        field.field_id
+                    ));
+                }
                 if field.date == Some(true) && field.datetime == Some(true) {
                     return Err(anyhow!(
                         "view '{}', field '{}': set either `date` or `datetime`, not both",
@@ -201,6 +208,43 @@ mod tests {
             ..Default::default()
         });
         assert!(validate_team_config(&team).is_ok());
+    }
+
+    #[test]
+    fn type_alone_is_valid() {
+        let team = team_with_field(CustomViewFieldConfig {
+            field_id: "duedate".into(),
+            r#type: Some(crate::config::types::FieldType::Date),
+            ..Default::default()
+        });
+        assert!(validate_team_config(&team).is_ok());
+    }
+
+    #[test]
+    fn type_alongside_legacy_flag_is_an_error() {
+        let team = team_with_field(CustomViewFieldConfig {
+            field_id: "duedate".into(),
+            r#type: Some(crate::config::types::FieldType::DateTime),
+            datetime: Some(true),
+            ..Default::default()
+        });
+        let err = validate_team_config(&team).expect_err("conflict must be rejected");
+        assert!(err.to_string().contains("deprecated"));
+    }
+
+    #[test]
+    fn legacy_flags_produce_deprecation_warning() {
+        let team = team_with_field(CustomViewFieldConfig {
+            field_id: "duedate".into(),
+            date: Some(true),
+            ..Default::default()
+        });
+        let warnings = collect_team_warnings(&team, std::path::Path::new("."));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("deprecated") && w.contains("type: \"date\""))
+        );
     }
 
     // ── Source kinds ─────────────────────────────────────────────────────
@@ -442,13 +486,27 @@ fn apply_confluence_override(base: &mut JiraConfig, overlay: &ConfluenceConfig) 
     }
 }
 
-/// Walk template references and report paths that can't be read or are empty.
-/// Non-fatal — these surface as warnings instead of failing the team load.
+/// Walk view fields and report non-fatal issues: deprecated config keys and
+/// template paths that can't be read or are empty. These surface as warnings
+/// instead of failing the team load.
 fn collect_team_warnings(team: &TeamConfig, dir: &Path) -> Vec<String> {
     let mut warnings = Vec::new();
     for (view_id, view) in &team.views {
         for section in &view.sections {
             for field in &section.fields {
+                if field.uses_legacy_date_flags() {
+                    let advice = if field.datetime == Some(true) {
+                        "use `type: \"datetime\"`"
+                    } else if field.date == Some(true) {
+                        "use `type: \"date\"`"
+                    } else {
+                        "remove them"
+                    };
+                    warnings.push(format!(
+                        "view '{}', field '{}': `date`/`datetime` flags are deprecated, {}",
+                        view_id, field.field_id, advice
+                    ));
+                }
                 let paths: Vec<&str> = if let Some(p) = &field.template {
                     vec![p.as_str()]
                 } else if let Some(entries) = &field.templates {
