@@ -137,8 +137,13 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
                 StorageChoice::Keyring => OAuthStore::Keyring,
                 _ => OAuthStore::File,
             };
-            // First run: no team sources exist yet, so no Confluence scopes.
-            crate::jira::oauth::run_oauth_flow(&client_id, &client_secret, store, false)?;
+            // First run: no team sources exist yet, so no granular scopes.
+            crate::jira::oauth::run_oauth_flow(
+                &client_id,
+                &client_secret,
+                store,
+                crate::jira::oauth::ExtraScopes::default(),
+            )?;
             jira_config.auth_method = Some("oauth".into());
             jira_config.oauth_client_id = Some(client_id);
             jira_config.oauth_client_secret = Some(client_secret);
@@ -210,7 +215,10 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
 
 /// Reconfigure authentication for an existing install without overwriting other config.
 #[allow(clippy::too_many_lines)]
-pub fn run_auth_reset(config: &mut Config, include_confluence: bool) -> Result<()> {
+pub fn run_auth_reset(
+    config: &mut Config,
+    extra_scopes: crate::jira::oauth::ExtraScopes,
+) -> Result<()> {
     if config.jira.base_url.is_empty() {
         return Err(anyhow::anyhow!(
             "No configuration found. Run do-next first to complete initial setup."
@@ -250,12 +258,7 @@ pub fn run_auth_reset(config: &mut Config, include_confluence: bool) -> Result<(
                 StorageChoice::Keyring => OAuthStore::Keyring,
                 _ => OAuthStore::File,
             };
-            crate::jira::oauth::run_oauth_flow(
-                &client_id,
-                &client_secret,
-                store,
-                include_confluence,
-            )?;
+            crate::jira::oauth::run_oauth_flow(&client_id, &client_secret, store, extra_scopes)?;
             config.jira.auth_method = Some("oauth".into());
             config.jira.oauth_client_id = Some(client_id);
             config.jira.oauth_client_secret = Some(client_secret);

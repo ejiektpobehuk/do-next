@@ -138,6 +138,135 @@ pub struct TransitionsResponse {
     pub transitions: Vec<Transition>,
 }
 
+/// Agile board type from the configuration response.
+/// Team-managed (next-gen) boards report "simple" regardless of sprint
+/// support, so this alone cannot decide whether a board has sprints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BoardType {
+    Scrum,
+    Kanban,
+    Simple,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Agile board configuration (`GET /rest/agile/1.0/board/{id}/configuration`).
+/// Carries the ordered columns and the board type — one call serves both.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BoardConfiguration {
+    pub id: u64,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub board_type: BoardType,
+    #[serde(rename = "columnConfig")]
+    pub column_config: ColumnConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ColumnConfig {
+    pub columns: Vec<BoardColumn>,
+}
+
+/// One board column, in board order. A column maps to one or more statuses;
+/// `statuses` may be empty for columns with no mapped status.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BoardColumn {
+    pub name: String,
+    #[serde(default)]
+    pub statuses: Vec<ColumnStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ColumnStatus {
+    /// Status id; joins `Issue.fields.status.id`.
+    pub id: String,
+}
+
+impl BoardColumn {
+    pub fn contains_status(&self, status_id: &str) -> bool {
+        self.statuses.iter().any(|s| s.id == status_id)
+    }
+}
+
+/// Agile sprint (`GET /rest/agile/1.0/board/{id}/sprint`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Sprint {
+    pub id: u64,
+    pub name: String,
+    /// "active" | "future" | "closed"
+    pub state: String,
+}
+
+/// Agile values-list page envelope (isLast-based; used by the sprint list).
+#[derive(Debug, Deserialize)]
+pub struct AgilePage<T> {
+    pub values: Vec<T>,
+    #[serde(rename = "isLast", default)]
+    pub is_last: bool,
+}
+
+/// Agile issue-list envelope. Unlike the v3 `SearchResponse`, Agile issue
+/// endpoints return `total` and no `isLast` — pagination goes by total.
+#[derive(Debug, Deserialize)]
+pub struct AgileIssuesResponse {
+    pub issues: Vec<Issue>,
+    pub total: u32,
+}
+
+/// Resolved query-swimlane assignment for one board source, computed at
+/// fetch time. Keys absent from `assignment` belong to the trailing
+/// "everything else" lane when the config enables it.
+#[derive(Debug, Clone)]
+pub struct BoardSwimlanes {
+    /// Lane names in display order.
+    pub lane_names: Vec<String>,
+    /// Issue key → index into `lane_names`.
+    pub assignment: std::collections::HashMap<String, usize>,
+}
+
+/// Lane definition from Jira's internal `GreenHopper` API (the only place
+/// swimlane config exists — it is absent from the public Agile API).
+/// Deliberately tolerant: only the fields we need, everything defaulted,
+/// unknown fields ignored, because the endpoint is undocumented.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GreenHopperSwimlane {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default, rename = "isDefault")]
+    pub is_default: bool,
+}
+
+/// Envelope for the `GreenHopper` board payload; we extract only the swimlane
+/// list. Tolerant of both observed layouts (`swimlanes` at the top level or
+/// nested under `swimlanesData`) since the endpoint is undocumented.
+#[derive(Debug, Deserialize)]
+pub struct GreenHopperBoardData {
+    #[serde(default)]
+    pub swimlanes: Vec<GreenHopperSwimlane>,
+    #[serde(default, rename = "swimlanesData")]
+    pub swimlanes_data: Option<GreenHopperSwimlanesData>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GreenHopperSwimlanesData {
+    #[serde(default)]
+    pub swimlanes: Vec<GreenHopperSwimlane>,
+}
+
+impl GreenHopperBoardData {
+    /// The swimlane list, wherever the payload put it.
+    pub fn into_swimlanes(self) -> Vec<GreenHopperSwimlane> {
+        if self.swimlanes.is_empty() {
+            self.swimlanes_data.map(|d| d.swimlanes).unwrap_or_default()
+        } else {
+            self.swimlanes
+        }
+    }
+}
+
 /// Metadata for a single Jira field (from `/rest/api/3/field`).
 #[derive(Debug, Deserialize)]
 pub struct FieldMeta {
@@ -217,4 +346,111 @@ fn is_adf_custom_field_type(custom: &str) -> bool {
         custom,
         "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Trimmed capture of `GET /rest/agile/1.0/board/{id}/configuration`,
+    /// keeping the envelope fields we ignore to prove tolerance.
+    const BOARD_CONFIG_JSON: &str = r#"{
+        "id": 10000,
+        "name": "Team board",
+        "type": "kanban",
+        "self": "https://acme.atlassian.net/rest/agile/1.0/board/10000/configuration",
+        "location": { "type": "project", "key": "PROJ" },
+        "filter": { "id": "10001" },
+        "columnConfig": {
+            "columns": [
+                { "name": "Backlog", "statuses": [] },
+                { "name": "To Do", "statuses": [{ "id": "10100", "self": "..." }] },
+                { "name": "In Progress", "statuses": [{ "id": "3", "self": "..." }, { "id": "10101", "self": "..." }] },
+                { "name": "Done", "statuses": [{ "id": "10200", "self": "..." }] }
+            ],
+            "constraintType": "issueCount"
+        },
+        "ranking": { "rankCustomFieldId": 10019 }
+    }"#;
+
+    #[test]
+    fn board_configuration_deserializes_from_api_json() {
+        let cfg: BoardConfiguration = serde_json::from_str(BOARD_CONFIG_JSON).unwrap();
+        assert_eq!(cfg.id, 10000);
+        assert_eq!(cfg.board_type, BoardType::Kanban);
+        let cols = &cfg.column_config.columns;
+        assert_eq!(
+            cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["Backlog", "To Do", "In Progress", "Done"]
+        );
+        assert!(cols[0].statuses.is_empty());
+        assert!(cols[2].contains_status("3"));
+        assert!(cols[2].contains_status("10101"));
+        assert!(!cols[2].contains_status("10100"));
+    }
+
+    #[test]
+    fn board_type_covers_simple_and_unknown() {
+        for (json, expected) in [
+            (r#""scrum""#, BoardType::Scrum),
+            (r#""simple""#, BoardType::Simple),
+            (r#""next-gen-mystery""#, BoardType::Unknown),
+        ] {
+            let ty: BoardType = serde_json::from_str(json).unwrap();
+            assert_eq!(ty, expected);
+        }
+    }
+
+    #[test]
+    fn agile_issue_envelope_paginates_by_total_not_is_last() {
+        let json = r#"{ "startAt": 0, "maxResults": 50, "total": 120, "issues": [] }"#;
+        let page: AgileIssuesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(page.total, 120);
+        assert!(page.issues.is_empty());
+    }
+
+    #[test]
+    fn sprint_page_deserializes() {
+        let json = r#"{
+            "maxResults": 50, "startAt": 0, "isLast": true,
+            "values": [{ "id": 137, "name": "Sprint 12", "state": "active", "goal": "ship" }]
+        }"#;
+        let page: AgilePage<Sprint> = serde_json::from_str(json).unwrap();
+        assert!(page.is_last);
+        assert_eq!(page.values[0].id, 137);
+        assert_eq!(page.values[0].state, "active");
+    }
+
+    #[test]
+    fn greenhopper_swimlanes_tolerate_both_layouts_and_junk() {
+        // Top-level `swimlanes` (lane definitions with query + default lane).
+        let top: GreenHopperBoardData = serde_json::from_str(
+            r#"{
+                "rapidViewId": 42,
+                "swimlanes": [
+                    { "id": 1, "name": "Expedite", "query": "priority = Highest", "isDefault": false },
+                    { "id": 2, "name": "Everything Else", "query": "", "isDefault": true }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let lanes = top.into_swimlanes();
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].query, "priority = Highest");
+        assert!(lanes[1].is_default);
+
+        // Nested `swimlanesData.swimlanes` layout.
+        let nested: GreenHopperBoardData = serde_json::from_str(
+            r#"{ "swimlanesData": { "swimlanes": [{ "name": "Bugs", "query": "type = Bug" }] } }"#,
+        )
+        .unwrap();
+        let lanes = nested.into_swimlanes();
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].name, "Bugs");
+        assert!(!lanes[0].is_default);
+
+        // No swimlane data at all → empty, not an error.
+        let none: GreenHopperBoardData = serde_json::from_str(r#"{ "otherStuff": 1 }"#).unwrap();
+        assert!(none.into_swimlanes().is_empty());
+    }
 }

@@ -1,12 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::types::SourceConfig;
+use crate::config::types::{QueryLane, SourceConfig, SprintSelector, SwimlaneConfig};
 use crate::confluence::ConfluenceClient;
 use crate::events::{ActionResult, AppEvent};
 use crate::items::WorkItem;
 use crate::jira::JiraClient;
+use crate::jira::types::{BoardSwimlanes, BoardType, Issue};
 
 /// Spawn a background task that fetches issues for one source and sends
 /// an `AppEvent::SourceLoaded` or `AppEvent::SourceError` when done.
@@ -68,6 +69,234 @@ pub fn spawn_fetch(client: JiraClient, source_cfg: SourceConfig, tx: UnboundedSe
         );
         let _ = tx.send(AppEvent::SourceLoaded(source_id, items));
     });
+}
+
+/// Spawn a background task that fetches a Jira Agile board source: the
+/// column configuration first (`BoardConfigLoaded`), then the issue set per
+/// sprint selector (`SourceLoaded`), then — for query-swimlane strategies —
+/// the lane assignment (`BoardLanesLoaded`). Lane failures degrade the board
+/// to laneless; they never fail the source.
+pub fn spawn_board_fetch(client: JiraClient, source_cfg: SourceConfig, tx: UnboundedSender<AppEvent>) {
+    let source_id = source_cfg.id.clone();
+    tokio::spawn(async move {
+        // Validation guarantees Some; unwrap_or_default keeps the task panic-free.
+        let filters = source_cfg.board.clone().unwrap_or_default();
+
+        // Without columns the kanban view can't place a single card, so a
+        // failed configuration fetch fails the whole source (matching how a
+        // failed JQL fetch behaves).
+        log::debug!(
+            "Board '{}': fetching configuration for board_id={}",
+            source_id,
+            filters.board_id
+        );
+        let config = match client.get_board_configuration(filters.board_id).await {
+            Ok(config) => config,
+            Err(e) => {
+                log::debug!("Board '{source_id}': configuration fetch failed: {e:#}");
+                let _ = tx.send(AppEvent::SourceError(source_id, e));
+                return;
+            }
+        };
+        let board_type = config.board_type;
+        log::debug!(
+            "Board '{}': configuration ok (type={:?}, {} columns); fetching issues (sprint={:?})",
+            source_id,
+            board_type,
+            config.column_config.columns.len(),
+            filters.sprint
+        );
+        let _ = tx.send(AppEvent::BoardConfigLoaded(source_id.clone(), config));
+
+        let issues =
+            match fetch_issues_for_selector(&client, filters.board_id, filters.sprint, board_type)
+                .await
+            {
+                Ok(issues) => issues,
+                Err(e) => {
+                    log::debug!("Board '{source_id}': issue fetch failed: {e:#}");
+                    let _ = tx.send(AppEvent::SourceError(source_id, e));
+                    return;
+                }
+            };
+
+        let keys: Vec<String> = issues.iter().map(|i| i.key.clone()).collect();
+        let items: Vec<WorkItem> = issues
+            .into_iter()
+            .map(|issue| {
+                let mut item = WorkItem::Jira(issue);
+                item.set_source(source_id.clone(), 0);
+                item
+            })
+            .collect();
+        log::debug!(
+            "Board source '{}' fetch complete: {} items",
+            source_id,
+            items.len()
+        );
+        let _ = tx.send(AppEvent::SourceLoaded(source_id.clone(), items));
+
+        // Lane resolution. Field lanes need no fetch (grouped in the TUI);
+        // auto/query lanes resolve membership via the public search API.
+        let (lanes, everything_else, else_name) = match &filters.swimlanes {
+            Some(SwimlaneConfig::Auto) => {
+                match client.get_greenhopper_swimlanes(filters.board_id).await {
+                    Ok(gh_lanes) => {
+                        let else_name = gh_lanes
+                            .iter()
+                            .find(|l| l.is_default)
+                            .map_or_else(|| "Everything Else".to_string(), |l| l.name.clone());
+                        let lanes: Vec<QueryLane> = gh_lanes
+                            .into_iter()
+                            .filter(|l| !l.is_default && !l.query.is_empty())
+                            .map(|l| QueryLane {
+                                name: l.name,
+                                jql: l.query,
+                            })
+                            .collect();
+                        (lanes, true, else_name)
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::BoardLanesLoaded(source_id, Err(e)));
+                        return;
+                    }
+                }
+            }
+            Some(SwimlaneConfig::Queries {
+                lanes,
+                everything_else,
+            }) => (
+                lanes.clone(),
+                *everything_else,
+                "Everything Else".to_string(),
+            ),
+            Some(SwimlaneConfig::Field { .. }) | None => return,
+        };
+
+        let result = resolve_query_lanes(&client, &keys, &lanes, everything_else, &else_name).await;
+        let _ = tx.send(AppEvent::BoardLanesLoaded(source_id, result));
+    });
+}
+
+/// The issue set a board source shows, per its sprint selector.
+async fn fetch_issues_for_selector(
+    client: &JiraClient,
+    board_id: u64,
+    sprint: SprintSelector,
+    board_type: BoardType,
+) -> anyhow::Result<Vec<Issue>> {
+    // Kanban boards have no sprints; the selector is ignored.
+    let selector = if board_type == BoardType::Kanban {
+        SprintSelector::All
+    } else {
+        sprint
+    };
+    match selector {
+        SprintSelector::All => client.fetch_board_issues(board_id).await,
+        SprintSelector::Id(sprint_id) => {
+            client.fetch_board_sprint_issues(board_id, sprint_id).await
+        }
+        SprintSelector::Active => {
+            match client.get_board_sprints(board_id, "active").await? {
+                // HTTP 400: the board doesn't support sprints at all
+                // (sprint-less team-managed board) — show all its issues.
+                None => {
+                    log::debug!("Board {board_id}: no sprint support (400); fetching all issues");
+                    client.fetch_board_issues(board_id).await
+                }
+                // Sprints supported but none active: an empty board, NOT
+                // all-issues — that would silently include the backlog.
+                Some(sprints) if sprints.is_empty() => {
+                    log::debug!("Board {board_id}: sprints supported but none active; empty board");
+                    Ok(Vec::new())
+                }
+                // Parallel active sprints are possible; concatenate in sprint
+                // order, deduped by key like the subsource loop above.
+                Some(sprints) => {
+                    log::debug!("Board {board_id}: {} active sprint(s)", sprints.len());
+                    let mut all: Vec<Issue> = Vec::new();
+                    let mut seen: HashSet<String> = HashSet::new();
+                    for sprint in sprints {
+                        let issues =
+                            client.fetch_board_sprint_issues(board_id, sprint.id).await?;
+                        for issue in issues {
+                            if seen.insert(issue.key.clone()) {
+                                all.push(issue);
+                            }
+                        }
+                    }
+                    Ok(all)
+                }
+            }
+        }
+    }
+}
+
+/// Keys are checked against lane JQL in chunks this size; Jira comfortably
+/// handles `issueKey in (...)` lists of this length.
+const LANE_CHUNK: usize = 100;
+
+/// Evaluate query-lane membership through the public search API: each lane's
+/// JQL is intersected with the board's keys via chunked `issueKey in (...)`
+/// searches, then folded first-match-wins (Jira query-swimlane semantics).
+async fn resolve_query_lanes(
+    client: &JiraClient,
+    keys: &[String],
+    lanes: &[QueryLane],
+    everything_else: bool,
+    else_name: &str,
+) -> anyhow::Result<BoardSwimlanes> {
+    let mut per_lane_matches: Vec<Vec<String>> = Vec::with_capacity(lanes.len());
+    for lane in lanes {
+        let mut matches = Vec::new();
+        for chunk in keys.chunks(LANE_CHUNK) {
+            let jql = membership_jql(chunk, &lane.jql);
+            matches.extend(client.fetch_jql_keys(&jql).await?);
+        }
+        per_lane_matches.push(matches);
+    }
+    let lane_names: Vec<String> = lanes.iter().map(|l| l.name.clone()).collect();
+    Ok(build_lane_assignment(
+        keys,
+        lane_names,
+        &per_lane_matches,
+        everything_else.then(|| else_name.to_string()),
+    ))
+}
+
+/// `issueKey in (K-1, K-2, ...) AND (<lane jql>)`
+fn membership_jql(keys: &[String], lane_jql: &str) -> String {
+    format!("issueKey in ({}) AND ({lane_jql})", keys.join(", "))
+}
+
+/// Pure fold of per-lane match lists into a lane assignment. The first lane
+/// whose query matched an issue wins; leftovers go to a trailing
+/// everything-else lane when one is given (and only if any exist).
+fn build_lane_assignment(
+    all_keys: &[String],
+    mut lane_names: Vec<String>,
+    per_lane_matches: &[Vec<String>],
+    everything_else: Option<String>,
+) -> BoardSwimlanes {
+    let mut assignment: HashMap<String, usize> = HashMap::new();
+    for (idx, matches) in per_lane_matches.iter().enumerate() {
+        for key in matches {
+            assignment.entry(key.clone()).or_insert(idx);
+        }
+    }
+    if let Some(else_name) = everything_else
+        && all_keys.iter().any(|k| !assignment.contains_key(k))
+    {
+        let else_idx = lane_names.len();
+        lane_names.push(else_name);
+        for key in all_keys {
+            assignment.entry(key.clone()).or_insert(else_idx);
+        }
+    }
+    BoardSwimlanes {
+        lane_names,
+        assignment,
+    }
 }
 
 /// Spawn a background task that fetches Confluence inline tasks for one
@@ -236,4 +465,56 @@ pub fn spawn_refresh_issue(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn membership_jql_intersects_keys_with_lane_query() {
+        let jql = membership_jql(&keys(&["A-1", "A-2"]), "priority = Highest");
+        assert_eq!(jql, "issueKey in (A-1, A-2) AND (priority = Highest)");
+    }
+
+    #[test]
+    fn lane_assignment_is_first_match_wins() {
+        let all = keys(&["A-1", "A-2", "A-3"]);
+        // A-1 matches both lanes; the first lane must win.
+        let result = build_lane_assignment(
+            &all,
+            vec!["Expedite".into(), "Bugs".into()],
+            &[keys(&["A-1"]), keys(&["A-1", "A-2"])],
+            None,
+        );
+        assert_eq!(result.lane_names, ["Expedite", "Bugs"]);
+        assert_eq!(result.assignment["A-1"], 0);
+        assert_eq!(result.assignment["A-2"], 1);
+        assert!(!result.assignment.contains_key("A-3"));
+    }
+
+    #[test]
+    fn everything_else_lane_appended_only_when_leftovers_exist() {
+        let all = keys(&["A-1", "A-2"]);
+        let with_leftovers = build_lane_assignment(
+            &all,
+            vec!["Expedite".into()],
+            &[keys(&["A-1"])],
+            Some("Everything Else".into()),
+        );
+        assert_eq!(with_leftovers.lane_names, ["Expedite", "Everything Else"]);
+        assert_eq!(with_leftovers.assignment["A-2"], 1);
+
+        let fully_assigned = build_lane_assignment(
+            &all,
+            vec!["Expedite".into()],
+            &[keys(&["A-1", "A-2"])],
+            Some("Everything Else".into()),
+        );
+        assert_eq!(fully_assigned.lane_names, ["Expedite"]);
+    }
 }

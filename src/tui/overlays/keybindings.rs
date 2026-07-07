@@ -103,5 +103,12 @@ fn right_column() -> Vec<Line<'static>> {
         key_line("Alt+1", "open status filter"),
         key_line("Alt+2", "open project filter"),
         key_line("Enter", "open result (fullscreen detail)"),
+        Line::raw(""),
+        section_header("Board tab"),
+        key_line("Tab / ⇧Tab", "switch to/from a board tab"),
+        key_line("← → / h l", "move between columns"),
+        key_line("↑ ↓ / j k", "move between cards / lanes"),
+        key_line("t", "move card to a column"),
+        key_line("Enter", "open card (Esc returns to board)"),
     ]
 }

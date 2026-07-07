@@ -40,7 +40,7 @@ pub fn render(
     list_state: &mut ratatui::widgets::ListState,
     render_out: &mut RenderOut,
 ) {
-    let show_tabs = app.resolved_teams.len() > 1;
+    let show_tabs = app.tab_list().len() > 1;
 
     // Layout: top bar (1) | [tab bar (1)] | main area (rest) | hint bar (1)
     let root = if show_tabs {
@@ -81,6 +81,8 @@ pub fn render(
     let popup = app.popup_active();
     if app.fullscreen_detail {
         render_detail(f, main_area, app, !popup, render_out);
+    } else if app.board_view.is_some() {
+        crate::tui::board::render_board(f, main_area, app, !popup);
     } else {
         // Main: list (30%) | detail (70%)
         let main = Layout::default()
@@ -121,6 +123,9 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
     match &app.action_state {
         ActionState::SelectingTransition { .. } => {
             overlays::transition::render_transition_overlay(f, &app.action_state);
+        }
+        ActionState::SelectingBoardColumn { .. } => {
+            overlays::board_column::render_board_column_overlay(f, &app.action_state);
         }
         ActionState::HidePopup { .. } => {
             overlays::hide::render_hide_overlay(f, &app.action_state, app.team_config());
@@ -289,13 +294,27 @@ fn render_title(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
 }
 
 fn render_tab_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
+    use crate::tui::app::source_config_for;
+
+    let tabs = app.tab_list();
+    let active = app.active_tab_index();
     let mut spans = Vec::new();
-    for (i, team) in app.resolved_teams.iter().enumerate() {
+    for (i, (team_idx, board)) in tabs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw(" "));
         }
-        let label = format!(" {} ", team.id);
-        if i == app.active_team_idx {
+        let team = &app.resolved_teams[*team_idx];
+        // Board tabs are labelled by the board source's display name and
+        // prefixed to read as a distinct kind of tab.
+        let label = board.as_ref().map_or_else(
+            || format!(" {} ", team.id),
+            |src_id| {
+                let name = source_config_for(&team.config, src_id)
+                    .map_or(src_id.as_str(), |s| s.display_name());
+                format!(" ▤ {name} ")
+            },
+        );
+        if i == active {
             spans.push(Span::styled(
                 label,
                 Style::default()

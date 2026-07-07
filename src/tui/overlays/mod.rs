@@ -1,4 +1,5 @@
 pub mod await_spinner;
+pub mod board_column;
 pub mod comment_edit_confirm;
 pub mod create_issue;
 pub mod datetime_picker;

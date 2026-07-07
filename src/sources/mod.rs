@@ -8,7 +8,7 @@ use crate::config::types::{SourceKind, TeamConfig};
 use crate::confluence::ConfluenceClient;
 use crate::events::AppEvent;
 use crate::jira::JiraClient;
-use fetcher::{spawn_confluence_fetch, spawn_fetch};
+use fetcher::{spawn_board_fetch, spawn_confluence_fetch, spawn_fetch};
 
 /// Per-backend HTTP clients, keyed by base URL.
 pub struct Clients {
@@ -42,6 +42,9 @@ pub fn spawn_fetches(
                         anyhow::anyhow!("Confluence is not configured for this team"),
                     ));
                 }
+            }
+            SourceKind::Board => {
+                spawn_board_fetch(jira.clone(), source_cfg.clone(), tx.clone());
             }
         }
     }

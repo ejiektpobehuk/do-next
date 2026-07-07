@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::items::WorkItem;
 use crate::jira::types::{
-    Attachment, Comment, FieldOption, FieldSchema, Issue, IssueTypeField, ProjectInfo, StatusInfo,
-    Transition,
+    Attachment, Comment, FieldOption, FieldSchema, Issue, IssueTypeField, ProjectInfo, StatusField,
+    StatusInfo, Transition,
 };
 
 #[derive(Debug)]
@@ -16,6 +16,13 @@ pub enum AppEvent {
     SourceError(String, anyhow::Error),
     /// One subsource fetch failed; other subsources continue.
     SubsourceError(String, usize, anyhow::Error),
+    /// A board source's column configuration arrived. Sent before that
+    /// source's `SourceLoaded` on the same channel, so ordering is guaranteed.
+    BoardConfigLoaded(String, crate::jira::types::BoardConfiguration),
+    /// A board source's query-swimlane assignment resolved (sent after
+    /// `SourceLoaded`; only for `auto`/query lane strategies). Errors degrade
+    /// the board to laneless — they never fail the source.
+    BoardLanesLoaded(String, Result<crate::jira::types::BoardSwimlanes, anyhow::Error>),
     /// A Jira action (transition, comment, assign, move) completed.
     ActionDone(ActionResult),
     /// Current user resolved (sent once on startup).
@@ -80,7 +87,9 @@ pub enum AppEvent {
 pub enum ActionResult {
     TransitionApplied {
         issue_key: String,
-        new_status: String,
+        /// Full target status (id + name) so the board view can re-group the
+        /// card by status id. None when the transition lookup failed.
+        new_status: Option<StatusField>,
     },
     TransitionsLoaded {
         issue_key: String,

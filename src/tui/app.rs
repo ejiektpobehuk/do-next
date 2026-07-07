@@ -8,7 +8,9 @@ use indexmap::IndexMap;
 use crate::config::types::{ResolvedTeam, SourceConfig, TeamConfig};
 use crate::events::{ActionResult, AppEvent};
 use crate::items::WorkItem;
-use crate::jira::types::{Comment, FieldOption, FieldSchema, Issue, ProjectInfo, StatusInfo};
+use crate::jira::types::{
+    BoardConfiguration, Comment, FieldOption, FieldSchema, Issue, ProjectInfo, StatusInfo,
+};
 use crate::tui::search::{RankedHit, SearchFilters};
 
 /// Per-team state that is saved/restored when switching tabs.
@@ -22,6 +24,16 @@ pub struct PerTeamState {
     pub field_names: HashMap<String, String>,
     pub field_schemas: HashMap<String, FieldSchema>,
     pub field_names_state: FieldNamesState,
+    pub board_configs: HashMap<String, BoardConfiguration>,
+    pub board_lanes: HashMap<String, LanesState>,
+}
+
+/// Loading state for a board source's resolved query-swimlanes.
+#[derive(Debug, Clone)]
+pub enum LanesState {
+    Loading,
+    Loaded(crate::jira::types::BoardSwimlanes),
+    Error(String),
 }
 
 /// A navigable item in the list (issue or error row).
@@ -93,6 +105,15 @@ pub enum ActionState {
     SelectingTransition {
         issue_key: String,
         transitions: Vec<crate::jira::types::Transition>,
+        selected: usize,
+    },
+    /// Board-mode move-card picker: the board's columns annotated with the
+    /// transition (if any) that reaches each one. `transitions` is kept so
+    /// `t` inside the picker can swap to the raw transition list refetch-free.
+    SelectingBoardColumn {
+        issue_key: String,
+        transitions: Vec<crate::jira::types::Transition>,
+        columns: Vec<crate::tui::board::BoardColumnChoice>,
         selected: usize,
     },
     LoadingTransitions {
@@ -561,6 +582,13 @@ pub struct AppState {
     /// Set when search opens (or the project picker opens) and the project
     /// cache is still cold; consumed by the background dispatcher.
     pub pending_projects_fetch: bool,
+    /// Column configuration per board source (`source_id` → config).
+    pub board_configs: HashMap<String, BoardConfiguration>,
+    /// Resolved query-swimlanes per board source (`source_id` → state).
+    pub board_lanes: HashMap<String, LanesState>,
+    /// Some(`source_id`) while the kanban board view covers the main area.
+    /// Selection stays in `nav_idx`; the board cursor is derived from it.
+    pub board_view: Option<String>,
 }
 
 /// Request for a silent background attachment fetch.
@@ -641,6 +669,9 @@ impl AppState {
             pending_team_status_fetch: false,
             pending_all_statuses_fetch: false,
             pending_projects_fetch: false,
+            board_configs: HashMap::new(),
+            board_lanes: HashMap::new(),
+            board_view: None,
         }
     }
 
@@ -659,6 +690,8 @@ impl AppState {
             field_names: std::mem::take(&mut self.field_names),
             field_schemas: std::mem::take(&mut self.field_schemas),
             field_names_state: self.flags.field_names.clone(),
+            board_configs: std::mem::take(&mut self.board_configs),
+            board_lanes: std::mem::take(&mut self.board_lanes),
         };
         self.saved_team_states
             .insert(self.active_team_idx, current_state);
@@ -674,6 +707,8 @@ impl AppState {
             self.field_names = saved.field_names;
             self.field_schemas = saved.field_schemas;
             self.flags.field_names = saved.field_names_state;
+            self.board_configs = saved.board_configs;
+            self.board_lanes = saved.board_lanes;
         } else {
             // First time switching to this team — initialize from its config
             self.sources = self.resolved_teams[new_idx]
@@ -689,6 +724,8 @@ impl AppState {
             self.field_names = HashMap::new();
             self.field_schemas = HashMap::new();
             self.flags.field_names = FieldNamesState::Idle;
+            self.board_configs = HashMap::new();
+            self.board_lanes = HashMap::new();
         }
 
         // Reset UI state for the new tab
@@ -706,11 +743,18 @@ impl AppState {
         self.action_state = ActionState::None;
         self.overlay = None;
         self.fullscreen_detail = false;
+        self.board_view = None;
         // Drop any in-flight refresh signals; the running tasks will still
         // send events, but the handler tolerates unknown keys.
         self.refreshing_issues.clear();
         self.pending_refresh_all = false;
         self.pending_refresh_issue = None;
+
+        // Recompute the flat list from the (correct, full) restored sources for
+        // the team-list tab. The saved `issues`/`nav_items` may have been
+        // captured while a board tab was active (board-filtered), so we can't
+        // trust them; `sources` is the source of truth.
+        self.rebuild_issues();
 
         // Trigger source fetches if any sources are still pending
         if self
@@ -719,6 +763,48 @@ impl AppState {
             .any(|s| matches!(s, SourceState::Pending))
         {
             self.flags.pending_team_fetch = true;
+        }
+    }
+
+    /// The ordered tab list. Each team contributes a list tab, immediately
+    /// followed by one tab per board source it defines. A tab is identified by
+    /// `(team_idx, Option<board_source_id>)`; `None` is the team's list view.
+    pub fn tab_list(&self) -> Vec<(usize, Option<String>)> {
+        let mut tabs = Vec::new();
+        for (i, team) in self.resolved_teams.iter().enumerate() {
+            tabs.push((i, None));
+            for src in &team.config.sources {
+                if src.kind == crate::config::types::SourceKind::Board {
+                    tabs.push((i, Some(src.id.clone())));
+                }
+            }
+        }
+        tabs
+    }
+
+    /// Index of the active tab within `tab_list()`.
+    pub fn active_tab_index(&self) -> usize {
+        self.tab_list()
+            .iter()
+            .position(|(t, b)| *t == self.active_team_idx && *b == self.board_view)
+            .unwrap_or(0)
+    }
+
+    /// Activate the tab at `idx` in `tab_list()` (team-list or board view).
+    pub fn activate_tab(&mut self, idx: usize) {
+        let Some((team_idx, board)) = self.tab_list().get(idx).cloned() else {
+            return;
+        };
+        if team_idx != self.active_team_idx {
+            // switch_team resets board_view to None and rebuilds for the list.
+            self.switch_team(team_idx);
+        }
+        if self.board_view != board {
+            self.board_view = board;
+            self.fullscreen_detail = false;
+            self.detail_scroll = 0;
+            self.nav_idx = 0;
+            self.rebuild_issues();
         }
     }
 
@@ -781,12 +867,28 @@ impl AppState {
         self.nav_items.get(self.nav_idx)
     }
 
+    /// Whether a source's items belong in the currently active tab.
+    ///
+    /// Board sources are their own tabs, never part of a team's flat list: on
+    /// a team-list tab (`board_view == None`) all board sources are excluded;
+    /// on a board tab only that one board source is included.
+    fn source_in_active_tab(&self, source_id: &str) -> bool {
+        let is_board = source_config_for(self.team_config(), source_id)
+            .is_some_and(|s| s.kind == crate::config::types::SourceKind::Board);
+        self.board_view
+            .as_deref()
+            .map_or(!is_board, |active| source_id == active)
+    }
+
     /// Rebuild the flat items list from loaded source states (in priority order, deduped),
     /// then rebuild navigable items.
     fn rebuild_issues(&mut self) {
         let mut seen = std::collections::HashSet::new();
         let mut issues = Vec::new();
-        for (_, state) in &self.sources {
+        for (source_id, state) in &self.sources {
+            if !self.source_in_active_tab(source_id) {
+                continue;
+            }
             if let SourceState::Loaded(source_items) = state {
                 for item in source_items {
                     if seen.insert(item.key().to_owned()) {
@@ -806,6 +908,9 @@ impl AppState {
         let mut nav_items = Vec::new();
         let mut issue_pos = 0usize;
         for (source_id, state) in &self.sources {
+            if !self.source_in_active_tab(source_id) {
+                continue;
+            }
             match state {
                 SourceState::Loaded(_) => {
                     let start = issue_pos;
@@ -921,6 +1026,19 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
                 .or_default()
                 .push((subsource_idx, Arc::new(e)));
             // nav rebuild deferred until SourceLoaded arrives for this source
+        }
+
+        AppEvent::BoardConfigLoaded(source_id, config) => {
+            apply_board_config_loaded(app, source_id, config);
+        }
+
+        AppEvent::BoardLanesLoaded(source_id, result) => {
+            let state = match result {
+                Ok(lanes) => LanesState::Loaded(lanes),
+                Err(e) => LanesState::Error(format!("{e:#}")),
+            };
+            app.board_lanes.insert(source_id, state);
+            // No rebuild: lanes only affect board-view grouping, derived per frame.
         }
 
         AppEvent::CurrentUserResolved(user) => {
@@ -1408,7 +1526,7 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
         ActionResult::TransitionApplied {
             ref issue_key,
             ref new_status,
-        } => apply_transition_applied(app, issue_key, new_status),
+        } => apply_transition_applied(app, issue_key, new_status.as_ref()),
         ActionResult::TransitionsLoaded {
             issue_key,
             transitions,
@@ -1506,16 +1624,99 @@ fn apply_hidden(app: &mut AppState, issue_key: &str) {
     app.action_state = ActionState::None;
 }
 
+/// A board fetch (incl. refresh) always starts with the config event, so it
+/// doubles as the lane-state reset point: query-lane strategies get a fresh
+/// `Loading` marker, other strategies clear any stale entry. No nav rebuild —
+/// the `SourceLoaded` that follows on the same channel does it.
+fn apply_board_config_loaded(
+    app: &mut AppState,
+    source_id: String,
+    config: crate::jira::types::BoardConfiguration,
+) {
+    let expects_lanes = source_config_for(app.team_config(), &source_id)
+        .and_then(|s| s.board.as_ref())
+        .and_then(|b| b.swimlanes.as_ref())
+        .is_some_and(|s| {
+            matches!(
+                s,
+                crate::config::types::SwimlaneConfig::Auto
+                    | crate::config::types::SwimlaneConfig::Queries { .. }
+            )
+        });
+    if expects_lanes {
+        app.board_lanes
+            .insert(source_id.clone(), LanesState::Loading);
+    } else {
+        app.board_lanes.remove(&source_id);
+    }
+    app.board_configs.insert(source_id, config);
+}
+
 fn apply_transitions_loaded(
     app: &mut AppState,
     issue_key: String,
     transitions: Vec<crate::jira::types::Transition>,
 ) {
+    // In board mode the same `t` press becomes "move to column"; the raw
+    // picker stays the fallback whenever the column mapping isn't possible,
+    // so `t` never dead-ends.
+    if let Some(state) = board_column_picker_state(app, &issue_key, &transitions) {
+        app.action_state = state;
+        return;
+    }
     app.action_state = ActionState::SelectingTransition {
         issue_key,
         transitions,
         selected: 0,
     };
+}
+
+/// The column-picker state for a board-mode transition, or `None` when the
+/// issue is off-board, the config is missing, or no transition reaches any
+/// column (fall back to the raw transition list).
+fn board_column_picker_state(
+    app: &AppState,
+    issue_key: &str,
+    transitions: &[crate::jira::types::Transition],
+) -> Option<ActionState> {
+    if !board_mode_active(app) {
+        return None;
+    }
+    let source_id = app.board_view.as_deref()?;
+    let config = app.board_configs.get(source_id)?;
+    let is_member = match app.sources.get(source_id) {
+        Some(SourceState::Loaded(items)) => items.iter().any(|i| i.key() == issue_key),
+        _ => false,
+    };
+    if !is_member {
+        return None;
+    }
+    let status_id = app
+        .issues
+        .iter()
+        .find(|i| i.key() == issue_key)
+        .and_then(WorkItem::as_jira)
+        .map(|i| i.fields.status.id.clone())?;
+    let columns = crate::tui::board::map_transitions_to_columns(
+        &config.column_config.columns,
+        &status_id,
+        transitions,
+    );
+    if !columns.iter().any(|c| c.transition_id.is_some()) {
+        return None;
+    }
+    // Start on the first reachable non-current column — the likeliest move.
+    let selected = columns
+        .iter()
+        .position(|c| c.transition_id.is_some() && !c.is_current)
+        .or_else(|| columns.iter().position(|c| c.transition_id.is_some()))
+        .unwrap_or(0);
+    Some(ActionState::SelectingBoardColumn {
+        issue_key: issue_key.to_owned(),
+        transitions: transitions.to_vec(),
+        columns,
+        selected,
+    })
 }
 
 fn apply_field_names_loaded(
@@ -1532,11 +1733,30 @@ fn apply_field_names_loaded(
     }
 }
 
-fn apply_transition_applied(app: &mut AppState, issue_key: &str, new_status: &str) {
-    if let Some(issue) = app.jira_issue_mut(issue_key) {
-        issue.fields.status.name = new_status.to_string();
-    }
+fn apply_transition_applied(
+    app: &mut AppState,
+    issue_key: &str,
+    new_status: Option<&crate::jira::types::StatusField>,
+) {
+    write_transitioned_status(&mut app.issues, issue_key, new_status);
     app.action_state = ActionState::None;
+}
+
+/// Write the transition's target status (id + name) onto the flat item. The
+/// id matters: the board view re-groups cards by `status.id`.
+fn write_transitioned_status(
+    issues: &mut [WorkItem],
+    issue_key: &str,
+    new_status: Option<&crate::jira::types::StatusField>,
+) {
+    let Some(status) = new_status else { return };
+    if let Some(issue) = issues
+        .iter_mut()
+        .find(|i| i.key() == issue_key)
+        .and_then(WorkItem::as_jira_mut)
+    {
+        issue.fields.status = status.clone();
+    }
 }
 
 fn apply_moved_to_project(app: &mut AppState, issue_key: &str, project: &str) {
@@ -2372,6 +2592,10 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
             handle_transition_input(app, event);
             return;
         }
+        ActionState::SelectingBoardColumn { .. } => {
+            handle_board_column_input(app, &event);
+            return;
+        }
         ActionState::HidePopup { .. } => {
             handle_hide_input(app, event);
             return;
@@ -2483,14 +2707,26 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
     }
     app.flags.pending_g = false;
 
+    // Board mode remaps navigation to the 3-D board cursor; anything it
+    // doesn't consume falls through to the normal arms below (item actions
+    // all resolve via selected_item(), so they work unchanged on cards).
+    if board_mode_active(app) && handle_board_key(app, code, modifiers) {
+        return;
+    }
+
     match (code, modifiers) {
-        // Tab switching (only when multiple teams)
-        (KeyCode::Tab, _) if app.resolved_teams.len() > 1 => {
-            app.switch_team((app.active_team_idx + 1) % app.resolved_teams.len());
+        // Tab switching across the tab list (teams + board tabs).
+        (KeyCode::Tab, _) => {
+            let len = app.tab_list().len();
+            if len > 1 {
+                app.activate_tab((app.active_tab_index() + 1) % len);
+            }
         }
-        (KeyCode::BackTab, _) if app.resolved_teams.len() > 1 => {
-            let len = app.resolved_teams.len();
-            app.switch_team((app.active_team_idx + len - 1) % len);
+        (KeyCode::BackTab, _) => {
+            let len = app.tab_list().len();
+            if len > 1 {
+                app.activate_tab((app.active_tab_index() + len - 1) % len);
+            }
         }
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
@@ -2566,6 +2802,92 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         _ => {}
     }
 }
+
+/// True while the kanban board covers the main area (fullscreen detail on a
+/// card temporarily leaves board key handling).
+const fn board_mode_active(app: &AppState) -> bool {
+    app.board_view.is_some() && !app.fullscreen_detail
+}
+
+/// Board-mode key handling. Returns true when the key was consumed.
+fn handle_board_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    use crate::tui::board::{BoardMove, app_board_grouping, cursor_pos};
+
+    // Never swallow control chords (Ctrl+C must keep quitting).
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    let Some(source_id) = app.board_view.clone() else {
+        return false;
+    };
+
+    let Some(grouping) = app_board_grouping(app, &source_id) else {
+        // Config missing (placeholder screen): consume navigation so panel
+        // focus doesn't shift underneath; let everything else through.
+        return matches!(
+            code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Enter
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Char('h' | 'j' | 'k' | 'l' | 'v')
+        );
+    };
+    let on_board = cursor_pos(&grouping, app.nav_idx).is_some();
+
+    match code {
+        KeyCode::Left | KeyCode::Char('h') => board_move(app, &grouping, BoardMove::Left),
+        KeyCode::Right | KeyCode::Char('l') => board_move(app, &grouping, BoardMove::Right),
+        KeyCode::Down | KeyCode::Char('j') => board_move(app, &grouping, BoardMove::Down),
+        KeyCode::Up | KeyCode::Char('k') => board_move(app, &grouping, BoardMove::Up),
+        KeyCode::PageDown => {
+            for _ in 0..5 {
+                board_move(app, &grouping, BoardMove::Down);
+            }
+        }
+        KeyCode::PageUp => {
+            for _ in 0..5 {
+                board_move(app, &grouping, BoardMove::Up);
+            }
+        }
+        KeyCode::Enter => {
+            if on_board {
+                app.fullscreen_detail = true;
+                app.focused_panel = FocusedPanel::Detail;
+                app.detail_scroll = 0;
+            }
+        }
+        // Detail view-mode cycling is meaningless with no detail visible.
+        KeyCode::Char('v') => {}
+        // Item actions on an off-board selection would target an invisible
+        // item — consume them as no-ops. On-board they fall through.
+        KeyCode::Char('t' | 'o' | 'c' | 'i' | 'a' | 'm' | 'r') if !on_board => {}
+        _ => return false,
+    }
+    true
+}
+
+/// Apply a board cursor move to `nav_idx`.
+fn board_move(app: &mut AppState, grouping: &crate::tui::board::BoardGrouping, mv: crate::tui::board::BoardMove) {
+    if let Some(pos) = crate::tui::board::move_cursor(grouping, app.nav_idx, mv) {
+        app.nav_idx = pos;
+        update_view_mode_on_navigate(app);
+    }
+}
+
+/// Board-mode gg/G: jump within the current column (derives the grouping).
+fn board_jump(app: &mut AppState, mv: crate::tui::board::BoardMove) {
+    let Some(source_id) = app.board_view.clone() else {
+        return;
+    };
+    if let Some(grouping) = crate::tui::board::app_board_grouping(app, &source_id) {
+        board_move(app, &grouping, mv);
+    }
+}
+
 
 /// Open the create-issue form. Seeds the project list with the team's
 /// configured projects plus any projects seen in loaded issues; the full
@@ -3286,6 +3608,10 @@ fn first_detail_focus(item: Option<&WorkItem>) -> DetailFocus {
 }
 
 fn key_jump_first(app: &mut AppState) {
+    if board_mode_active(app) {
+        board_jump(app, crate::tui::board::BoardMove::Top);
+        return;
+    }
     if app.focused_panel == FocusedPanel::Detail {
         if matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) {
             app.detail_focus = first_detail_focus(app.selected_item());
@@ -3300,6 +3626,10 @@ fn key_jump_first(app: &mut AppState) {
 }
 
 fn key_jump_last(app: &mut AppState) {
+    if board_mode_active(app) {
+        board_jump(app, crate::tui::board::BoardMove::Bottom);
+        return;
+    }
     if app.focused_panel == FocusedPanel::Detail {
         if matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) {
             let view_cfg = crate::tui::views::custom::current_view_config(app);
@@ -3775,6 +4105,67 @@ fn handle_transition_input(app: &mut AppState, event: crossterm::event::Event) {
                     issue_key: key,
                     transition_id,
                 };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Input for the board column picker: `j/k` skip unreachable columns,
+/// `Enter` fires the mapped transition, `t` swaps to the raw transition
+/// list (same fetched data), `Esc` cancels.
+fn handle_board_column_input(app: &mut AppState, event: &crossterm::event::Event) {
+    use crossterm::event::{Event, KeyCode, KeyEvent};
+    let ActionState::SelectingBoardColumn {
+        ref issue_key,
+        ref transitions,
+        ref columns,
+        ref mut selected,
+    } = app.action_state
+    else {
+        return;
+    };
+
+    let reachable_towards = |from: usize, down: bool| -> Option<usize> {
+        if down {
+            (from + 1..columns.len()).find(|&i| columns[i].transition_id.is_some())
+        } else {
+            (0..from).rev().find(|&i| columns[i].transition_id.is_some())
+        }
+    };
+
+    if let Event::Key(KeyEvent { code, .. }) = *event {
+        match code {
+            KeyCode::Esc => {
+                app.action_state = ActionState::None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(next) = reachable_towards(*selected, true) {
+                    *selected = next;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(prev) = reachable_towards(*selected, false) {
+                    *selected = prev;
+                }
+            }
+            KeyCode::Char('t') => {
+                let key = issue_key.clone();
+                let transitions = transitions.clone();
+                app.action_state = ActionState::SelectingTransition {
+                    issue_key: key,
+                    transitions,
+                    selected: 0,
+                };
+            }
+            KeyCode::Enter => {
+                if let Some(transition_id) = columns[*selected].transition_id.clone() {
+                    let key = issue_key.clone();
+                    app.action_state = ActionState::PendingTransition {
+                        issue_key: key,
+                        transition_id,
+                    };
+                }
             }
             _ => {}
         }
@@ -4493,6 +4884,35 @@ mod tests {
             source_id: source_id.map(str::to_string),
             subsource_idx: 0,
         }
+    }
+
+    #[test]
+    fn write_transitioned_status_updates_id_and_name() {
+        let mut issues = vec![make_item("A-1", "To Do", None)];
+        let target = StatusField {
+            id: "s42".into(),
+            name: "In Progress".into(),
+        };
+        write_transitioned_status(&mut issues, "A-1", Some(&target));
+
+        let WorkItem::Jira(issue) = &issues[0] else {
+            panic!("expected Jira item");
+        };
+        assert_eq!(issue.fields.status.id, "s42");
+        assert_eq!(issue.fields.status.name, "In Progress");
+
+        // None payload (transition lookup failed) leaves the status untouched.
+        write_transitioned_status(&mut issues, "A-1", None);
+        assert_eq!(issue_status(&issues, "A-1"), ("s42", "In Progress"));
+    }
+
+    fn issue_status<'a>(issues: &'a [WorkItem], key: &str) -> (&'a str, &'a str) {
+        let issue = issues
+            .iter()
+            .find(|i| i.key() == key)
+            .and_then(WorkItem::as_jira)
+            .unwrap();
+        (issue.fields.status.id.as_str(), issue.fields.status.name.as_str())
     }
 
     #[test]

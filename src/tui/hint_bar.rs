@@ -85,6 +85,34 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         return;
     }
 
+    if app.board_view.is_some() && !app.fullscreen_detail {
+        let title = Line::from(vec![
+            Span::raw("┤ "),
+            Span::styled("←→", Style::default().fg(Color::Blue)),
+            Span::raw(" column  "),
+            Span::styled("↕", Style::default().fg(Color::Blue)),
+            Span::raw(" card/lane  "),
+            Span::styled("↵", Style::default().fg(Color::Blue)),
+            Span::raw(" open  "),
+            Span::styled("t", Style::default().fg(Color::Blue)),
+            Span::raw(" move  "),
+            Span::styled("Tab", Style::default().fg(Color::Blue)),
+            Span::raw(" switch  "),
+            Span::styled("?", Style::default().fg(Color::Blue)),
+            Span::raw(" ├──"),
+        ])
+        .alignment(Alignment::Right)
+        .style(Style::default().fg(theme::MUTED));
+        f.render_widget(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(theme::MUTED))
+                .title_bottom(title),
+            area,
+        );
+        return;
+    }
+
     let list_focused = app.focused_panel == FocusedPanel::List;
     let can_move_vertical = if list_focused {
         !app.nav_items.is_empty()

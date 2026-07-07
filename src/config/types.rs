@@ -122,6 +122,200 @@ pub enum SourceKind {
     #[default]
     Jira,
     Confluence,
+    /// A Jira Software (Agile) board: issues + column layout from
+    /// `/rest/agile/1.0/`, rendered as a kanban view.
+    Board,
+}
+
+/// Which issues a board source shows: the active sprint (default), all board
+/// issues, or one specific sprint by numeric id. Kanban-type boards have no
+/// sprints and always show all board issues.
+///
+/// Serde is hand-written because the JSON5 forms are heterogeneous
+/// (`"active"` | `"all"` | `137`) and `#[serde(untagged)]` is unreliable
+/// through json5's `deserialize_any` number handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SprintSelector {
+    #[default]
+    Active,
+    All,
+    Id(u64),
+}
+
+impl Serialize for SprintSelector {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Active => serializer.serialize_str("active"),
+            Self::All => serializer.serialize_str("all"),
+            Self::Id(id) => serializer.serialize_u64(*id),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SprintSelector {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SelectorVisitor;
+
+        impl serde::de::Visitor<'_> for SelectorVisitor {
+            type Value = SprintSelector;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("\"active\", \"all\", or a numeric sprint id")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "active" => Ok(SprintSelector::Active),
+                    "all" => Ok(SprintSelector::All),
+                    other => Err(E::custom(format!(
+                        "`sprint` must be \"active\", \"all\" or a sprint id (got \"{other}\")"
+                    ))),
+                }
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(SprintSelector::Id(v))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                u64::try_from(v)
+                    .map(SprintSelector::Id)
+                    .map_err(|_| E::custom("`sprint` id must be non-negative"))
+            }
+
+            // json5 parses all numbers as floats.
+            #[allow(clippy::cast_precision_loss)]
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                if v.fract() == 0.0 && v >= 0.0 && v <= u64::MAX as f64 {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    Ok(SprintSelector::Id(v as u64))
+                } else {
+                    Err(E::custom("`sprint` id must be a non-negative integer"))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(SelectorVisitor)
+    }
+}
+
+/// One query-based swimlane: issues matching `jql` land in this lane.
+/// Lanes are evaluated in order; the first matching lane wins (Jira
+/// query-swimlane semantics).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct QueryLane {
+    pub name: String,
+    pub jql: String,
+}
+
+/// Swimlane strategy for a board source.
+///
+/// JSON5 forms:
+/// - `"auto"` — read the board's real lane definitions from Jira's internal
+///   `GreenHopper` API (basic auth only; unsupported under OAuth).
+/// - `{ field: "priority" }` — one lane per distinct value of a field.
+/// - `{ lanes: [{name, jql}, ...], everything_else: true }` — explicit query
+///   lanes, mirroring the board's configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwimlaneConfig {
+    Auto,
+    Field { field: String },
+    Queries { lanes: Vec<QueryLane>, everything_else: bool },
+}
+
+impl Serialize for SwimlaneConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Field { field } => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("field", field)?;
+                map.end()
+            }
+            Self::Queries {
+                lanes,
+                everything_else,
+            } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("lanes", lanes)?;
+                map.serialize_entry("everything_else", everything_else)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SwimlaneConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SwimlaneVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SwimlaneVisitor {
+            type Value = SwimlaneConfig;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("\"auto\", { field: ... }, or { lanes: [...] }")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "auto" => Ok(SwimlaneConfig::Auto),
+                    other => Err(E::custom(format!(
+                        "`swimlanes` string form must be \"auto\" (got \"{other}\")"
+                    ))),
+                }
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut field: Option<String> = None;
+                let mut lanes: Option<Vec<QueryLane>> = None;
+                let mut everything_else: Option<bool> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "field" => field = Some(map.next_value()?),
+                        "lanes" => lanes = Some(map.next_value()?),
+                        "everything_else" => everything_else = Some(map.next_value()?),
+                        other => {
+                            return Err(serde::de::Error::custom(format!(
+                                "unknown `swimlanes` key \"{other}\" (expected `field`, `lanes` or `everything_else`)"
+                            )));
+                        }
+                    }
+                }
+                match (field, lanes) {
+                    (Some(field), None) => Ok(SwimlaneConfig::Field { field }),
+                    (None, Some(lanes)) => Ok(SwimlaneConfig::Queries {
+                        lanes,
+                        everything_else: everything_else.unwrap_or(true),
+                    }),
+                    (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                        "`swimlanes` cannot set both `field` and `lanes`",
+                    )),
+                    (None, None) => Err(serde::de::Error::custom(
+                        "`swimlanes` object form needs `field` or `lanes`",
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(SwimlaneVisitor)
+    }
+}
+
+/// Per-source Jira Agile board filters. Required when `kind` is `board`.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct BoardFilters {
+    /// Numeric Agile board id (the `rapidView=<id>` in the board URL).
+    pub board_id: u64,
+    /// Sprint selection: "active" (default) | "all" | a numeric sprint id.
+    #[serde(default)]
+    pub sprint: SprintSelector,
+    /// Swimlane strategy. Absent = no lanes.
+    #[serde(default)]
+    pub swimlanes: Option<SwimlaneConfig>,
 }
 
 /// What identifies a Confluence task in the list: its content, the page it
@@ -185,6 +379,9 @@ pub struct SourceConfig {
     /// Confluence task filters; only meaningful when `kind` is `confluence`.
     #[serde(default)]
     pub confluence: Option<ConfluenceFilters>,
+    /// Jira Agile board filters; only meaningful when `kind` is `board`.
+    #[serde(default)]
+    pub board: Option<BoardFilters>,
     /// Project key for wrong-project detection (e.g. incidents).
     pub expected_project: Option<String>,
     /// Sort order within source: "updated", "created", "priority".

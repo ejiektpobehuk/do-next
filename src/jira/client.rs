@@ -8,8 +8,9 @@ use tokio::sync::RwLock;
 
 use crate::jira::auth::Auth;
 use crate::jira::types::{
-    Attachment, Comment, FieldMeta, FieldSchema, Issue, IssueTypeField, ProjectInfo,
-    SearchResponse, StatusCategory, StatusInfo, Transition, TransitionsResponse,
+    AgileIssuesResponse, AgilePage, Attachment, BoardConfiguration, Comment, FieldMeta,
+    FieldSchema, GreenHopperBoardData, GreenHopperSwimlane, Issue, IssueTypeField, ProjectInfo,
+    SearchResponse, Sprint, StatusCategory, StatusInfo, Transition, TransitionsResponse,
 };
 
 const MAX_RESULTS: u32 = 100;
@@ -107,6 +108,236 @@ impl JiraClient {
         }
 
         Ok(all_issues)
+    }
+
+    /// Fetch only the keys of issues matching a JQL query. Used for cheap
+    /// swimlane-membership checks where full issue payloads would be waste.
+    pub async fn fetch_jql_keys(&self, jql: &str) -> Result<Vec<String>> {
+        let mut all_keys = Vec::new();
+        let mut start_at = 0u32;
+
+        loop {
+            let url = format!("{}/rest/api/3/search/jql", self.base_url);
+            self.maybe_refresh().await?;
+            let resp = self
+                .apply_auth(self.client.get(&url))
+                .await
+                .query(&[
+                    ("jql", jql),
+                    ("maxResults", &MAX_RESULTS.to_string()),
+                    ("startAt", &start_at.to_string()),
+                    ("fields", "key"),
+                ])
+                .send()
+                .await
+                .context("Failed to send JQL keys request")?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Jira API error {status}: {body}");
+            }
+
+            let page: SearchResponse = resp
+                .json()
+                .await
+                .context("Failed to parse search response")?;
+            let fetched = u32::try_from(page.issues.len()).unwrap_or(0);
+            let is_last = page.is_last;
+            all_keys.extend(page.issues.into_iter().map(|i| i.key));
+
+            if is_last || fetched == 0 {
+                break;
+            }
+            start_at += fetched;
+        }
+
+        Ok(all_keys)
+    }
+
+    /// Fetch an Agile board's column/status configuration and board type.
+    pub async fn get_board_configuration(&self, board_id: u64) -> Result<BoardConfiguration> {
+        let url = format!(
+            "{}/rest/agile/1.0/board/{board_id}/configuration",
+            self.base_url
+        );
+        self.maybe_refresh().await?;
+        let resp = self
+            .apply_auth(self.client.get(&url))
+            .await
+            .send()
+            .await
+            .context("Failed to fetch board configuration")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+
+        resp.json()
+            .await
+            .context("Failed to parse board configuration")
+    }
+
+    /// List a board's sprints filtered by state (e.g. "active").
+    ///
+    /// Returns `Ok(None)` on HTTP 400, which is how Jira says "this board
+    /// does not support sprints" (kanban boards and sprint-less team-managed
+    /// boards) — callers fall back to plain board issues without
+    /// string-matching errors.
+    pub async fn get_board_sprints(
+        &self,
+        board_id: u64,
+        state: &str,
+    ) -> Result<Option<Vec<Sprint>>> {
+        let mut sprints = Vec::new();
+        let mut start_at = 0u32;
+
+        loop {
+            let url = format!("{}/rest/agile/1.0/board/{board_id}/sprint", self.base_url);
+            self.maybe_refresh().await?;
+            let resp = self
+                .apply_auth(self.client.get(&url))
+                .await
+                .query(&[
+                    ("state", state),
+                    ("maxResults", "50"),
+                    ("startAt", &start_at.to_string()),
+                ])
+                .send()
+                .await
+                .context("Failed to fetch board sprints")?;
+
+            let status = resp.status();
+            if status == reqwest::StatusCode::BAD_REQUEST {
+                return Ok(None);
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Jira API error {status}: {body}");
+            }
+
+            let page: AgilePage<Sprint> =
+                resp.json().await.context("Failed to parse sprints")?;
+            let fetched = u32::try_from(page.values.len()).unwrap_or(0);
+            let is_last = page.is_last;
+            sprints.extend(page.values);
+
+            if is_last || fetched == 0 {
+                break;
+            }
+            start_at += fetched;
+        }
+
+        Ok(Some(sprints))
+    }
+
+    /// All issues on a board, in board rank order.
+    pub async fn fetch_board_issues(&self, board_id: u64) -> Result<Vec<Issue>> {
+        self.fetch_agile_issues(&format!("board/{board_id}/issue"))
+            .await
+    }
+
+    /// All issues in one sprint of a board, in rank order.
+    pub async fn fetch_board_sprint_issues(
+        &self,
+        board_id: u64,
+        sprint_id: u64,
+    ) -> Result<Vec<Issue>> {
+        self.fetch_agile_issues(&format!("board/{board_id}/sprint/{sprint_id}/issue"))
+            .await
+    }
+
+    /// Shared pagination loop for Agile issue endpoints. Issues come back in
+    /// board rank order and are appended in response order — callers must not
+    /// re-sort, the rank IS the board order. Agile endpoints paginate by
+    /// `total` (there is no `isLast`).
+    async fn fetch_agile_issues(&self, path: &str) -> Result<Vec<Issue>> {
+        let mut all_issues: Vec<Issue> = Vec::new();
+        let mut start_at = 0u32;
+
+        loop {
+            let url = format!("{}/rest/agile/1.0/{path}", self.base_url);
+            log::debug!("Agile issues request: {path} startAt={start_at}");
+
+            self.maybe_refresh().await?;
+            let resp = self
+                .apply_auth(self.client.get(&url))
+                .await
+                .query(&[
+                    ("maxResults", &MAX_RESULTS.to_string()),
+                    ("startAt", &start_at.to_string()),
+                    ("fields", &"*all".to_string()),
+                ])
+                .send()
+                .await
+                .context("Failed to send Agile issues request")?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Jira API error {status}: {body}");
+            }
+
+            let page: AgileIssuesResponse = resp
+                .json()
+                .await
+                .context("Failed to parse Agile issues response")?;
+            let fetched = u32::try_from(page.issues.len()).unwrap_or(0);
+            all_issues.extend(page.issues);
+            start_at += fetched;
+
+            if fetched == 0 || start_at >= page.total {
+                break;
+            }
+        }
+
+        Ok(all_issues)
+    }
+
+    /// Swimlane definitions from Jira's internal `GreenHopper` API — the only
+    /// place swimlane configuration exists (the public Agile API omits it).
+    ///
+    /// Unsupported, undocumented endpoint: it works with basic auth against
+    /// the site URL but is not served through the OAuth API gateway, so this
+    /// fails fast with an explanatory error under OAuth. May break without
+    /// notice on Atlassian's side; callers must degrade gracefully.
+    pub async fn get_greenhopper_swimlanes(
+        &self,
+        board_id: u64,
+    ) -> Result<Vec<GreenHopperSwimlane>> {
+        if matches!(&*self.auth.read().await, Auth::OAuth(_)) {
+            anyhow::bail!(
+                "swimlanes: \"auto\" needs basic auth (the board's lane config \
+                 is only exposed by an internal Jira API that OAuth cannot reach); \
+                 declare lanes explicitly in the source's `swimlanes` block"
+            );
+        }
+        let url = format!(
+            "{}/rest/greenhopper/1.0/xboard/work/allData.json",
+            self.base_url
+        );
+        self.maybe_refresh().await?;
+        let resp = self
+            .apply_auth(self.client.get(&url))
+            .await
+            .query(&[("rapidViewId", &board_id.to_string())])
+            .send()
+            .await
+            .context("Failed to fetch board swimlanes")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+
+        let data: GreenHopperBoardData = resp
+            .json()
+            .await
+            .context("Failed to parse board swimlanes")?;
+        Ok(data.into_swimlanes())
     }
 
     /// Fetch a single issue by key.

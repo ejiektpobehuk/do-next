@@ -1,4 +1,5 @@
 pub mod app;
+pub mod board;
 pub mod detail;
 pub mod hint_bar;
 pub mod list;
@@ -1039,18 +1040,17 @@ fn spawn_commit_field_edit(
 
 fn spawn_transition(key: String, tid: String, client: JiraClient, tx: UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
-        // Fetch transitions to get the target status name for the result
-        let name = client
+        // Fetch transitions to get the target status (id + name) for the result
+        let status = client
             .get_transitions(&key)
             .await
             .ok()
-            .and_then(|ts| ts.into_iter().find(|t| t.id == tid).map(|t| t.to.name))
-            .unwrap_or_default();
+            .and_then(|ts| ts.into_iter().find(|t| t.id == tid).map(|t| t.to));
         match client.post_transition(&key, &tid).await {
             Ok(()) => {
                 let _ = tx.send(AppEvent::ActionDone(ActionResult::TransitionApplied {
                     issue_key: key,
-                    new_status: name,
+                    new_status: status,
                 }));
             }
             Err(e) => {

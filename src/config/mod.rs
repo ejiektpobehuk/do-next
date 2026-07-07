@@ -346,6 +346,219 @@ mod tests {
         assert!(validate_source_config(&ok).is_ok());
     }
 
+    // ── Board sources ─────────────────────────────────────────────────────
+
+    fn board_source(board: types::BoardFilters) -> SourceConfig {
+        SourceConfig {
+            id: "sprint-board".into(),
+            kind: SourceKind::Board,
+            board: Some(board),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn board_source_parses_with_all_sprint_forms() {
+        for (form, expected) in [
+            (r#"sprint: "active","#, types::SprintSelector::Active),
+            (r#"sprint: "all","#, types::SprintSelector::All),
+            ("sprint: 137,", types::SprintSelector::Id(137)),
+            ("", types::SprintSelector::Active), // omitted → default
+        ] {
+            let src: SourceConfig = json5::from_str(&format!(
+                r#"{{ id: "b", kind: "board", board: {{ board_id: 42, {form} }} }}"#
+            ))
+            .unwrap();
+            assert_eq!(src.kind, SourceKind::Board);
+            let board = src.board.unwrap();
+            assert_eq!(board.board_id, 42);
+            assert_eq!(board.sprint, expected, "form: {form}");
+        }
+        assert!(
+            json5::from_str::<SourceConfig>(
+                r#"{ id: "b", kind: "board", board: { board_id: 42, sprint: "next" } }"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn board_swimlanes_parse_all_forms() {
+        let auto: SourceConfig = json5::from_str(
+            r#"{ id: "b", kind: "board", board: { board_id: 1, swimlanes: "auto" } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            auto.board.unwrap().swimlanes,
+            Some(types::SwimlaneConfig::Auto)
+        );
+
+        let field: SourceConfig = json5::from_str(
+            r#"{ id: "b", kind: "board", board: { board_id: 1, swimlanes: { field: "priority" } } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            field.board.unwrap().swimlanes,
+            Some(types::SwimlaneConfig::Field {
+                field: "priority".into()
+            })
+        );
+
+        let queries: SourceConfig = json5::from_str(
+            r#"{ id: "b", kind: "board", board: { board_id: 1,
+                swimlanes: { lanes: [{ name: "Expedite", jql: "priority = Highest" }] } } }"#,
+        )
+        .unwrap();
+        let Some(types::SwimlaneConfig::Queries {
+            lanes,
+            everything_else,
+        }) = queries.board.unwrap().swimlanes
+        else {
+            panic!("expected query lanes");
+        };
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].name, "Expedite");
+        assert!(everything_else, "everything_else defaults to true");
+
+        // Unknown string / unknown key / both field and lanes are rejected.
+        for bad in [
+            r#"{ board_id: 1, swimlanes: "assignee" }"#,
+            r#"{ board_id: 1, swimlanes: { strategy: "auto" } }"#,
+            r#"{ board_id: 1, swimlanes: { field: "priority", lanes: [] } }"#,
+        ] {
+            assert!(
+                json5::from_str::<types::BoardFilters>(bad).is_err(),
+                "should reject: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_selector_and_swimlanes_round_trip() {
+        for board in [
+            types::BoardFilters {
+                board_id: 7,
+                sprint: types::SprintSelector::Id(137),
+                swimlanes: Some(types::SwimlaneConfig::Auto),
+            },
+            types::BoardFilters {
+                board_id: 7,
+                sprint: types::SprintSelector::All,
+                swimlanes: Some(types::SwimlaneConfig::Queries {
+                    lanes: vec![types::QueryLane {
+                        name: "Expedite".into(),
+                        jql: "priority = Highest".into(),
+                    }],
+                    everything_else: false,
+                }),
+            },
+        ] {
+            let json = serde_json::to_string(&board).unwrap();
+            let back: types::BoardFilters = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.sprint, board.sprint);
+            assert_eq!(back.swimlanes, board.swimlanes);
+        }
+    }
+
+    #[test]
+    fn board_source_requires_board_block_and_positive_id() {
+        let missing = SourceConfig {
+            id: "b".into(),
+            kind: SourceKind::Board,
+            ..Default::default()
+        };
+        let err = validate_source_config(&missing).expect_err("must reject");
+        assert!(err.to_string().contains("board"));
+
+        let zero = board_source(types::BoardFilters::default());
+        assert!(validate_source_config(&zero).is_err());
+
+        let ok = board_source(types::BoardFilters {
+            board_id: 42,
+            ..Default::default()
+        });
+        assert!(validate_source_config(&ok).is_ok());
+    }
+
+    #[test]
+    fn board_source_rejects_jql_subsources_and_confluence() {
+        let base = || types::BoardFilters {
+            board_id: 42,
+            ..Default::default()
+        };
+        let mut with_jql = board_source(base());
+        with_jql.jql = "project = X".into();
+        assert!(validate_source_config(&with_jql).is_err());
+
+        let mut with_subsources = board_source(base());
+        with_subsources.subsources = vec![types::SubsourceConfig::default()];
+        assert!(validate_source_config(&with_subsources).is_err());
+
+        let mut with_confluence = board_source(base());
+        with_confluence.confluence = Some(ConfluenceFilters::default());
+        assert!(validate_source_config(&with_confluence).is_err());
+    }
+
+    #[test]
+    fn board_swimlane_validation_rejects_empty_lanes_and_field() {
+        let empty_lanes = board_source(types::BoardFilters {
+            board_id: 42,
+            swimlanes: Some(types::SwimlaneConfig::Queries {
+                lanes: vec![],
+                everything_else: true,
+            }),
+            ..Default::default()
+        });
+        assert!(validate_source_config(&empty_lanes).is_err());
+
+        let blank_jql = board_source(types::BoardFilters {
+            board_id: 42,
+            swimlanes: Some(types::SwimlaneConfig::Queries {
+                lanes: vec![types::QueryLane {
+                    name: "Expedite".into(),
+                    jql: String::new(),
+                }],
+                everything_else: true,
+            }),
+            ..Default::default()
+        });
+        assert!(validate_source_config(&blank_jql).is_err());
+
+        let blank_field = board_source(types::BoardFilters {
+            board_id: 42,
+            swimlanes: Some(types::SwimlaneConfig::Field {
+                field: String::new(),
+            }),
+            ..Default::default()
+        });
+        assert!(validate_source_config(&blank_field).is_err());
+    }
+
+    #[test]
+    fn non_board_sources_reject_board_block() {
+        let jira = SourceConfig {
+            id: "mine".into(),
+            jql: "assignee = currentUser()".into(),
+            board: Some(types::BoardFilters {
+                board_id: 42,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_source_config(&jira).is_err());
+
+        let confluence = SourceConfig {
+            id: "actions".into(),
+            kind: SourceKind::Confluence,
+            board: Some(types::BoardFilters {
+                board_id: 42,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_source_config(&confluence).is_err());
+    }
+
     // ── Confluence connection resolution ─────────────────────────────────
 
     #[test]
@@ -391,6 +604,12 @@ fn validate_source_config(source: &types::SourceConfig) -> Result<()> {
                     source.id
                 ));
             }
+            if source.board.is_some() {
+                return Err(anyhow!(
+                    "source '{}': `board` filters are only valid with `kind: \"board\"`",
+                    source.id
+                ));
+            }
         }
         SourceKind::Confluence => {
             if !source.jql.is_empty() {
@@ -411,8 +630,73 @@ fn validate_source_config(source: &types::SourceConfig) -> Result<()> {
                     source.id
                 ));
             }
+            if source.board.is_some() {
+                return Err(anyhow!(
+                    "source '{}': `board` filters are only valid with `kind: \"board\"`",
+                    source.id
+                ));
+            }
             if let Some(filters) = &source.confluence {
                 validate_confluence_filters(&source.id, filters)?;
+            }
+        }
+        SourceKind::Board => validate_board_source(source)?,
+    }
+    Ok(())
+}
+
+fn validate_board_source(source: &types::SourceConfig) -> Result<()> {
+    let Some(board) = &source.board else {
+        return Err(anyhow!(
+            "source '{}': a `board` block with `board_id` is required for a board source",
+            source.id
+        ));
+    };
+    if board.board_id == 0 {
+        return Err(anyhow!(
+            "source '{}': `board_id` must be a positive board id",
+            source.id
+        ));
+    }
+    if !source.jql.is_empty() {
+        return Err(anyhow!(
+            "source '{}': `jql` is not valid for a board source (the board's saved filter defines the query)",
+            source.id
+        ));
+    }
+    if !source.subsources.is_empty() {
+        return Err(anyhow!(
+            "source '{}': `subsources` are not valid for a board source",
+            source.id
+        ));
+    }
+    if source.confluence.is_some() {
+        return Err(anyhow!(
+            "source '{}': `confluence` filters are only valid with `kind: \"confluence\"`",
+            source.id
+        ));
+    }
+    if let Some(types::SwimlaneConfig::Field { field }) = &board.swimlanes
+        && field.is_empty()
+    {
+        return Err(anyhow!(
+            "source '{}': `swimlanes.field` must not be empty",
+            source.id
+        ));
+    }
+    if let Some(types::SwimlaneConfig::Queries { lanes, .. }) = &board.swimlanes {
+        if lanes.is_empty() {
+            return Err(anyhow!(
+                "source '{}': `swimlanes.lanes` must not be empty",
+                source.id
+            ));
+        }
+        for lane in lanes {
+            if lane.name.is_empty() || lane.jql.is_empty() {
+                return Err(anyhow!(
+                    "source '{}': every swimlane needs a non-empty `name` and `jql`",
+                    source.id
+                ));
             }
         }
     }
@@ -591,3 +875,4 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     }
     PathBuf::from(path)
 }
+

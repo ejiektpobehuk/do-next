@@ -21,31 +21,62 @@ const JIRA_SCOPES: &str = "read:jira-work write:jira-work read:jira-user offline
 const CONFLUENCE_SCOPES: &str = "read:task:confluence write:task:confluence \
      read:page:confluence read:space:confluence read:content-details:confluence";
 
-/// The scope string to request. Confluence granular scopes are appended only
-/// when a team defines confluence sources, since mixing classic Jira scopes
-/// with granular ones in a single authorization is not officially supported
-/// by Atlassian — if the consent screen rejects the combined set, use
-/// `auth_method: "basic"` for Confluence instead.
-fn scopes(include_confluence: bool) -> String {
-    if include_confluence {
-        format!("{JIRA_SCOPES} {CONFLUENCE_SCOPES}")
-    } else {
-        JIRA_SCOPES.to_owned()
+/// Scopes for the Jira Agile API used by board sources. Each `/rest/agile/1.0/`
+/// endpoint requires ALL of its listed scopes — a missing one yields 401
+/// "scope does not match", not a partial result — and the classic
+/// `read:jira-work` does not substitute for these granular grants. Per the
+/// Jira Software `OpenAPI` spec, the endpoints we call need:
+///
+/// - board configuration: `read:board-scope.admin:jira-software`, `read:project:jira`
+/// - board issues: `read:board-scope:jira-software`, `read:issue-details:jira`
+/// - sprints: `read:sprint:jira-software`
+/// - sprint issues: `read:sprint:jira-software`, `read:issue-details:jira`, `read:jql:jira`
+///
+/// `read:board-scope.admin:jira-software` additionally needs board/project
+/// admin rights on Jira's side to return configuration.
+const JIRA_SOFTWARE_SCOPES: &str = "read:board-scope.admin:jira-software \
+     read:board-scope:jira-software read:sprint:jira-software \
+     read:project:jira read:issue-details:jira read:jql:jira";
+
+/// Which extra granular scope sets to request beyond the base Jira scopes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExtraScopes {
+    /// Confluence task sources are configured.
+    pub confluence: bool,
+    /// Jira Agile board sources are configured.
+    pub board: bool,
+}
+
+/// The scope string to request. Granular scopes are appended only for the
+/// source kinds a team actually uses, since mixing classic Jira scopes with
+/// granular ones in a single authorization is not officially supported by
+/// Atlassian — if the consent screen rejects the combined set, use
+/// `auth_method: "basic"` for the affected source instead.
+fn scopes(extra: ExtraScopes) -> String {
+    let mut s = JIRA_SCOPES.to_owned();
+    if extra.confluence {
+        s.push(' ');
+        s.push_str(CONFLUENCE_SCOPES);
     }
+    if extra.board {
+        s.push(' ');
+        s.push_str(JIRA_SOFTWARE_SCOPES);
+    }
+    s
 }
 
 /// Run the full OAuth 2.0 (3LO) authorization flow with PKCE.
 ///
 /// Opens the user's browser for Atlassian authorization, listens for the
 /// callback on a local HTTP server, exchanges the code for tokens, and
-/// resolves the cloud ID. `include_confluence` adds the Confluence task
-/// scopes for teams with confluence sources.
+/// resolves the cloud ID. `extra` adds granular scopes for the source kinds
+/// a team uses (Confluence tasks, Agile boards).
 #[allow(clippy::too_many_lines)]
 pub fn run_oauth_flow(
     client_id: &str,
     client_secret: &str,
     store: OAuthStore,
-    include_confluence: bool,
+    extra: ExtraScopes,
 ) -> Result<OAuthCredentials> {
     // 1. Start local HTTP server on a fixed port (must match the callback URL
     //    registered in the Atlassian Developer Console).
@@ -61,6 +92,7 @@ pub fn run_oauth_flow(
     let state = generate_state();
 
     // 4. Build authorization URL.
+    let requested_scopes = scopes(extra);
     let auth_url = format!(
         "{AUTH_URL}?\
          audience=api.atlassian.com&\
@@ -72,7 +104,7 @@ pub fn run_oauth_flow(
          prompt=consent&\
          code_challenge={code_challenge}&\
          code_challenge_method=S256",
-        scopes = urlencoded(&scopes(include_confluence)),
+        scopes = urlencoded(&requested_scopes),
         redirect_uri = urlencoded(&redirect_uri),
     );
 
@@ -122,6 +154,7 @@ pub fn run_oauth_flow(
     // conflicts with the main runtime (which we're called from synchronously).
     let client_id_owned = client_id.to_string();
     let client_secret_owned = client_secret.to_string();
+    let requested = requested_scopes;
     let (token_data, mut resources) = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -156,6 +189,23 @@ pub fn run_oauth_flow(
                 .json()
                 .await
                 .context("Failed to parse token response")?;
+
+            // Surface what Atlassian actually granted, and flag any requested
+            // scope that wasn't — a missing scope is the usual cause of a
+            // later "scope does not match" 401.
+            match &token_data.scope {
+                Some(granted) => {
+                    println!("Granted scopes: {granted}");
+                    let granted_set: std::collections::HashSet<&str> =
+                        granted.split_whitespace().collect();
+                    for want in requested.split_whitespace() {
+                        if !granted_set.contains(want) {
+                            println!("  ⚠ requested scope '{want}' was NOT granted");
+                        }
+                    }
+                }
+                None => println!("(Atlassian did not report granted scopes)"),
+            }
 
             // 8. Get accessible resources to find the cloud ID.
             let resources_resp = http
@@ -406,6 +456,10 @@ struct TokenResponse {
     access_token: String,
     refresh_token: String,
     expires_in: i64,
+    /// Scopes Atlassian actually granted (may differ from what was requested,
+    /// e.g. when classic and granular scopes are mixed).
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(serde::Deserialize)]

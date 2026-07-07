@@ -31,6 +31,11 @@ pub fn render_list(
     for (source_id, state) in &app.sources {
         let src_cfg = source_config_for(app.team_config(), source_id);
 
+        // Board sources are their own tabs, never rows in a team's list.
+        if src_cfg.is_some_and(|s| s.kind == crate::config::types::SourceKind::Board) {
+            continue;
+        }
+
         // Add source separator
         let sep_text = source_separator_text(source_id, src_cfg);
         items.push(ListItem::new(Line::from(Span::styled(
@@ -324,7 +329,7 @@ fn parse_color(name: &str) -> Color {
     }
 }
 
-fn truncate(s: &str, max_chars: usize) -> &str {
+pub fn truncate(s: &str, max_chars: usize) -> &str {
     if s.chars().count() <= max_chars {
         return s;
     }

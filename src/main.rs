@@ -81,14 +81,19 @@ async fn main() -> Result<()> {
 
     // Auth reset runs before credential resolution (auth may currently be broken).
     if matches!(&cli.command, Some(Commands::Auth)) {
-        // Teams with confluence sources need the Confluence OAuth scopes.
-        let include_confluence = loaded.teams.iter().any(|t| {
-            t.config
-                .sources
+        // Teams with confluence / board sources need the matching granular
+        // OAuth scopes (classic Jira scopes don't cover those APIs).
+        let source_kind_present = |kind: config::types::SourceKind| {
+            loaded
+                .teams
                 .iter()
-                .any(|s| s.kind == config::types::SourceKind::Confluence)
-        });
-        tui::onboarding::run_auth_reset(&mut loaded.config, include_confluence)
+                .any(|t| t.config.sources.iter().any(|s| s.kind == kind))
+        };
+        let extra_scopes = crate::jira::oauth::ExtraScopes {
+            confluence: source_kind_present(config::types::SourceKind::Confluence),
+            board: source_kind_present(config::types::SourceKind::Board),
+        };
+        tui::onboarding::run_auth_reset(&mut loaded.config, extra_scopes)
             .context("Auth reset failed")?;
         return Ok(());
     }
