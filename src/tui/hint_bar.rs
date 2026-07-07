@@ -96,6 +96,8 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
             Span::raw(" open  "),
             Span::styled("t", Style::default().fg(Color::Blue)),
             Span::raw(" move  "),
+            Span::styled("P", Style::default().fg(Color::Blue)),
+            Span::raw(" preload  "),
             Span::styled("Tab", Style::default().fg(Color::Blue)),
             Span::raw(" switch  "),
             Span::styled("?", Style::default().fg(Color::Blue)),

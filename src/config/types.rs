@@ -13,6 +13,10 @@ pub struct Config {
     pub confluence: Option<ConfluenceConfig>,
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Default detail-load mode for board sources. A per-board `detail_load`
+    /// (in the board's filters) overrides this.
+    #[serde(default)]
+    pub detail_load: DetailLoad,
     /// Team references. Onboarding creates at least one ("personal").
     #[serde(default)]
     pub teams: Vec<TeamRef>,
@@ -316,6 +320,23 @@ pub struct BoardFilters {
     /// Swimlane strategy. Absent = no lanes.
     #[serde(default)]
     pub swimlanes: Option<SwimlaneConfig>,
+    /// Overrides the global `detail_load` for this board. Absent = use global.
+    #[serde(default)]
+    pub detail_load: Option<DetailLoad>,
+}
+
+/// How much of each issue a board fetches up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DetailLoad {
+    /// Fetch only the fields the board renders; load an issue's full detail
+    /// (description, comments, custom fields) lazily when it is opened.
+    /// Fastest board load — the default.
+    #[default]
+    Lazy,
+    /// Fetch every field up front so opening a card is instant, at the cost of
+    /// a slower initial board load.
+    Full,
 }
 
 /// What identifies a Confluence task in the list: its content, the page it
@@ -588,6 +609,33 @@ mod tests {
     fn effective_type_is_none_by_default() {
         let field = CustomViewFieldConfig::default();
         assert_eq!(field.effective_type(), None);
+    }
+
+    #[test]
+    fn detail_load_defaults_to_lazy() {
+        assert_eq!(DetailLoad::default(), DetailLoad::Lazy);
+        // Global config without a `detail_load` key defaults to lazy.
+        let cfg: Config = json5::from_str("{}").expect("valid config");
+        assert_eq!(cfg.detail_load, DetailLoad::Lazy);
+    }
+
+    #[test]
+    fn detail_load_parses_from_lowercase_names() {
+        let cfg: Config =
+            json5::from_str(r#"{ detail_load: "full" }"#).expect("valid config");
+        assert_eq!(cfg.detail_load, DetailLoad::Full);
+    }
+
+    #[test]
+    fn board_detail_load_is_optional_and_overrides() {
+        // Absent per-board override parses as None (falls back to global).
+        let no_override: BoardFilters =
+            json5::from_str(r#"{ board_id: 7 }"#).expect("valid config");
+        assert_eq!(no_override.detail_load, None);
+
+        let overridden: BoardFilters =
+            json5::from_str(r#"{ board_id: 7, detail_load: "full" }"#).expect("valid config");
+        assert_eq!(overridden.detail_load, Some(DetailLoad::Full));
     }
 
     #[test]

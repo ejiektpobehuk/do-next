@@ -440,6 +440,7 @@ mod tests {
                 board_id: 7,
                 sprint: types::SprintSelector::Id(137),
                 swimlanes: Some(types::SwimlaneConfig::Auto),
+                detail_load: None,
             },
             types::BoardFilters {
                 board_id: 7,
@@ -451,6 +452,7 @@ mod tests {
                     }],
                     everything_else: false,
                 }),
+                detail_load: Some(types::DetailLoad::Full),
             },
         ] {
             let json = serde_json::to_string(&board).unwrap();

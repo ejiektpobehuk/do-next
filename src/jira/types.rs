@@ -6,12 +6,20 @@ pub struct Issue {
     pub id: String,
     pub key: String,
     pub fields: IssueFields,
-    /// Which source this issue was fetched from (set after fetch).
-    #[serde(skip)]
+    /// Which source this issue was fetched from (set after fetch). Absent from
+    /// Jira API responses (`default`); persisted in the on-disk source cache.
+    #[serde(default)]
     pub source_id: Option<String>,
-    /// Within-source subsource index for ordering (set after fetch).
-    #[serde(skip)]
+    /// Within-source subsource index for ordering (set after fetch). Absent
+    /// from Jira API responses (`default`); persisted in the source cache.
+    #[serde(default)]
     pub subsource_idx: usize,
+    /// True when only board-display fields were fetched, so the issue's full
+    /// detail (description, comments, custom fields) must be lazy-loaded when
+    /// it is opened. Set after a trimmed board fetch; false everywhere else.
+    /// Absent from Jira API responses (`default`); persisted in the cache.
+    #[serde(default)]
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -217,7 +225,7 @@ pub struct AgileIssuesResponse {
 /// Resolved query-swimlane assignment for one board source, computed at
 /// fetch time. Keys absent from `assignment` belong to the trailing
 /// "everything else" lane when the config enables it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BoardSwimlanes {
     /// Lane names in display order.
     pub lane_names: Vec<String>,

@@ -2,12 +2,12 @@ use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveTime, Utc};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::types::ConfluenceFilters;
 
 /// Inline-task status as returned by the Confluence v2 tasks API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskStatus {
     Complete,
@@ -125,7 +125,7 @@ pub struct PageMeta {
 }
 
 /// Display-ready Confluence inline task handed to the TUI as a `WorkItem`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Task {
     pub id: String,
     /// Work-item key ("CONF:{id}") — cannot collide with Jira issue keys

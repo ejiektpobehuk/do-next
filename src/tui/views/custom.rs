@@ -383,6 +383,21 @@ fn build_segments(
             nav: DetailNavKind::Attachments,
             content: format!("Attachments  ({attachment_count})"),
         });
+
+        // A partial (board-trimmed) issue has its full detail — description,
+        // comments, custom fields — fetched in the background when opened.
+        // Note it so the empty sections don't read as "nothing here".
+        if issue.partial {
+            segs.push(Segment::ReadOnly {
+                lines: vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Loading full detail…",
+                        Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+                    )),
+                ],
+            });
+        }
     }
 
     match cfg {

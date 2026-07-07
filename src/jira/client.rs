@@ -233,9 +233,10 @@ impl JiraClient {
         Ok(Some(sprints))
     }
 
-    /// All issues on a board, in board rank order.
-    pub async fn fetch_board_issues(&self, board_id: u64) -> Result<Vec<Issue>> {
-        self.fetch_agile_issues(&format!("board/{board_id}/issue"))
+    /// All issues on a board, in board rank order. `fields` is the Jira
+    /// `fields` query value (e.g. `*all` or a comma-separated whitelist).
+    pub async fn fetch_board_issues(&self, board_id: u64, fields: &str) -> Result<Vec<Issue>> {
+        self.fetch_agile_issues(&format!("board/{board_id}/issue"), fields)
             .await
     }
 
@@ -244,56 +245,82 @@ impl JiraClient {
         &self,
         board_id: u64,
         sprint_id: u64,
+        fields: &str,
     ) -> Result<Vec<Issue>> {
-        self.fetch_agile_issues(&format!("board/{board_id}/sprint/{sprint_id}/issue"))
+        self.fetch_agile_issues(&format!("board/{board_id}/sprint/{sprint_id}/issue"), fields)
             .await
     }
 
-    /// Shared pagination loop for Agile issue endpoints. Issues come back in
-    /// board rank order and are appended in response order — callers must not
-    /// re-sort, the rank IS the board order. Agile endpoints paginate by
-    /// `total` (there is no `isLast`).
-    async fn fetch_agile_issues(&self, path: &str) -> Result<Vec<Issue>> {
-        let mut all_issues: Vec<Issue> = Vec::new();
-        let mut start_at = 0u32;
+    /// Pagination for Agile issue endpoints. Issues come back in board rank
+    /// order and are appended in response order — callers must not re-sort,
+    /// the rank IS the board order. Agile endpoints paginate by `total` (there
+    /// is no `isLast`).
+    ///
+    /// The first page is fetched to learn `total` (and the server's effective
+    /// page size), then the remaining pages are fetched concurrently and
+    /// stitched back together in `startAt` order so rank is preserved.
+    async fn fetch_agile_issues(&self, path: &str, fields: &str) -> Result<Vec<Issue>> {
+        let first = self.fetch_agile_page(path, 0, fields).await?;
+        let total = first.total;
+        // Use the page size the server actually returned as the stride — Jira
+        // may cap `maxResults` below what we ask, and a wrong stride would skip
+        // issues. A zero-length first page means an empty board.
+        let stride = u32::try_from(first.issues.len()).unwrap_or(0);
+        let mut all_issues = first.issues;
+        if stride == 0 || u32::try_from(all_issues.len()).unwrap_or(0) >= total {
+            return Ok(all_issues);
+        }
 
-        loop {
-            let url = format!("{}/rest/agile/1.0/{path}", self.base_url);
-            log::debug!("Agile issues request: {path} startAt={start_at}");
-
-            self.maybe_refresh().await?;
-            let resp = self
-                .apply_auth(self.client.get(&url))
-                .await
-                .query(&[
-                    ("maxResults", &MAX_RESULTS.to_string()),
-                    ("startAt", &start_at.to_string()),
-                    ("fields", &"*all".to_string()),
-                ])
-                .send()
-                .await
-                .context("Failed to send Agile issues request")?;
-
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Jira API error {status}: {body}");
-            }
-
-            let page: AgileIssuesResponse = resp
-                .json()
-                .await
-                .context("Failed to parse Agile issues response")?;
-            let fetched = u32::try_from(page.issues.len()).unwrap_or(0);
+        let offsets = agile_page_offsets(stride, total);
+        log::debug!(
+            "Agile issues {path}: total={total} stride={stride}; fetching {} more page(s) concurrently",
+            offsets.len()
+        );
+        let pages = futures::future::try_join_all(
+            offsets.into_iter().map(|off| self.fetch_agile_page(path, off, fields)),
+        )
+        .await?;
+        // `try_join_all` preserves input order, so extending in sequence keeps
+        // issues in ascending `startAt` (i.e. rank) order.
+        for page in pages {
             all_issues.extend(page.issues);
-            start_at += fetched;
-
-            if fetched == 0 || start_at >= page.total {
-                break;
-            }
         }
 
         Ok(all_issues)
+    }
+
+    /// Fetch a single page of an Agile issue endpoint at the given `startAt`.
+    async fn fetch_agile_page(
+        &self,
+        path: &str,
+        start_at: u32,
+        fields: &str,
+    ) -> Result<AgileIssuesResponse> {
+        let url = format!("{}/rest/agile/1.0/{path}", self.base_url);
+        log::debug!("Agile issues request: {path} startAt={start_at} fields={fields}");
+
+        self.maybe_refresh().await?;
+        let resp = self
+            .apply_auth(self.client.get(&url))
+            .await
+            .query(&[
+                ("maxResults", &MAX_RESULTS.to_string()),
+                ("startAt", &start_at.to_string()),
+                ("fields", &fields.to_string()),
+            ])
+            .send()
+            .await
+            .context("Failed to send Agile issues request")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+
+        resp.json()
+            .await
+            .context("Failed to parse Agile issues response")
     }
 
     /// Swimlane definitions from Jira's internal `GreenHopper` API — the only
@@ -340,13 +367,16 @@ impl JiraClient {
         Ok(data.into_swimlanes())
     }
 
-    /// Fetch a single issue by key.
+    /// Fetch a single issue by key, with all fields (`fields=*all`) so the
+    /// detail view and a lazy detail-load get description, comments, and every
+    /// custom field.
     pub async fn get_issue(&self, key: &str) -> Result<Issue> {
         let url = format!("{}/rest/api/3/issue/{key}", self.base_url);
         self.maybe_refresh().await?;
         let resp = self
             .apply_auth(self.client.get(&url))
             .await
+            .query(&[("fields", "*all")])
             .send()
             .await
             .context("Failed to fetch issue")?;
@@ -1102,5 +1132,43 @@ impl JiraClient {
                 name: p.name,
             })
             .collect())
+    }
+}
+
+/// `startAt` offsets for the Agile pages after the first, given the server's
+/// effective page size (`stride`) and reported `total`. Empty when the first
+/// page already covers everything or the board is empty (`stride == 0`).
+fn agile_page_offsets(stride: u32, total: u32) -> Vec<u32> {
+    if stride == 0 {
+        return Vec::new();
+    }
+    (stride..total).step_by(stride as usize).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agile_page_offsets;
+
+    #[test]
+    fn offsets_cover_all_pages_after_the_first_in_order() {
+        // 250 issues, 100 per page → first page is startAt=0, then 100 and 200.
+        assert_eq!(agile_page_offsets(100, 250), vec![100, 200]);
+    }
+
+    #[test]
+    fn single_page_needs_no_extra_requests() {
+        assert!(agile_page_offsets(100, 100).is_empty());
+        assert!(agile_page_offsets(100, 42).is_empty());
+    }
+
+    #[test]
+    fn stride_below_the_asked_page_size_is_honored() {
+        // Jira capped the page at 50; offsets must step by 50, not 100.
+        assert_eq!(agile_page_offsets(50, 120), vec![50, 100]);
+    }
+
+    #[test]
+    fn empty_board_yields_no_offsets() {
+        assert!(agile_page_offsets(0, 0).is_empty());
     }
 }

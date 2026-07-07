@@ -13,7 +13,7 @@ use crate::jira::types::{Issue, PriorityField, UserField};
     reason = "items live in Vecs that held full Issues before; boxing would \
               only add indirection to the hot rendering path"
 )]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub enum WorkItem {
     Jira(Issue),
     Confluence(Task),

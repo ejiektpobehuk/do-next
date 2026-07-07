@@ -794,6 +794,7 @@ mod tests {
             },
             source_id: Some("board".into()),
             subsource_idx: 0,
+            partial: false,
         })
     }
 

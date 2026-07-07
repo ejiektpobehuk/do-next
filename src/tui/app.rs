@@ -555,6 +555,9 @@ pub struct AppState {
     pub pending_completion_fetch: Option<u64>,
     /// Set by `r`/`Shift+R` when the user requests a full team refresh.
     pub pending_refresh_all: bool,
+    /// Set by `P` to preload full detail for every partial (board-trimmed)
+    /// issue; consumed by the main loop dispatcher.
+    pub pending_preload: bool,
     /// Set by `r` on a focused issue; consumed by the main loop dispatcher.
     pub pending_refresh_issue: Option<RefreshIssueRequest>,
     /// Issue keys with a refresh currently in flight (drives spinner + de-dupes presses).
@@ -589,6 +592,10 @@ pub struct AppState {
     /// Some(`source_id`) while the kanban board view covers the main area.
     /// Selection stays in `nav_idx`; the board cursor is derived from it.
     pub board_view: Option<String>,
+    /// Global default board detail-load mode (per-board config overrides it).
+    pub detail_load: crate::config::types::DetailLoad,
+    /// On-disk source cache settings (stale-while-revalidate).
+    pub cache: crate::config::types::CacheConfig,
 }
 
 /// Request for a silent background attachment fetch.
@@ -607,7 +614,7 @@ pub struct RefreshIssueRequest {
 }
 
 impl AppState {
-    pub fn new(resolved_teams: Vec<ResolvedTeam>) -> Self {
+    pub fn new(resolved_teams: Vec<ResolvedTeam>, config: &crate::config::types::Config) -> Self {
         // Build source state from the first (active) team's sources.
         let sources = resolved_teams
             .first()
@@ -659,6 +666,7 @@ impl AppState {
             pending_attachment_fetch: None,
             pending_completion_fetch: None,
             pending_refresh_all: false,
+            pending_preload: false,
             pending_refresh_issue: None,
             refreshing_issues: HashSet::new(),
             image_picker: None,
@@ -672,6 +680,8 @@ impl AppState {
             board_configs: HashMap::new(),
             board_lanes: HashMap::new(),
             board_view: None,
+            detail_load: config.detail_load,
+            cache: config.cache.clone(),
         }
     }
 
@@ -748,6 +758,7 @@ impl AppState {
         // send events, but the handler tolerates unknown keys.
         self.refreshing_issues.clear();
         self.pending_refresh_all = false;
+        self.pending_preload = false;
         self.pending_refresh_issue = None;
 
         // Recompute the flat list from the (correct, full) restored sources for
@@ -882,7 +893,7 @@ impl AppState {
 
     /// Rebuild the flat items list from loaded source states (in priority order, deduped),
     /// then rebuild navigable items.
-    fn rebuild_issues(&mut self) {
+    pub(crate) fn rebuild_issues(&mut self) {
         let mut seen = std::collections::HashSet::new();
         let mut issues = Vec::new();
         for (source_id, state) in &self.sources {
@@ -2743,6 +2754,7 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         }
         (KeyCode::Right | KeyCode::Char('l'), _) => {
             app.focused_panel = FocusedPanel::Detail;
+            request_detail_load_if_partial(app);
         }
         (KeyCode::Down | KeyCode::Char('j'), _) => key_nav_down(app),
         (KeyCode::Up | KeyCode::Char('k'), _) => key_nav_up(app),
@@ -2797,6 +2809,7 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         }
         (KeyCode::Char('R'), _) => key_refresh_all(app),
         (KeyCode::Char('r'), _) => key_refresh_focused(app),
+        (KeyCode::Char('P'), _) => key_preload_details(app),
         (KeyCode::Char('/'), _) => key_open_search(app),
         (KeyCode::Char('n'), _) => key_open_create(app),
         _ => {}
@@ -2858,6 +2871,7 @@ fn handle_board_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) 
                 app.fullscreen_detail = true;
                 app.focused_panel = FocusedPanel::Detail;
                 app.detail_scroll = 0;
+                request_detail_load_if_partial(app);
             }
         }
         // Detail view-mode cycling is meaningless with no detail visible.
@@ -3472,6 +3486,7 @@ fn commit_search_selection(app: &mut AppState) {
     app.focused_panel = FocusedPanel::Detail;
     app.detail_scroll = 0;
     app.fullscreen_detail = true;
+    request_detail_load_if_partial(app);
     let _ = was_jira;
 }
 
@@ -3511,6 +3526,16 @@ const fn key_refresh_all(app: &mut AppState) {
     app.pending_refresh_all = true;
 }
 
+/// Request a full fetch of every partially-loaded (board-trimmed) issue, so
+/// their detail is ready without opening each card. Handled in
+/// `dispatch_background_tasks`.
+const fn key_preload_details(app: &mut AppState) {
+    if !refresh_allowed(&app.action_state) {
+        return;
+    }
+    app.pending_preload = true;
+}
+
 fn key_refresh_focused(app: &mut AppState) {
     if !refresh_allowed(&app.action_state) {
         return;
@@ -3526,6 +3551,31 @@ fn key_refresh_current_issue(app: &mut AppState) {
     let Some(issue) = app.selected_issue() else {
         return;
     };
+    let key = issue.key.clone();
+    if app.refreshing_issues.contains(&key) {
+        return;
+    }
+    let source_id = issue.source_id.clone();
+    let subsource_idx = issue.subsource_idx;
+    app.refreshing_issues.insert(key.clone());
+    app.pending_refresh_issue = Some(RefreshIssueRequest {
+        key,
+        source_id,
+        subsource_idx,
+    });
+}
+
+/// When a card opened from a lazily-loaded board is only partially fetched
+/// (board-display fields only), kick off a full fetch so its description,
+/// comments, and custom fields fill in. No-op for already-full issues,
+/// non-Jira items, or one already being refreshed.
+pub fn request_detail_load_if_partial(app: &mut AppState) {
+    let Some(issue) = app.selected_issue() else {
+        return;
+    };
+    if !issue.partial {
+        return;
+    }
     let key = issue.key.clone();
     if app.refreshing_issues.contains(&key) {
         return;
@@ -4883,6 +4933,7 @@ mod tests {
             },
             source_id: source_id.map(str::to_string),
             subsource_idx: 0,
+            partial: false,
         }
     }
 

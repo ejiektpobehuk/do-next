@@ -32,8 +32,8 @@ use crate::jira::JiraClient;
 use crate::sources::{
     Clients,
     fetcher::{
-        spawn_all_statuses_fetch, spawn_jira_search, spawn_projects_fetch, spawn_refresh_issue,
-        spawn_team_statuses_fetch,
+        spawn_all_statuses_fetch, spawn_jira_search, spawn_preload_details, spawn_projects_fetch,
+        spawn_refresh_issue, spawn_team_statuses_fetch,
     },
     spawn_fetches,
 };
@@ -62,13 +62,14 @@ pub async fn run(loaded: LoadedConfig, clients: Clients) -> Result<()> {
     result
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     loaded: LoadedConfig,
     clients: Clients,
 ) -> Result<()> {
     let (tx, mut rx) = unbounded_channel::<AppEvent>();
-    let mut app = AppState::new(loaded.teams.clone());
+    let mut app = AppState::new(loaded.teams.clone(), &loaded.config);
 
     // Surface team config load errors as warnings
     if !loaded.load_errors.is_empty() {
@@ -108,7 +109,14 @@ async fn run_inner(
                 && let Some(team_client) = clients_map.jira.get(&team.jira.base_url)
             {
                 let team_confluence = clients_map.confluence.get(&team.confluence.base_url);
-                spawn_fetches(team_client, team_confluence, app.team_config(), &tx);
+                spawn_fetches(
+                    team_client,
+                    team_confluence,
+                    app.team_config(),
+                    app.detail_load,
+                    &app.cache,
+                    &tx,
+                );
                 for state in app.sources.values_mut() {
                     if matches!(state, crate::tui::app::SourceState::Pending) {
                         *state = crate::tui::app::SourceState::Loading;
@@ -219,10 +227,20 @@ fn spawn_initial_tasks(
     });
 
     // Spawn fetch tasks for the active team's sources
-    spawn_fetches(&active_client, active_confluence, app.team_config(), tx);
+    spawn_fetches(
+        &active_client,
+        active_confluence,
+        app.team_config(),
+        app.detail_load,
+        &app.cache,
+        tx,
+    );
     for state in app.sources.values_mut() {
         *state = crate::tui::app::SourceState::Loading;
     }
+    // Paint any fresh cached results instantly; the fetches above revalidate
+    // in the background and overwrite each source when they return.
+    hydrate_from_cache(app);
 
     // Spawn background update checks for team config repos
     let teams = loaded.teams.clone();
@@ -238,6 +256,41 @@ fn spawn_initial_tasks(
     });
 
     Ok(active_client)
+}
+
+/// Paint the active team's sources from any fresh on-disk cache so the first
+/// frame shows data instead of spinners. No-op when caching is disabled or a
+/// source has no fresh cache; hydrated sources are overwritten by the
+/// in-flight revalidation fetch when it returns.
+fn hydrate_from_cache(app: &mut AppState) {
+    if !app.cache.enabled {
+        return;
+    }
+    let source_ids: Vec<String> = app
+        .team_config()
+        .sources
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+    let mut hydrated = false;
+    for id in source_ids {
+        let Some(entry) = crate::sources::cache::read(&app.cache, &id) else {
+            continue;
+        };
+        if let Some(cfg) = entry.board_config {
+            app.board_configs.insert(id.clone(), cfg);
+        }
+        if let Some(lanes) = entry.lanes {
+            app.board_lanes
+                .insert(id.clone(), crate::tui::app::LanesState::Loaded(lanes));
+        }
+        app.sources
+            .insert(id, crate::tui::app::SourceState::Loaded(entry.items));
+        hydrated = true;
+    }
+    if hydrated {
+        app.rebuild_issues();
+    }
 }
 
 fn spawn_tick_task(tx: UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<()> {
@@ -526,7 +579,14 @@ fn dispatch_background_tasks(
             *state = crate::tui::app::SourceState::Loading;
         }
         app.subsource_errors.clear();
-        spawn_fetches(client, confluence, app.team_config(), tx);
+        spawn_fetches(
+            client,
+            confluence,
+            app.team_config(),
+            app.detail_load,
+            &app.cache,
+            tx,
+        );
     }
 
     // Single-issue refresh requested via `r` (detail focus).
@@ -538,6 +598,29 @@ fn dispatch_background_tasks(
             req.subsource_idx,
             tx.clone(),
         );
+    }
+
+    // Preload full detail for every partial (board-trimmed) issue, requested
+    // via `P`. Fans out `get_issue` with bounded concurrency.
+    if app.pending_preload {
+        app.pending_preload = false;
+        let requests: Vec<crate::tui::app::RefreshIssueRequest> = app
+            .issues
+            .iter()
+            .filter_map(|item| item.as_jira())
+            .filter(|issue| issue.partial && !app.refreshing_issues.contains(&issue.key))
+            .map(|issue| crate::tui::app::RefreshIssueRequest {
+                key: issue.key.clone(),
+                source_id: issue.source_id.clone(),
+                subsource_idx: issue.subsource_idx,
+            })
+            .collect();
+        for req in &requests {
+            app.refreshing_issues.insert(req.key.clone());
+        }
+        if !requests.is_empty() {
+            spawn_preload_details(client.clone(), requests, tx.clone());
+        }
     }
 
     // Debounced Jira-side search dispatch.

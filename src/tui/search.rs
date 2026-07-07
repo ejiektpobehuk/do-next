@@ -339,6 +339,7 @@ mod tests {
             },
             source_id: None,
             subsource_idx: 0,
+            partial: false,
         }
     }
 

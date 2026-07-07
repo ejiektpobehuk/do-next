@@ -1,10 +1,11 @@
+pub mod cache;
 pub mod fetcher;
 
 use std::collections::HashMap;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::types::{SourceKind, TeamConfig};
+use crate::config::types::{CacheConfig, DetailLoad, SourceKind, TeamConfig};
 use crate::confluence::ConfluenceClient;
 use crate::events::AppEvent;
 use crate::jira::JiraClient;
@@ -17,10 +18,16 @@ pub struct Clients {
 }
 
 /// Spawn one background fetch task per configured source in a team.
+///
+/// `default_detail_load` is the global board detail-load mode; a board source
+/// may override it via its own `detail_load`. `cache` controls whether each
+/// fetch persists its result for stale-while-revalidate.
 pub fn spawn_fetches(
     jira: &JiraClient,
     confluence: Option<&ConfluenceClient>,
     team_config: &TeamConfig,
+    default_detail_load: DetailLoad,
+    cache: &CacheConfig,
     tx: &UnboundedSender<AppEvent>,
 ) {
     for source_cfg in &team_config.sources {
@@ -31,11 +38,16 @@ pub fn spawn_fetches(
                     let _ = tx.send(AppEvent::SourceLoaded(source_cfg.id.clone(), vec![]));
                     continue;
                 }
-                spawn_fetch(jira.clone(), source_cfg.clone(), tx.clone());
+                spawn_fetch(jira.clone(), source_cfg.clone(), cache.clone(), tx.clone());
             }
             SourceKind::Confluence => {
                 if let Some(client) = confluence {
-                    spawn_confluence_fetch(client.clone(), source_cfg.clone(), tx.clone());
+                    spawn_confluence_fetch(
+                        client.clone(),
+                        source_cfg.clone(),
+                        cache.clone(),
+                        tx.clone(),
+                    );
                 } else {
                     let _ = tx.send(AppEvent::SourceError(
                         source_cfg.id.clone(),
@@ -44,7 +56,18 @@ pub fn spawn_fetches(
                 }
             }
             SourceKind::Board => {
-                spawn_board_fetch(jira.clone(), source_cfg.clone(), tx.clone());
+                let detail_load = source_cfg
+                    .board
+                    .as_ref()
+                    .and_then(|b| b.detail_load)
+                    .unwrap_or(default_detail_load);
+                spawn_board_fetch(
+                    jira.clone(),
+                    source_cfg.clone(),
+                    detail_load,
+                    cache.clone(),
+                    tx.clone(),
+                );
             }
         }
     }
