@@ -12,7 +12,12 @@
       let
         pkgs = import nixpkgs { inherit system; };
         craneLib = crane.mkLib pkgs;
-        src = craneLib.cleanCargoSource ./.;
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            (pkgs.lib.hasSuffix ".html" path) || (craneLib.filterCargoSources path type);
+          name = "source";
+        };
         commonArgs = {
           inherit src;
           nativeBuildInputs = [ pkgs.pkg-config ];
