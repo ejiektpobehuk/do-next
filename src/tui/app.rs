@@ -2739,6 +2739,16 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
                 app.activate_tab((app.active_tab_index() + len - 1) % len);
             }
         }
+        // Issue view opened from a board: q/Esc step back to the board rather
+        // than quitting the app (Ctrl+C still quits — it's a separate arm).
+        (KeyCode::Char('q') | KeyCode::Esc, m)
+            if app.fullscreen_detail
+                && app.board_view.is_some()
+                && !m.contains(KeyModifiers::CONTROL) =>
+        {
+            app.fullscreen_detail = false;
+            app.focused_panel = FocusedPanel::List;
+        }
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }

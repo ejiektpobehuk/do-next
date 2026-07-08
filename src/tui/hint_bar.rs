@@ -199,9 +199,16 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         hints.push(Span::raw(" team | "));
     }
     hints.push(Span::styled("?", Style::default().fg(Color::Blue)));
-    hints.push(Span::raw(" | ("));
-    hints.push(Span::styled("q", Style::default().fg(Color::Red)));
-    hints.push(Span::raw(")uit ├──"));
+    hints.push(Span::raw(" | "));
+    if app.board_view.is_some() && app.fullscreen_detail {
+        // Detail opened from a board: q/Esc step back to the board.
+        hints.push(Span::styled("q/Esc", Style::default().fg(Color::Blue)));
+        hints.push(Span::raw(" board ├──"));
+    } else {
+        hints.push(Span::raw("("));
+        hints.push(Span::styled("q", Style::default().fg(Color::Red)));
+        hints.push(Span::raw(")uit ├──"));
+    }
 
     let title = Line::from(hints)
         .alignment(Alignment::Right)
