@@ -200,7 +200,11 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
     }
     hints.push(Span::styled("?", Style::default().fg(Color::Blue)));
     hints.push(Span::raw(" | "));
-    if app.board_view.is_some() && app.fullscreen_detail {
+    if app.fullscreen_detail && app.saved_search.is_some() {
+        // Detail opened from a search: q/Esc return to the search overlay.
+        hints.push(Span::styled("q/Esc", Style::default().fg(Color::Blue)));
+        hints.push(Span::raw(" search ├──"));
+    } else if app.board_view.is_some() && app.fullscreen_detail {
         // Detail opened from a board: q/Esc step back to the board.
         hints.push(Span::styled("q/Esc", Style::default().fg(Color::Blue)));
         hints.push(Span::raw(" board ├──"));

@@ -568,6 +568,11 @@ pub struct AppState {
     /// Toggled off by `h` or `Esc` in normal mode. Set when opening an issue
     /// from the search popup.
     pub fullscreen_detail: bool,
+    /// The `Searching` state that opened the current fullscreen detail, parked
+    /// so `q`/`Esc` can restore the search overlay with its prior results,
+    /// filters, and selection. `Some` only while a search-originated detail is
+    /// open; cleared whenever that detail is left by any other path.
+    pub saved_search: Option<Box<ActionState>>,
     /// Distinct status names from the active team projects' workflows.
     pub status_team_cache: CacheState<Vec<String>>,
     /// All statuses configured on this Jira instance (used for the picker's
@@ -671,6 +676,7 @@ impl AppState {
             refreshing_issues: HashSet::new(),
             image_picker: None,
             fullscreen_detail: false,
+            saved_search: None,
             status_team_cache: CacheState::default(),
             status_all_cache: CacheState::default(),
             project_cache: CacheState::default(),
@@ -753,6 +759,7 @@ impl AppState {
         self.action_state = ActionState::None;
         self.overlay = None;
         self.fullscreen_detail = false;
+        self.saved_search = None;
         self.board_view = None;
         // Drop any in-flight refresh signals; the running tasks will still
         // send events, but the handler tolerates unknown keys.
@@ -813,6 +820,7 @@ impl AppState {
         if self.board_view != board {
             self.board_view = board;
             self.fullscreen_detail = false;
+            self.saved_search = None;
             self.detail_scroll = 0;
             self.nav_idx = 0;
             self.rebuild_issues();
@@ -2739,6 +2747,19 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
                 app.activate_tab((app.active_tab_index() + len - 1) % len);
             }
         }
+        // Issue view opened from a search: q/Esc return to the search overlay
+        // with its prior state rather than quitting (Ctrl+C still quits). Takes
+        // precedence over the board arm below — search is the more recent origin.
+        (KeyCode::Char('q') | KeyCode::Esc, m)
+            if app.fullscreen_detail
+                && app.saved_search.is_some()
+                && !m.contains(KeyModifiers::CONTROL) =>
+        {
+            app.fullscreen_detail = false;
+            if let Some(saved) = app.saved_search.take() {
+                app.action_state = *saved;
+            }
+        }
         // Issue view opened from a board: q/Esc step back to the board rather
         // than quitting the app (Ctrl+C still quits — it's a separate arm).
         (KeyCode::Char('q') | KeyCode::Esc, m)
@@ -2759,6 +2780,8 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         (KeyCode::Left | KeyCode::Char('h'), _) => {
             if app.fullscreen_detail {
                 app.fullscreen_detail = false;
+                // Left the search-originated detail without returning to search.
+                app.saved_search = None;
             }
             app.focused_panel = FocusedPanel::List;
         }
@@ -2879,6 +2902,8 @@ fn handle_board_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) 
         KeyCode::Enter => {
             if on_board {
                 app.fullscreen_detail = true;
+                // This detail was opened from the board, not from search.
+                app.saved_search = None;
                 app.focused_panel = FocusedPanel::Detail;
                 app.detail_scroll = 0;
                 request_detail_load_if_partial(app);
@@ -3486,7 +3511,12 @@ fn commit_search_selection(app: &mut AppState) {
         }
     };
 
-    app.action_state = ActionState::None;
+    // Park the search overlay so q/Esc from the issue view can restore it with
+    // the same query, filters, results, and selection.
+    app.saved_search = Some(Box::new(std::mem::replace(
+        &mut app.action_state,
+        ActionState::None,
+    )));
     // Focus the picked issue in the main list.
     if let Some(pos) = app.nav_items.iter().position(
         |n| matches!(n, NavItem::Issue(idx) if app.issues.get(*idx).is_some_and(|i| i.key() == key)),
