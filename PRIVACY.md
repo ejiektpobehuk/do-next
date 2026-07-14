@@ -21,18 +21,33 @@ All locally stored files containing secrets use restrictive file permissions (`6
 
 ## Third-Party Services
 
-do-next communicates directly with the **Atlassian Jira Cloud API** to read and manage issues on your behalf. When using OAuth authentication, the app also communicates with **Atlassian's authorization servers** (`auth.atlassian.com`) to obtain and refresh access tokens.
+do-next communicates directly with the **Atlassian Jira Cloud API** to read and manage issues on your behalf. If you configure Confluence task sources, it also communicates with the **Atlassian Confluence Cloud API**. When using OAuth authentication, the app also communicates with **Atlassian's authorization servers** (`auth.atlassian.com`) to obtain and refresh access tokens.
 
 No data is sent to any other third party.
 
 ## OAuth Scopes
 
-When authenticating via OAuth, do-next requests the following permissions:
+When authenticating via OAuth, do-next always requests the following base permissions:
 
 - `read:jira-work` — Read access to Jira issues, comments, and attachments.
 - `write:jira-work` — Write access to create comments, update fields, and manage issues.
 - `read:jira-user` — Read access to identify the current user.
 - `offline_access` — Allows token refresh without re-authorization.
+
+Additional permissions are requested **only if** your configuration uses the corresponding source kinds:
+
+**Confluence task sources** (read and complete inline tasks, resolve page and space names):
+
+- `read:task:confluence` / `write:task:confluence` — Read and complete inline tasks.
+- `read:page:confluence` — Resolve page titles.
+- `read:space:confluence` — Resolve space keys.
+- `read:content-details:confluence` — Look up the current user.
+
+**Jira board sources** (read boards, sprints, and their issues via the Jira Agile API):
+
+- `read:board-scope:jira-software` / `read:board-scope.admin:jira-software` — Read board issues and configuration.
+- `read:sprint:jira-software` — Read sprints and sprint issues.
+- `read:project:jira`, `read:issue-details:jira`, `read:jql:jira` — Supporting scopes required by the same endpoints.
 
 You can revoke access at any time from your [Atlassian account settings](https://id.atlassian.com/manage-profile/apps).
 
