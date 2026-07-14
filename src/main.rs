@@ -44,11 +44,24 @@ enum Commands {
     },
     /// Reconfigure Jira authentication
     Auth,
+    /// Manage the company config repo (shared connection + team catalog)
+    Company {
+        #[command(subcommand)]
+        action: CompanyAction,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
         shell: Shell,
     },
+}
+
+#[derive(Subcommand)]
+enum CompanyAction {
+    /// Join a company config repo (git URL or local path)
+    Join { source: String },
+    /// Change which company teams are active
+    Teams,
 }
 
 #[tokio::main]
@@ -83,30 +96,73 @@ async fn main() -> Result<()> {
     if matches!(&cli.command, Some(Commands::Auth)) {
         // Teams with confluence / board sources need the matching granular
         // OAuth scopes (classic Jira scopes don't cover those APIs).
-        let source_kind_present = |kind: config::types::SourceKind| {
-            loaded
-                .teams
-                .iter()
-                .any(|t| t.config.sources.iter().any(|s| s.kind == kind))
-        };
-        let extra_scopes = crate::jira::oauth::ExtraScopes {
-            confluence: source_kind_present(config::types::SourceKind::Confluence),
-            board: source_kind_present(config::types::SourceKind::Board),
-        };
-        tui::onboarding::run_auth_reset(&mut loaded.config, extra_scopes)
+        let extra_scopes = config::extra_scopes_for(loaded.teams.iter().map(|t| &t.config));
+        let effective_jira = loaded.config.jira.clone();
+        tui::onboarding::run_auth_reset(&effective_jira, &mut loaded.raw, extra_scopes)
             .context("Auth reset failed")?;
         return Ok(());
     }
 
-    // Run onboarding if no config at all (first run)
-    if loaded.config.jira.base_url.is_empty() && loaded.config.teams.is_empty() {
+    // Company management also runs before credential resolution: joining sets
+    // auth up itself, and team selection must work while auth is broken.
+    // Both operate on the raw on-disk config, never the merged view.
+    if let Some(Commands::Company { action }) = &cli.command {
+        match action {
+            CompanyAction::Join { source } => {
+                tui::onboarding::run_company_join_command(&mut loaded.raw, source)
+                    .context("Company join failed")?;
+            }
+            CompanyAction::Teams => {
+                tui::onboarding::run_company_teams_command(&mut loaded.raw)
+                    .context("Company team selection failed")?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Company config repo: offer to pull upstream updates before the TUI
+    // starts so manifest/team changes apply to this run. TUI launch only —
+    // quick subcommands shouldn't block on a network fetch.
+    if cli.command.is_none()
+        && let Some(company) = &loaded.config.company
+    {
+        let repo = config::expand_tilde(&company.path);
+        let behind = config::updates::fetch_behind_count(&repo).unwrap_or(0);
+        if behind > 0 {
+            let plural = if behind == 1 { "" } else { "s" };
+            let pull = tui::onboarding::prompt_yes_no(
+                &format!("Company config has {behind} update{plural}. Pull now? [Y/n]: "),
+                true,
+            )
+            .unwrap_or(false);
+            if pull {
+                match config::updates::pull_ff_only(&repo) {
+                    Ok(()) => {
+                        loaded = config::load().context("Failed to reload configuration")?;
+                    }
+                    Err(e) => {
+                        eprintln!("warning: {e:#}; continuing with the current checkout");
+                    }
+                }
+            }
+        }
+    }
+
+    // Run onboarding if no config at all (first run). A configured company
+    // whose manifest failed to load must NOT fall into onboarding (it would
+    // overwrite the user's config) — its errors surface via the bail below.
+    if loaded.config.jira.base_url.is_empty()
+        && loaded.config.teams.is_empty()
+        && loaded.config.company.is_none()
+    {
         loaded = tui::onboarding::run_onboarding().context("Onboarding failed")?;
     }
 
-    // Config exists but no team refs — interactive team setup
-    if loaded.config.teams.is_empty() {
-        loaded =
-            tui::onboarding::run_team_setup(&mut loaded.config).context("Team setup failed")?;
+    // Config exists but no team refs (manual or company) — interactive team
+    // setup. Operates on the raw config: it rewrites config.json5, which must
+    // never absorb merged company values.
+    if !config::has_team_refs(&loaded.config) {
+        loaded = tui::onboarding::run_team_setup(&mut loaded.raw).context("Team setup failed")?;
     }
 
     // Team refs exist but every team failed to load — surface errors and bail.
@@ -199,7 +255,7 @@ async fn main() -> Result<()> {
         }) => {
             subcommands::fields::run(&default_client, &issue_key, field.as_deref(), raw).await?;
         }
-        Some(Commands::Auth | Commands::Completions { .. }) => {
+        Some(Commands::Auth | Commands::Company { .. } | Commands::Completions { .. }) => {
             unreachable!("handled before credential resolution")
         }
         None => {

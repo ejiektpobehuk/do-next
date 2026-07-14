@@ -246,10 +246,7 @@ fn spawn_initial_tasks(
     let teams = loaded.teams.clone();
     let update_tx = tx.clone();
     tokio::task::spawn_blocking(move || {
-        let warnings: Vec<String> = teams
-            .iter()
-            .filter_map(crate::config::updates::check_team_update)
-            .collect();
+        let warnings = crate::config::updates::check_updates(&teams);
         if !warnings.is_empty() {
             let _ = update_tx.send(AppEvent::UpdateWarnings(warnings));
         }

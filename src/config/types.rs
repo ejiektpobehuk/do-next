@@ -25,6 +25,24 @@ pub struct Config {
     pub open_slack_in_app: Option<bool>,
     /// Slack workspace (team) ID (e.g. "T0123ABCDEF"). Required for deep links.
     pub slack_team_id: Option<String>,
+    /// Company config repo: Jira connection, shared OAuth app and team catalog
+    /// come from its `company.json5` manifest. Selected teams load alongside
+    /// the manual `teams` entries.
+    #[serde(default)]
+    pub company: Option<CompanyRef>,
+}
+
+/// A reference to a company config repo clone in the user config.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CompanyRef {
+    /// Git URL the repo was cloned from (kept for display and re-cloning;
+    /// not used at load time).
+    pub url: Option<String>,
+    /// Local clone directory containing `company.json5`. `~` is expanded.
+    pub path: String,
+    /// Team ids selected from the manifest catalog.
+    #[serde(default)]
+    pub teams: Vec<String>,
 }
 
 /// A reference to a team config directory.
@@ -609,6 +627,37 @@ mod tests {
     fn effective_type_is_none_by_default() {
         let field = CustomViewFieldConfig::default();
         assert_eq!(field.effective_type(), None);
+    }
+
+    #[test]
+    fn config_without_company_block_parses_as_none() {
+        let cfg: Config = json5::from_str("{}").expect("valid config");
+        assert!(cfg.company.is_none());
+    }
+
+    #[test]
+    fn config_company_block_parses() {
+        let cfg: Config = json5::from_str(
+            r#"{ company: {
+                url: "git@github.com:acme/cfg.git",
+                path: "~/.config/do-next/company/cfg",
+                teams: ["platform", "billing"],
+            } }"#,
+        )
+        .expect("valid config");
+        let company = cfg.company.expect("company block");
+        assert_eq!(company.url.as_deref(), Some("git@github.com:acme/cfg.git"));
+        assert_eq!(company.path, "~/.config/do-next/company/cfg");
+        assert_eq!(company.teams, vec!["platform", "billing"]);
+    }
+
+    #[test]
+    fn company_block_teams_default_to_empty() {
+        let cfg: Config =
+            json5::from_str(r#"{ company: { path: "/tmp/cfg" } }"#).expect("valid config");
+        let company = cfg.company.expect("company block");
+        assert_eq!(company.url, None);
+        assert!(company.teams.is_empty());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod company;
 pub mod credentials;
 pub mod hidden;
 pub mod types;
@@ -13,7 +14,12 @@ use types::{
 
 /// Result of loading user config + all team configs.
 pub struct LoadedConfig {
+    /// Effective config: the user's file with company manifest values merged
+    /// in. Use for running the app; never write this back to disk.
     pub config: Config,
+    /// The user's config exactly as parsed from disk (no company merge).
+    /// Anything that rewrites `config.json5` must start from this.
+    pub raw: Config,
     pub teams: Vec<ResolvedTeam>,
     /// Non-fatal errors from team configs that failed to load.
     pub load_errors: Vec<String>,
@@ -23,15 +29,18 @@ pub struct LoadedConfig {
 pub fn load() -> Result<LoadedConfig> {
     let user_path = user_config_path()?;
 
-    let config: Config = if user_path.exists() {
+    let mut config: Config = if user_path.exists() {
         load_file(&user_path)?
     } else {
         Config::default()
     };
 
+    let raw = config.clone();
     let mut teams = Vec::new();
     let mut load_errors = Vec::new();
-    for team_ref in &config.teams {
+    let mut team_refs = resolve_company(&mut config, &mut load_errors);
+    team_refs.extend(config.teams.iter().cloned());
+    for team_ref in &team_refs {
         match load_team_config(team_ref) {
             Ok((team_config, warnings)) => {
                 for w in warnings {
@@ -69,9 +78,54 @@ pub fn load() -> Result<LoadedConfig> {
 
     Ok(LoadedConfig {
         config,
+        raw,
         teams,
         load_errors,
     })
+}
+
+/// Resolve the optional company block: parse the manifest from the clone
+/// directory, overlay company values onto the user's global settings
+/// (in memory only — the user's file is never rewritten), and synthesize
+/// `TeamRef`s for the selected catalog teams. All failures are non-fatal:
+/// they land in `load_errors` and manually-configured teams keep working.
+fn resolve_company(config: &mut Config, load_errors: &mut Vec<String>) -> Vec<TeamRef> {
+    let Some(company_ref) = config.company.clone() else {
+        return Vec::new();
+    };
+    let dir = expand_tilde(&company_ref.path);
+    let manifest = match company::load_manifest(&dir) {
+        Ok(m) => m,
+        Err(e) => {
+            load_errors.push(format!("company '{}': {e:#}", company_ref.path));
+            return Vec::new();
+        }
+    };
+    config.jira = company::apply_company_defaults(&config.jira, &manifest);
+    if config.confluence.is_none() {
+        config.confluence.clone_from(&manifest.defaults.confluence);
+    }
+    if config.slack_team_id.is_none() {
+        config
+            .slack_team_id
+            .clone_from(&manifest.defaults.slack_team_id);
+    }
+    if config.open_slack_in_app.is_none() {
+        config.open_slack_in_app = manifest.defaults.open_slack_in_app;
+    }
+    let (refs, errors) = company::company_team_refs(&dir, &manifest, &company_ref.teams);
+    load_errors.extend(errors);
+    refs
+}
+
+/// True when the config references any team, either manually or through a
+/// company team selection. Used by `main` to decide whether team setup runs.
+pub fn has_team_refs(config: &Config) -> bool {
+    !config.teams.is_empty()
+        || config
+            .company
+            .as_ref()
+            .is_some_and(|c| !c.teams.is_empty())
 }
 
 pub fn user_config_path() -> Result<PathBuf> {
@@ -81,7 +135,7 @@ pub fn user_config_path() -> Result<PathBuf> {
         .join("config.json5"))
 }
 
-fn load_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+pub fn load_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
     json5::from_str(&content)
@@ -574,6 +628,168 @@ mod tests {
         assert_eq!(conf, jira);
     }
 
+    // ── resolve_company ───────────────────────────────────────────────────
+
+    /// Build a company clone fixture: manifest + one team config on disk.
+    fn company_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("company.json5"),
+            r#"{
+                name: "Acme",
+                jira: { base_url: "https://acme.atlassian.net", default_project: "CORE" },
+                oauth: { client_id: "cid", client_secret: "sec" },
+                defaults: { slack_team_id: "T0123" },
+                teams: [{ id: "platform" }, { id: "ghost" }],
+            }"#,
+        )
+        .expect("write manifest");
+        let team_dir = dir.path().join("teams/platform");
+        std::fs::create_dir_all(&team_dir).expect("team dir");
+        std::fs::write(
+            team_dir.join("do-next.json5"),
+            r#"{ sources: [{ id: "mine", jql: "assignee = currentUser()" }] }"#,
+        )
+        .expect("write team config");
+        dir
+    }
+
+    fn config_with_company(dir: &tempfile::TempDir, teams: &[&str]) -> Config {
+        Config {
+            company: Some(types::CompanyRef {
+                url: None,
+                path: dir.path().to_string_lossy().into_owned(),
+                teams: teams.iter().map(ToString::to_string).collect(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_company_merges_defaults_and_synthesizes_refs() {
+        let fixture = company_fixture();
+        let mut config = config_with_company(&fixture, &["platform"]);
+        let mut errors = Vec::new();
+        let refs = resolve_company(&mut config, &mut errors);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].id, "platform");
+        assert!(refs[0].path.ends_with("teams/platform"));
+        // Company values landed in the in-memory global config.
+        assert_eq!(config.jira.base_url, "https://acme.atlassian.net");
+        assert_eq!(config.jira.default_project, "CORE");
+        assert_eq!(config.jira.auth_method.as_deref(), Some("oauth"));
+        assert_eq!(config.slack_team_id.as_deref(), Some("T0123"));
+        // The synthesized ref resolves through the normal team loader.
+        let (team, warnings) = load_team_config(&refs[0]).expect("team loads");
+        assert!(warnings.is_empty());
+        assert_eq!(team.sources.len(), 1);
+    }
+
+    #[test]
+    fn resolve_company_missing_manifest_is_nonfatal() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let mut config = config_with_company(&empty, &["platform"]);
+        let mut errors = Vec::new();
+        let refs = resolve_company(&mut config, &mut errors);
+        assert!(refs.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("company"));
+        // No merge happened — user config untouched.
+        assert!(config.jira.base_url.is_empty());
+    }
+
+    #[test]
+    fn resolve_company_unknown_selected_team_errors_but_keeps_rest() {
+        let fixture = company_fixture();
+        let mut config = config_with_company(&fixture, &["platform", "gone"]);
+        let mut errors = Vec::new();
+        let refs = resolve_company(&mut config, &mut errors);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("gone"));
+    }
+
+    #[test]
+    fn resolve_company_user_values_win() {
+        let fixture = company_fixture();
+        let mut config = config_with_company(&fixture, &[]);
+        config.jira.base_url = "https://mine.atlassian.net".into();
+        config.slack_team_id = Some("TMINE".into());
+        let mut errors = Vec::new();
+        resolve_company(&mut config, &mut errors);
+        assert_eq!(config.jira.base_url, "https://mine.atlassian.net");
+        assert_eq!(config.slack_team_id.as_deref(), Some("TMINE"));
+    }
+
+    #[test]
+    fn has_team_refs_counts_manual_and_company_selections() {
+        assert!(!has_team_refs(&Config::default()));
+        let manual = Config {
+            teams: vec![TeamRef {
+                id: "personal".into(),
+                path: "/tmp/personal".into(),
+                file: None,
+            }],
+            ..Default::default()
+        };
+        assert!(has_team_refs(&manual));
+        let company_only = Config {
+            company: Some(types::CompanyRef {
+                url: None,
+                path: "/tmp/acme".into(),
+                teams: vec!["platform".into()],
+            }),
+            ..Default::default()
+        };
+        assert!(has_team_refs(&company_only));
+        let company_no_selection = Config {
+            company: Some(types::CompanyRef {
+                url: None,
+                path: "/tmp/acme".into(),
+                teams: vec![],
+            }),
+            ..Default::default()
+        };
+        assert!(!has_team_refs(&company_no_selection));
+    }
+
+    // ── extra_scopes_for ──────────────────────────────────────────────────
+
+    fn team_with_kinds(kinds: &[SourceKind]) -> TeamConfig {
+        TeamConfig {
+            sources: kinds
+                .iter()
+                .enumerate()
+                .map(|(i, &kind)| SourceConfig {
+                    id: format!("s{i}"),
+                    kind,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extra_scopes_default_to_none_for_jira_only_teams() {
+        let teams = [team_with_kinds(&[SourceKind::Jira]), team_with_kinds(&[])];
+        let extra = extra_scopes_for(&teams);
+        assert!(!extra.confluence);
+        assert!(!extra.board);
+    }
+
+    #[test]
+    fn extra_scopes_union_across_teams() {
+        let teams = [
+            team_with_kinds(&[SourceKind::Confluence]),
+            team_with_kinds(&[SourceKind::Board, SourceKind::Jira]),
+        ];
+        let extra = extra_scopes_for(&teams);
+        assert!(extra.confluence);
+        assert!(extra.board);
+    }
+
     #[test]
     fn confluence_override_precedence_is_team_over_user_over_jira() {
         let jira = JiraConfig {
@@ -866,6 +1082,24 @@ pub fn apply_team_jira_override(base: &mut JiraConfig, overlay: &TeamJiraOverrid
         base.oauth_client_secret
             .clone_from(&overlay.oauth_client_secret);
     }
+}
+
+/// Compute the extra granular OAuth scope sets required by the source kinds
+/// these teams use (Confluence tasks, Agile boards).
+pub fn extra_scopes_for<'a>(
+    teams: impl IntoIterator<Item = &'a TeamConfig>,
+) -> crate::jira::oauth::ExtraScopes {
+    let mut extra = crate::jira::oauth::ExtraScopes::default();
+    for team in teams {
+        for source in &team.sources {
+            match source.kind {
+                SourceKind::Confluence => extra.confluence = true,
+                SourceKind::Board => extra.board = true,
+                SourceKind::Jira => {}
+            }
+        }
+    }
+    extra
 }
 
 /// Expand `~` prefix to the user's home directory.

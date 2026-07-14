@@ -4,6 +4,32 @@ All notable changes to `do-next` are documented here.
 
 `do-next` uses a date-based pre-release scheme: `v0.0.0-yyyy.mm.dd`.
 
+## v0.0.0-2026.7.14 — 2026-07-14
+
+Third feature release.
+Adds issue creation, kanban boards, and Confluence tasks — plus a company central config for sharing setup across teams.
+
+### New features
+
+- New issue creation
+- Date field type support
+- Minimal kanban boards support
+- Confluence task support
+- Company central config
+- Deduplicated Confluence & Jira OAuth entries
+- Styled OAuth completion web page
+
+### UX polish
+
+- Keep the form on submission error instead of discarding it
+- `q` goes back to the search view without losing state
+
+### Chores / CI
+
+- New nix wrapper & comments for just
+- Allow .html files into the build process
+- Consolidate multiple bool config fields into a single enum
+
 ## v0.0.0-2026.5.25 — 2026-05-25
 
 Second feature release.

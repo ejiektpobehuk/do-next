@@ -631,6 +631,8 @@ impl AppState {
                     .collect()
             })
             .unwrap_or_default();
+        // A board-only first team starts on its board, not the (absent) list tab.
+        let board_view = resolved_teams.first().and_then(Self::default_view_for);
         Self {
             resolved_teams,
             active_team_idx: 0,
@@ -685,7 +687,7 @@ impl AppState {
             pending_projects_fetch: false,
             board_configs: HashMap::new(),
             board_lanes: HashMap::new(),
-            board_view: None,
+            board_view,
             detail_load: config.detail_load,
             cache: config.cache.clone(),
         }
@@ -760,7 +762,8 @@ impl AppState {
         self.overlay = None;
         self.fullscreen_detail = false;
         self.saved_search = None;
-        self.board_view = None;
+        // Board-only teams have no list tab; land on their first board.
+        self.board_view = Self::default_view_for(&self.resolved_teams[new_idx]);
         // Drop any in-flight refresh signals; the running tasks will still
         // send events, but the handler tolerates unknown keys.
         self.refreshing_issues.clear();
@@ -784,13 +787,31 @@ impl AppState {
         }
     }
 
-    /// The ordered tab list. Each team contributes a list tab, immediately
-    /// followed by one tab per board source it defines. A tab is identified by
-    /// `(team_idx, Option<board_source_id>)`; `None` is the team's list view.
+    /// The default view for a team's tab: `None` (the flat list) normally,
+    /// or the first board source for a board-only team — such teams get no
+    /// list tab (it would always be empty).
+    fn default_view_for(team: &ResolvedTeam) -> Option<String> {
+        if team
+            .config
+            .sources
+            .iter()
+            .any(|s| s.kind != crate::config::types::SourceKind::Board)
+        {
+            return None;
+        }
+        team.config.sources.first().map(|s| s.id.clone())
+    }
+
+    /// The ordered tab list. Each team contributes a list tab (unless all its
+    /// sources are boards), followed by one tab per board source it defines.
+    /// A tab is identified by `(team_idx, Option<board_source_id>)`; `None`
+    /// is the team's list view.
     pub fn tab_list(&self) -> Vec<(usize, Option<String>)> {
         let mut tabs = Vec::new();
         for (i, team) in self.resolved_teams.iter().enumerate() {
-            tabs.push((i, None));
+            if Self::default_view_for(team).is_none() {
+                tabs.push((i, None));
+            }
             for src in &team.config.sources {
                 if src.kind == crate::config::types::SourceKind::Board {
                     tabs.push((i, Some(src.id.clone())));
@@ -814,7 +835,7 @@ impl AppState {
             return;
         };
         if team_idx != self.active_team_idx {
-            // switch_team resets board_view to None and rebuilds for the list.
+            // switch_team resets board_view to the team's default and rebuilds.
             self.switch_team(team_idx);
         }
         if self.board_view != board {
@@ -4942,6 +4963,93 @@ mod tests {
 
     fn item_status(item: &WorkItem) -> &str {
         item.status_name()
+    }
+
+    use crate::config::types as cfg;
+
+    fn resolved_team(id: &str, sources: Vec<cfg::SourceConfig>) -> ResolvedTeam {
+        ResolvedTeam {
+            id: id.into(),
+            path: "/tmp".into(),
+            config: TeamConfig {
+                sources,
+                ..Default::default()
+            },
+            jira: cfg::JiraConfig::default(),
+            confluence: cfg::JiraConfig::default(),
+            open_slack_in_app: true,
+            slack_team_id: None,
+        }
+    }
+
+    fn board_source(id: &str) -> cfg::SourceConfig {
+        cfg::SourceConfig {
+            id: id.into(),
+            kind: cfg::SourceKind::Board,
+            board: Some(cfg::BoardFilters {
+                board_id: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn jira_source(id: &str) -> cfg::SourceConfig {
+        cfg::SourceConfig {
+            id: id.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn board_only_team_gets_no_list_tab() {
+        let teams = vec![
+            resolved_team("platform", vec![jira_source("mine"), board_source("inc")]),
+            resolved_team("inc-board", vec![board_source("inc_board")]),
+        ];
+        let app = AppState::new(teams, &cfg::Config::default());
+        assert_eq!(
+            app.tab_list(),
+            vec![
+                (0, None),
+                (0, Some("inc".into())),
+                (1, Some("inc_board".into())),
+            ],
+        );
+    }
+
+    #[test]
+    fn sourceless_team_keeps_its_list_tab() {
+        let teams = vec![resolved_team("empty", Vec::new())];
+        let app = AppState::new(teams, &cfg::Config::default());
+        assert_eq!(app.tab_list(), vec![(0, None)]);
+        assert_eq!(app.board_view, None);
+    }
+
+    #[test]
+    fn board_only_first_team_starts_on_its_board() {
+        let teams = vec![resolved_team("inc-board", vec![board_source("b1")])];
+        let app = AppState::new(teams, &cfg::Config::default());
+        assert_eq!(app.board_view.as_deref(), Some("b1"));
+        assert_eq!(app.active_tab_index(), 0);
+    }
+
+    #[test]
+    fn switching_to_board_only_team_lands_on_its_board() {
+        let teams = vec![
+            resolved_team("platform", vec![jira_source("mine")]),
+            resolved_team("inc-board", vec![board_source("b1")]),
+        ];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        assert_eq!(app.active_tab_index(), 0);
+        app.activate_tab(1);
+        assert_eq!(app.active_team_idx, 1);
+        assert_eq!(app.board_view.as_deref(), Some("b1"));
+        assert_eq!(app.active_tab_index(), 1);
+        // And back to the list team.
+        app.activate_tab(0);
+        assert_eq!(app.active_team_idx, 0);
+        assert_eq!(app.board_view, None);
     }
 
     fn make_issue(key: &str, status: &str, source_id: Option<&str>) -> Issue {

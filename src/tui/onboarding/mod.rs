@@ -1,3 +1,7 @@
+mod company;
+
+pub use company::{run_company_join_command, run_company_teams_command};
+
 use anyhow::Result;
 use crossterm::cursor::MoveUp;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -30,7 +34,7 @@ const AUTH_METHOD_DESCRIPTIONS: [&str; AUTH_METHOD_COUNT] = [
 // ── Step 2: storage ─────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone)]
-enum StorageChoice {
+pub(super) enum StorageChoice {
     Keyring,
     File,
     Command,
@@ -74,7 +78,7 @@ const KEYRING_DESCRIPTION: &str = if cfg!(target_os = "macos") {
 
 // ── Status probing ──────────────────────────────────────────────────────────
 
-struct CredentialStatus {
+pub(super) struct CredentialStatus {
     env_set: bool,
     file_exists: bool,
     keyring_found: bool,
@@ -88,11 +92,34 @@ enum ConfigStyle {
 
 // ── Onboarding (first run) ──────────────────────────────────────────────────
 
+const SETUP_KIND_COUNT: usize = 2;
+
+const SETUP_KIND_LABELS: [&str; SETUP_KIND_COUNT] = ["Personal setup", "Join a company"];
+
+const SETUP_KIND_DESCRIPTIONS: [&str; SETUP_KIND_COUNT] = [
+    "configure your own Jira connection",
+    "your company shares a do-next config repo (git URL or local path)",
+];
+
 /// Run the interactive first-run wizard.
 /// Returns a fully configured `LoadedConfig` (credentials stored per user's choice).
 #[allow(clippy::too_many_lines)]
 pub fn run_onboarding() -> Result<LoadedConfig> {
     println!("Welcome to do-next! Let's set up your configuration.\n");
+
+    let tags = vec![String::new(); SETUP_KIND_COUNT];
+    let setup_kind = run_selection(
+        "How would you like to start?",
+        &SETUP_KIND_LABELS,
+        &SETUP_KIND_DESCRIPTIONS,
+        &tags,
+        0,
+        None,
+    )?;
+    if setup_kind == 1 {
+        return company::run_first_run_company_join();
+    }
+    println!();
 
     let base_url = prompt(
         "Jira base URL (e.g. https://mycompany.atlassian.net): ",
@@ -205,6 +232,7 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
     };
 
     Ok(LoadedConfig {
+        raw: config.clone(),
         config,
         teams: vec![resolved],
         load_errors: Vec::new(),
@@ -214,12 +242,18 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
 // ── Auth reset ──────────────────────────────────────────────────────────────
 
 /// Reconfigure authentication for an existing install without overwriting other config.
+///
+/// Detection and OAuth client credentials use `effective_jira` (user config
+/// with company manifest values merged in); everything persisted lands on
+/// `raw` — the on-disk config — so manifest values are never baked into the
+/// user's file.
 #[allow(clippy::too_many_lines)]
 pub fn run_auth_reset(
-    config: &mut Config,
+    effective_jira: &JiraConfig,
+    raw: &mut Config,
     extra_scopes: crate::jira::oauth::ExtraScopes,
 ) -> Result<()> {
-    if config.jira.base_url.is_empty() {
+    if effective_jira.base_url.is_empty() {
         return Err(anyhow::anyhow!(
             "No configuration found. Run do-next first to complete initial setup."
         ));
@@ -227,25 +261,30 @@ pub fn run_auth_reset(
 
     println!(
         "Reconfiguring Jira authentication for {}",
-        config.jira.base_url
+        effective_jira.base_url
     );
     println!();
 
-    let current_auth = detect_auth_method(&config.jira);
+    let current_auth = detect_auth_method(effective_jira);
     let auth_method = prompt_auth_method(Some(&current_auth))?;
 
     println!();
-    let status = probe_credential_status(&config.jira);
-    let current_storage = detect_storage_method(&config.jira);
+    let status = probe_credential_status(effective_jira);
+    let current_storage = detect_storage_method(effective_jira);
     let storage = match auth_method {
         AuthMethod::OAuth => prompt_oauth_storage(Some(&current_storage))?,
         AuthMethod::PersonalToken => prompt_token_storage(Some(&current_storage), Some(&status))?,
     };
 
+    // The company manifest supplies the OAuth app when the user hasn't set
+    // one; those creds must not be copied into the user's file, or rotation
+    // in the config repo would stop propagating.
+    let company_supplies_oauth = raw.company.is_some() && raw.jira.oauth_client_id.is_none();
+
     // Clear existing auth fields; each branch sets only what it needs.
-    config.jira.credential_command = None;
-    config.jira.credential_store = None;
-    config.jira.auth_method = None;
+    raw.jira.credential_command = None;
+    raw.jira.credential_store = None;
+    raw.jira.auth_method = None;
 
     let config_dir = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?
@@ -253,32 +292,51 @@ pub fn run_auth_reset(
 
     match auth_method {
         AuthMethod::OAuth => {
-            let (client_id, client_secret) = resolve_oauth_client_credentials(&config.jira)?;
+            let (client_id, client_secret) = resolve_oauth_client_credentials(effective_jira)?;
             let store = match storage {
                 StorageChoice::Keyring => OAuthStore::Keyring,
                 _ => OAuthStore::File,
             };
             crate::jira::oauth::run_oauth_flow(&client_id, &client_secret, store, extra_scopes)?;
-            config.jira.auth_method = Some("oauth".into());
-            config.jira.oauth_client_id = Some(client_id);
-            config.jira.oauth_client_secret = Some(client_secret);
-            config.jira.email = None;
+            let reused_company_app = company_supplies_oauth
+                && effective_jira.oauth_client_id.as_deref() == Some(client_id.as_str())
+                && effective_jira.oauth_client_secret.as_deref() == Some(client_secret.as_str());
+            if !reused_company_app {
+                raw.jira.auth_method = Some("oauth".into());
+                raw.jira.oauth_client_id = Some(client_id);
+                raw.jira.oauth_client_secret = Some(client_secret);
+            }
+            raw.jira.email = None;
             if matches!(storage, StorageChoice::Keyring) {
-                config.jira.credential_store = Some("keyring".into());
+                raw.jira.credential_store = Some("keyring".into());
             }
         }
         AuthMethod::PersonalToken => {
-            let current_email = config.jira.email.as_deref().unwrap_or("");
+            let current_email = effective_jira.email.as_deref().unwrap_or("");
             let email_prompt = if current_email.is_empty() {
                 "Jira account email: ".to_string()
             } else {
                 format!("Jira account email [{current_email}]: ")
             };
             let email = prompt(&email_prompt, Some(current_email))?;
-            config.jira.email = Some(email);
+            raw.jira.email = Some(email);
             println!();
 
-            apply_token_storage(&storage, &mut config.jira, &config_dir)?;
+            // The keyring entry key defaults to the base URL; company users
+            // have an empty base_url on disk, so storage must use the
+            // effective one. Restore afterwards so it isn't persisted.
+            let disk_base_url = raw.jira.base_url.clone();
+            raw.jira.base_url.clone_from(&effective_jira.base_url);
+            let stored = apply_token_storage(&storage, &mut raw.jira, &config_dir);
+            raw.jira.base_url = disk_base_url;
+            stored?;
+
+            // A company manifest with an OAuth app implies `oauth` for users
+            // without an explicit method — switching to a token needs an
+            // explicit override.
+            if raw.company.is_some() {
+                raw.jira.auth_method = Some("basic".into());
+            }
         }
     }
 
@@ -288,7 +346,7 @@ pub fn run_auth_reset(
         println!("Note: config file will be rewritten in minimal format (comments removed).");
     }
     std::fs::create_dir_all(&config_dir)?;
-    let json5_content = json5::to_string(&config)?;
+    let json5_content = json5::to_string(&raw)?;
     std::fs::write(&config_path, json5_content)?;
     println!("Config updated at {}", config_path.display());
 
@@ -297,14 +355,18 @@ pub fn run_auth_reset(
 
 // ── Team setup (no teams configured) ────────────────────────────────────────
 
-const TEAM_SETUP_COUNT: usize = 2;
+const TEAM_SETUP_COUNT: usize = 3;
 
-const TEAM_SETUP_LABELS: [&str; TEAM_SETUP_COUNT] =
-    ["Create personal space", "Use existing config "];
+const TEAM_SETUP_LABELS: [&str; TEAM_SETUP_COUNT] = [
+    "Create personal space",
+    "Use existing config  ",
+    "Join a company       ",
+];
 
 const TEAM_SETUP_DESCRIPTIONS: [&str; TEAM_SETUP_COUNT] = [
     "create a local team config for your personal sources",
     "provide a path to an existing team config (e.g. a cloned git repo)",
+    "clone your company's config repo and pick teams from its catalog",
 ];
 
 /// Interactive prompt when config exists but has no teams.
@@ -325,6 +387,15 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
     let config_dir = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?
         .join("do-next");
+
+    if choice == 2 {
+        // Join a company: writes the config itself, then reload from disk so
+        // the manifest merge and team resolution run through the normal path.
+        println!();
+        let source = prompt("Company config repo (git URL or local path): ", None)?;
+        company::join_company_into(config, &source)?;
+        return crate::config::load();
+    }
 
     let (team_ref, team_config, team_jira) = if choice == 0 {
         // Create personal space
@@ -414,6 +485,7 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
 
     Ok(LoadedConfig {
         config: config.clone(),
+        raw: config.clone(),
         teams: vec![resolved],
         load_errors: Vec::new(),
     })
@@ -421,7 +493,7 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
 
 // ── Token storage application ───────────────────────────────────────────────
 
-fn apply_token_storage(
+pub(super) fn apply_token_storage(
     storage: &StorageChoice,
     jira_config: &mut JiraConfig,
     config_dir: &std::path::Path,
@@ -607,7 +679,7 @@ fn probe_credential_status(jira: &JiraConfig) -> CredentialStatus {
 // ── Generic selection UI ────────────────────────────────────────────────────
 
 /// Render a vertical selection list and return the chosen index.
-fn run_selection(
+pub(super) fn run_selection(
     title: &str,
     labels: &[&str],
     descriptions: &[&str],
@@ -692,6 +764,154 @@ fn run_selection(
     }
 }
 
+/// Render a vertical multi-select list and return the checked indices.
+/// Space toggles, Enter confirms (at least one selection required),
+/// Esc/q cancels. `selectable[i] == false` rows can't be toggled.
+pub(super) fn run_multi_selection(
+    title: &str,
+    labels: &[String],
+    descriptions: &[String],
+    tags: &[String],
+    preselected: &[bool],
+    selectable: &[bool],
+) -> Result<Vec<usize>> {
+    let count = labels.len();
+
+    println!("{title}");
+    println!();
+    let mut checked: Vec<bool> = preselected.to_vec();
+    let mut cursor = 0;
+    render_multi_options(labels, descriptions, tags, &checked, selectable, cursor, false)?;
+    render_multi_hint()?;
+    io::stdout().flush()?;
+
+    enable_raw_mode()?;
+
+    // Options plus the hint line.
+    #[allow(clippy::cast_possible_truncation)]
+    let lines = count as u16 + 1;
+
+    let redraw = |checked: &[bool], cursor: usize, confirmed: bool| -> Result<()> {
+        crossterm::execute!(io::stdout(), MoveUp(lines), Clear(ClearType::FromCursorDown))?;
+        render_multi_options(labels, descriptions, tags, checked, selectable, cursor, confirmed)?;
+        render_multi_hint()?;
+        io::stdout().flush()?;
+        Ok(())
+    };
+
+    loop {
+        match crossterm::event::read() {
+            Ok(Event::Key(KeyEvent {
+                code, modifiers, ..
+            })) => match code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    cursor = cursor.saturating_sub(1);
+                    redraw(&checked, cursor, false)?;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    cursor = (cursor + 1).min(count - 1);
+                    redraw(&checked, cursor, false)?;
+                }
+                KeyCode::Char(' ') => {
+                    if selectable.get(cursor).copied().unwrap_or(true) {
+                        checked[cursor] = !checked[cursor];
+                        redraw(&checked, cursor, false)?;
+                    }
+                }
+                KeyCode::Enter => {
+                    if checked.iter().any(|&c| c) {
+                        redraw(&checked, cursor, true)?;
+                        disable_raw_mode()?;
+                        println!();
+                        return Ok((0..count).filter(|&i| checked[i]).collect());
+                    }
+                    // At least one selection required — ignore Enter.
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    disable_raw_mode()?;
+                    println!();
+                    return Err(anyhow::anyhow!("Cancelled"));
+                }
+                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    disable_raw_mode()?;
+                    println!();
+                    return Err(anyhow::anyhow!("Cancelled"));
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(e) => {
+                disable_raw_mode()?;
+                println!();
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+fn render_multi_options(
+    labels: &[String],
+    descriptions: &[String],
+    tags: &[String],
+    checked: &[bool],
+    selectable: &[bool],
+    cursor: usize,
+    confirmed: bool,
+) -> Result<()> {
+    for i in 0..labels.len() {
+        let pointer = if i == cursor && !confirmed { ">" } else { " " };
+        let tag = tags.get(i).map_or("", String::as_str);
+        let row = format!("{}   {}{}", labels[i], descriptions[i], tag);
+        if checked[i] && confirmed {
+            crossterm::execute!(
+                io::stdout(),
+                Print("  "),
+                SetForegroundColor(Color::Green),
+                Print("[\u{2713}] "),
+                ResetColor,
+                Print(format!("{row}\r\n")),
+            )?;
+        } else if !selectable.get(i).copied().unwrap_or(true) {
+            crossterm::execute!(
+                io::stdout(),
+                Print(format!("{pointer} ")),
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!("[-] {row}\r\n")),
+                ResetColor,
+            )?;
+        } else {
+            let mark = if checked[i] { "[x]" } else { "[ ]" };
+            print!("{pointer} {mark} {row}\r\n");
+        }
+    }
+    Ok(())
+}
+
+/// Hint line for the multi-select, following the semantic color convention:
+/// Blue = available action, Green = confirm, Magenta = back/cancel.
+fn render_multi_hint() -> Result<()> {
+    crossterm::execute!(
+        io::stdout(),
+        SetForegroundColor(Color::Blue),
+        Print("  space"),
+        ResetColor,
+        Print(" toggle  "),
+        SetForegroundColor(Color::Blue),
+        Print("\u{2191}\u{2193}/jk"),
+        ResetColor,
+        Print(" move  "),
+        SetForegroundColor(Color::Green),
+        Print("enter"),
+        ResetColor,
+        Print(" confirm  "),
+        SetForegroundColor(Color::Magenta),
+        Print("esc"),
+        ResetColor,
+        Print(" cancel\r\n"),
+    )?;
+    Ok(())
+}
+
 fn render_options(
     labels: &[&str],
     descriptions: &[&str],
@@ -760,7 +980,7 @@ fn prompt_auth_method(current: Option<&AuthMethod>) -> Result<AuthMethod> {
 
 // ── Prompt: OAuth storage ───────────────────────────────────────────────────
 
-fn prompt_oauth_storage(current: Option<&StorageChoice>) -> Result<StorageChoice> {
+pub(super) fn prompt_oauth_storage(current: Option<&StorageChoice>) -> Result<StorageChoice> {
     let current_idx = current.and_then(|c| match c {
         StorageChoice::Keyring => Some(0),
         StorageChoice::File => Some(1),
@@ -786,7 +1006,7 @@ fn prompt_oauth_storage(current: Option<&StorageChoice>) -> Result<StorageChoice
 
 // ── Prompt: token storage ───────────────────────────────────────────────────
 
-fn prompt_token_storage(
+pub(super) fn prompt_token_storage(
     current: Option<&StorageChoice>,
     status: Option<&CredentialStatus>,
 ) -> Result<StorageChoice> {
@@ -1048,7 +1268,7 @@ fn check_keyring_available(key: &str) -> Result<()> {
 }
 
 /// Prompt for a yes/no answer. `default` sets which is chosen on bare Enter.
-fn prompt_yes_no(message: &str, default: bool) -> Result<bool> {
+pub fn prompt_yes_no(message: &str, default: bool) -> Result<bool> {
     print!("{message}");
     io::stdout().flush()?;
     let mut input = String::new();
@@ -1060,7 +1280,7 @@ fn prompt_yes_no(message: &str, default: bool) -> Result<bool> {
     })
 }
 
-fn prompt(message: &str, default: Option<&str>) -> Result<String> {
+pub(super) fn prompt(message: &str, default: Option<&str>) -> Result<String> {
     print!("{message}");
     io::stdout().flush()?;
     let mut input = String::new();
@@ -1074,7 +1294,7 @@ fn prompt(message: &str, default: Option<&str>) -> Result<String> {
     Ok(trimmed)
 }
 
-fn prompt_masked(message: &str) -> Result<String> {
+pub(super) fn prompt_masked(message: &str) -> Result<String> {
     print!("{message}");
     io::stdout().flush()?;
 

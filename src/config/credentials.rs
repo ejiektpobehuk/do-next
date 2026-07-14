@@ -19,7 +19,7 @@ use crate::jira::oauth;
 /// 4. credentials file (`~/.config/do-next/credentials.json5`)
 pub fn resolve_auth(jira: &JiraConfig) -> Result<Auth> {
     if jira.auth_method.as_deref() == Some("oauth") {
-        return resolve_oauth();
+        return resolve_oauth(jira);
     }
     resolve_basic(jira)
 }
@@ -29,7 +29,7 @@ pub fn resolve_auth(jira: &JiraConfig) -> Result<Auth> {
 /// except `DO_NEXT_CONFLUENCE_API_TOKEN` takes precedence over everything.
 pub fn resolve_confluence_auth(conf: &JiraConfig) -> Result<Auth> {
     if conf.auth_method.as_deref() == Some("oauth") {
-        return resolve_oauth();
+        return resolve_oauth(conf);
     }
     let email = resolve_email(conf)?;
     if let Ok(token) = std::env::var("DO_NEXT_CONFLUENCE_API_TOKEN") {
@@ -43,9 +43,19 @@ pub fn resolve_confluence_auth(conf: &JiraConfig) -> Result<Auth> {
     Ok(Auth::Basic(BasicCredentials { email, api_token }))
 }
 
-fn resolve_oauth() -> Result<Auth> {
+fn resolve_oauth(jira: &JiraConfig) -> Result<Auth> {
     match oauth::load_oauth_tokens()? {
-        Some(creds) => Ok(Auth::OAuth(creds)),
+        Some(mut creds) => {
+            // Stored tokens embed the client id/secret they were minted with.
+            // Prefer the config's current values (e.g. a rotated secret in a
+            // company config repo) so token refresh heals after rotation
+            // without a manual re-auth.
+            if let (Some(id), Some(secret)) = (&jira.oauth_client_id, &jira.oauth_client_secret) {
+                creds.client_id.clone_from(id);
+                creds.client_secret.clone_from(secret);
+            }
+            Ok(Auth::OAuth(creds))
+        }
         None => bail!(
             "No OAuth tokens found.\n\
              Run `do-next auth` to authenticate with your browser."
