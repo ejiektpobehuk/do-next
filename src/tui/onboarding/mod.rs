@@ -781,7 +781,15 @@ pub(super) fn run_multi_selection(
     println!();
     let mut checked: Vec<bool> = preselected.to_vec();
     let mut cursor = 0;
-    render_multi_options(labels, descriptions, tags, &checked, selectable, cursor, false)?;
+    render_multi_options(
+        labels,
+        descriptions,
+        tags,
+        &checked,
+        selectable,
+        cursor,
+        false,
+    )?;
     render_multi_hint()?;
     io::stdout().flush()?;
 
@@ -792,8 +800,20 @@ pub(super) fn run_multi_selection(
     let lines = count as u16 + 1;
 
     let redraw = |checked: &[bool], cursor: usize, confirmed: bool| -> Result<()> {
-        crossterm::execute!(io::stdout(), MoveUp(lines), Clear(ClearType::FromCursorDown))?;
-        render_multi_options(labels, descriptions, tags, checked, selectable, cursor, confirmed)?;
+        crossterm::execute!(
+            io::stdout(),
+            MoveUp(lines),
+            Clear(ClearType::FromCursorDown)
+        )?;
+        render_multi_options(
+            labels,
+            descriptions,
+            tags,
+            checked,
+            selectable,
+            cursor,
+            confirmed,
+        )?;
         render_multi_hint()?;
         io::stdout().flush()?;
         Ok(())

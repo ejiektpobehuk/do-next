@@ -164,7 +164,10 @@ pub fn company_team_refs(
         if let Some(entry) = manifest.teams.iter().find(|t| &t.id == id) {
             refs.push(TeamRef {
                 id: entry.id.clone(),
-                path: clone_dir.join(entry.rel_path()).to_string_lossy().into_owned(),
+                path: clone_dir
+                    .join(entry.rel_path())
+                    .to_string_lossy()
+                    .into_owned(),
                 file: entry.file.clone(),
             });
         } else {
@@ -191,7 +194,11 @@ pub fn slug_from_url(url: &str) -> String {
         }
     }
     let slug = slug.trim_matches('-').to_string();
-    if slug.is_empty() { "company".into() } else { slug }
+    if slug.is_empty() {
+        "company".into()
+    } else {
+        slug
+    }
 }
 
 /// Managed clone location: `~/.config/do-next/company/<slug>`.
@@ -274,7 +281,9 @@ mod tests {
 
     #[test]
     fn rejects_empty_name_and_base_url() {
-        assert!(parse_manifest(r#"{ name: " ", jira: { base_url: "https://a.example" } }"#).is_err());
+        assert!(
+            parse_manifest(r#"{ name: " ", jira: { base_url: "https://a.example" } }"#).is_err()
+        );
         assert!(parse_manifest(r#"{ name: "Acme", jira: { base_url: "" } }"#).is_err());
         assert!(parse_manifest(r#"{ jira: { base_url: "https://a.example" } }"#).is_err());
     }

@@ -22,7 +22,10 @@ pub enum AppEvent {
     /// A board source's query-swimlane assignment resolved (sent after
     /// `SourceLoaded`; only for `auto`/query lane strategies). Errors degrade
     /// the board to laneless — they never fail the source.
-    BoardLanesLoaded(String, Result<crate::jira::types::BoardSwimlanes, anyhow::Error>),
+    BoardLanesLoaded(
+        String,
+        Result<crate::jira::types::BoardSwimlanes, anyhow::Error>,
+    ),
     /// A Jira action (transition, comment, assign, move) completed.
     ActionDone(ActionResult),
     /// Current user resolved (sent once on startup).

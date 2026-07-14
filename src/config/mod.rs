@@ -121,11 +121,7 @@ fn resolve_company(config: &mut Config, load_errors: &mut Vec<String>) -> Vec<Te
 /// True when the config references any team, either manually or through a
 /// company team selection. Used by `main` to decide whether team setup runs.
 pub fn has_team_refs(config: &Config) -> bool {
-    !config.teams.is_empty()
-        || config
-            .company
-            .as_ref()
-            .is_some_and(|c| !c.teams.is_empty())
+    !config.teams.is_empty() || config.company.as_ref().is_some_and(|c| !c.teams.is_empty())
 }
 
 pub fn user_config_path() -> Result<PathBuf> {
@@ -1111,4 +1107,3 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     }
     PathBuf::from(path)
 }
-

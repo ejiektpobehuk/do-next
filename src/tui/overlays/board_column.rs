@@ -28,9 +28,11 @@ pub fn render_board_column_overlay(f: &mut Frame, app_action: &ActionState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" Move {issue_key} "))
-        .title_bottom(Line::from(" t raw transitions ").right_aligned().style(
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+        .title_bottom(
+            Line::from(" t raw transitions ")
+                .right_aligned()
+                .style(Style::default().add_modifier(Modifier::DIM)),
+        );
 
     let inner = block.inner(area);
     f.render_widget(block, area);

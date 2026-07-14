@@ -2941,7 +2941,11 @@ fn handle_board_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) 
 }
 
 /// Apply a board cursor move to `nav_idx`.
-fn board_move(app: &mut AppState, grouping: &crate::tui::board::BoardGrouping, mv: crate::tui::board::BoardMove) {
+fn board_move(
+    app: &mut AppState,
+    grouping: &crate::tui::board::BoardGrouping,
+    mv: crate::tui::board::BoardMove,
+) {
     if let Some(pos) = crate::tui::board::move_cursor(grouping, app.nav_idx, mv) {
         app.nav_idx = pos;
         update_view_mode_on_navigate(app);
@@ -2957,7 +2961,6 @@ fn board_jump(app: &mut AppState, mv: crate::tui::board::BoardMove) {
         board_move(app, &grouping, mv);
     }
 }
-
 
 /// Open the create-issue form. Seeds the project list with the team's
 /// configured projects plus any projects seen in loaded issues; the full
@@ -4241,7 +4244,9 @@ fn handle_board_column_input(app: &mut AppState, event: &crossterm::event::Event
         if down {
             (from + 1..columns.len()).find(|&i| columns[i].transition_id.is_some())
         } else {
-            (0..from).rev().find(|&i| columns[i].transition_id.is_some())
+            (0..from)
+                .rev()
+                .find(|&i| columns[i].transition_id.is_some())
         }
     };
 
@@ -5111,7 +5116,10 @@ mod tests {
             .find(|i| i.key() == key)
             .and_then(WorkItem::as_jira)
             .unwrap();
-        (issue.fields.status.id.as_str(), issue.fields.status.name.as_str())
+        (
+            issue.fields.status.id.as_str(),
+            issue.fields.status.name.as_str(),
+        )
     }
 
     #[test]

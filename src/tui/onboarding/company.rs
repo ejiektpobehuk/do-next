@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::company as company_cfg;
 use crate::config::company::CompanyManifest;
-use crate::config::types::{Config, CompanyRef, JiraConfig, TeamConfig};
+use crate::config::types::{CompanyRef, Config, JiraConfig, TeamConfig};
 use crate::config::{LoadedConfig, extra_scopes_for};
 use crate::jira::auth::OAuthStore;
 
@@ -73,8 +73,8 @@ pub fn run_company_teams_command(raw: &mut Config) -> Result<()> {
     println!("Active company teams: {}", ids.join(", "));
 
     let effective = company_cfg::apply_company_defaults(&raw.jira, &manifest);
-    let needs_more_scopes = (new_extra.confluence && !old_extra.confluence)
-        || (new_extra.board && !old_extra.board);
+    let needs_more_scopes =
+        (new_extra.confluence && !old_extra.confluence) || (new_extra.board && !old_extra.board);
     if needs_more_scopes && effective.auth_method.as_deref() == Some("oauth") {
         println!();
         println!("New teams need additional OAuth scopes — run `do-next auth` to re-authorize.");
@@ -221,7 +221,9 @@ fn pick_teams(
     Ok(picked
         .into_iter()
         .map(|i| {
-            let config = configs[i].take().expect("unselectable rows can't be picked");
+            let config = configs[i]
+                .take()
+                .expect("unselectable rows can't be picked");
             (manifest.teams[i].id.clone(), config)
         })
         .collect())

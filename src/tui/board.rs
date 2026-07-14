@@ -390,7 +390,11 @@ pub fn render_board(f: &mut Frame, area: Rect, app: &AppState, focused: bool) {
         return;
     };
     let Some(config) = app.board_configs.get(source_id) else {
-        render_centered_note(f, area, "Board configuration unavailable — try a refresh (R)");
+        render_centered_note(
+            f,
+            area,
+            "Board configuration unavailable — try a refresh (R)",
+        );
         return;
     };
     let Some(g) = app_board_grouping(app, source_id) else {
@@ -416,7 +420,16 @@ pub fn render_board(f: &mut Frame, area: Rect, app: &AppState, focused: bool) {
         .saturating_sub(visible_cols - 1)
         .min(n_cols - visible_cols);
 
-    render_board_header(f, header_area, app, source_id, &config.name, &g, h_off, visible_cols);
+    render_board_header(
+        f,
+        header_area,
+        app,
+        source_id,
+        &config.name,
+        &g,
+        h_off,
+        visible_cols,
+    );
 
     let loading = matches!(
         app.sources.get(source_id),
@@ -472,14 +485,24 @@ pub fn render_board(f: &mut Frame, area: Rect, app: &AppState, focused: bool) {
                 ));
                 f.render_widget(
                     Paragraph::new(note),
-                    Rect { y, height: 1, width: body.width, x: body.x },
+                    Rect {
+                        y,
+                        height: 1,
+                        width: body.width,
+                        x: body.x,
+                    },
                 );
             }
             break;
         }
         let h = band_h(lane).min(remaining);
         #[allow(clippy::cast_possible_truncation)]
-        let band_area = Rect { y, height: h as u16, width: body.width, x: body.x };
+        let band_area = Rect {
+            y,
+            height: h as u16,
+            width: body.width,
+            x: body.x,
+        };
         render_band(
             f,
             band_area,
@@ -522,7 +545,10 @@ fn render_board_header(
         _ => None,
     };
     if let Some(note) = lane_note {
-        spans.push(Span::styled(note, Style::default().add_modifier(Modifier::DIM)));
+        spans.push(Span::styled(
+            note,
+            Style::default().add_modifier(Modifier::DIM),
+        ));
     }
     let n_cols = g.column_names.len();
     if h_off > 0 {
@@ -574,8 +600,7 @@ fn render_band(
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    let constraints =
-        vec![Constraint::Ratio(1, visible_cols as u32); visible_cols];
+    let constraints = vec![Constraint::Ratio(1, visible_cols as u32); visible_cols];
     let slots = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints)
@@ -623,11 +648,7 @@ fn render_column(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent));
     if titled {
-        let total: usize = g
-            .lanes
-            .iter()
-            .map(|l| l.columns[col_idx].cards.len())
-            .sum();
+        let total: usize = g.lanes.iter().map(|l| l.columns[col_idx].cards.len()).sum();
         block = block.title(format!(" {} ({total}) ", g.column_names[col_idx]));
     }
     let inner = block.inner(area);
@@ -711,7 +732,14 @@ fn render_centered_note(f: &mut Frame, area: Rect, text: &str) {
             .add_modifier(Modifier::DIM),
     ))
     .centered();
-    f.render_widget(Paragraph::new(line), Rect { y, height: 1, ..area });
+    f.render_widget(
+        Paragraph::new(line),
+        Rect {
+            y,
+            height: 1,
+            ..area
+        },
+    );
 }
 
 /// One entry of the move-card column picker.
@@ -748,8 +776,8 @@ pub fn map_transitions_to_columns(
 mod tests {
     use super::*;
     use crate::jira::types::{
-        BoardColumn, ColumnStatus, Issue, IssueFields, IssueTypeField, PriorityField,
-        ProjectField, StatusField,
+        BoardColumn, ColumnStatus, Issue, IssueFields, IssueTypeField, PriorityField, ProjectField,
+        StatusField,
     };
 
     fn column(name: &str, status_ids: &[&str]) -> BoardColumn {
@@ -833,13 +861,25 @@ mod tests {
         assert_eq!(g.column_names, ["To Do", "In Progress", "Done"]);
         assert_eq!(g.lanes.len(), 1);
         let lane = &g.lanes[0];
-        assert_eq!(lane.columns[0].cards, [BoardCard { nav_pos: 1, issue_idx: 1 }]);
+        assert_eq!(
+            lane.columns[0].cards,
+            [BoardCard {
+                nav_pos: 1,
+                issue_idx: 1
+            }]
+        );
         // Multi-status column keeps flat (rank) order.
         assert_eq!(
             lane.columns[1].cards,
             [
-                BoardCard { nav_pos: 0, issue_idx: 0 },
-                BoardCard { nav_pos: 3, issue_idx: 3 }
+                BoardCard {
+                    nav_pos: 0,
+                    issue_idx: 0
+                },
+                BoardCard {
+                    nav_pos: 3,
+                    issue_idx: 3
+                }
             ]
         );
         assert_eq!(lane.columns[2].cards.len(), 1);
@@ -849,14 +889,23 @@ mod tests {
     fn membership_is_by_key_and_unmapped_status_gets_other_column() {
         let issues = vec![
             issue("A-1", "1", None),
-            issue("B-9", "1", None),    // not a board member
-            issue("A-2", "999", None),  // status mapped to no column
+            issue("B-9", "1", None),   // not a board member
+            issue("A-2", "999", None), // status mapped to no column
         ];
         let members: HashSet<&str> = ["A-1", "A-2"].into();
         let g = build_board_grouping(&cols(), LaneSpec::None, &members, &issues, &navs(&issues));
-        assert_eq!(g.column_names.last().map(String::as_str), Some(OTHER_COLUMN));
+        assert_eq!(
+            g.column_names.last().map(String::as_str),
+            Some(OTHER_COLUMN)
+        );
         assert_eq!(g.lanes[0].columns[0].cards.len(), 1); // A-1 only, B-9 excluded
-        assert_eq!(g.lanes[0].columns[3].cards, [BoardCard { nav_pos: 2, issue_idx: 2 }]);
+        assert_eq!(
+            g.lanes[0].columns[3].cards,
+            [BoardCard {
+                nav_pos: 2,
+                issue_idx: 2
+            }]
+        );
 
         // No unmapped statuses → no synthetic column.
         let mapped = vec![issue("A-1", "1", None)];
@@ -901,7 +950,11 @@ mod tests {
             issue("A-3", "2", None),
         ];
         let swimlanes = BoardSwimlanes {
-            lane_names: vec!["Expedite".into(), "Ghost town".into(), "Everything Else".into()],
+            lane_names: vec![
+                "Expedite".into(),
+                "Ghost town".into(),
+                "Everything Else".into(),
+            ],
             // A-3 deliberately unassigned (everything_else: false case).
             assignment: [("A-1".to_string(), 2), ("A-2".to_string(), 0)].into(),
         };
@@ -1008,12 +1061,18 @@ mod tests {
             Transition {
                 id: "11".into(),
                 name: "Start".into(),
-                to: StatusField { id: "2".into(), name: "In Progress".into() },
+                to: StatusField {
+                    id: "2".into(),
+                    name: "In Progress".into(),
+                },
             },
             Transition {
                 id: "12".into(),
                 name: "Review".into(),
-                to: StatusField { id: "3".into(), name: "In Review".into() },
+                to: StatusField {
+                    id: "3".into(),
+                    name: "In Review".into(),
+                },
             },
         ];
         let choices = map_transitions_to_columns(&cols(), "1", &transitions);

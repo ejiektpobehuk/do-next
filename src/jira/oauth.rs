@@ -139,11 +139,11 @@ pub fn run_oauth_flow(
 
     // Respond to the browser.
     let response = tiny_http::Response::from_string(include_str!("authorization_complete.html"))
-    .with_header(
-        "Content-Type: text/html"
-            .parse::<tiny_http::Header>()
-            .expect("static header is valid"),
-    );
+        .with_header(
+            "Content-Type: text/html"
+                .parse::<tiny_http::Header>()
+                .expect("static header is valid"),
+        );
     let _ = request.respond(response);
     drop(server); // Release the listener before making outbound HTTP calls.
 

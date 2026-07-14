@@ -218,8 +218,7 @@ impl JiraClient {
                 anyhow::bail!("Jira API error {status}: {body}");
             }
 
-            let page: AgilePage<Sprint> =
-                resp.json().await.context("Failed to parse sprints")?;
+            let page: AgilePage<Sprint> = resp.json().await.context("Failed to parse sprints")?;
             let fetched = u32::try_from(page.values.len()).unwrap_or(0);
             let is_last = page.is_last;
             sprints.extend(page.values);
@@ -247,8 +246,11 @@ impl JiraClient {
         sprint_id: u64,
         fields: &str,
     ) -> Result<Vec<Issue>> {
-        self.fetch_agile_issues(&format!("board/{board_id}/sprint/{sprint_id}/issue"), fields)
-            .await
+        self.fetch_agile_issues(
+            &format!("board/{board_id}/sprint/{sprint_id}/issue"),
+            fields,
+        )
+        .await
     }
 
     /// Pagination for Agile issue endpoints. Issues come back in board rank
@@ -277,7 +279,9 @@ impl JiraClient {
             offsets.len()
         );
         let pages = futures::future::try_join_all(
-            offsets.into_iter().map(|off| self.fetch_agile_page(path, off, fields)),
+            offsets
+                .into_iter()
+                .map(|off| self.fetch_agile_page(path, off, fields)),
         )
         .await?;
         // `try_join_all` preserves input order, so extending in sequence keeps

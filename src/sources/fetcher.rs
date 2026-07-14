@@ -120,7 +120,10 @@ pub fn spawn_board_fetch(
             config.column_config.columns.len(),
             filters.sprint
         );
-        let _ = tx.send(AppEvent::BoardConfigLoaded(source_id.clone(), config.clone()));
+        let _ = tx.send(AppEvent::BoardConfigLoaded(
+            source_id.clone(),
+            config.clone(),
+        ));
 
         // In lazy mode fetch only the fields the board renders and mark the
         // issues partial (full detail is loaded when a card is opened); in
@@ -245,7 +248,9 @@ async fn fetch_issues_for_selector(
     match selector {
         SprintSelector::All => client.fetch_board_issues(board_id, fields).await,
         SprintSelector::Id(sprint_id) => {
-            client.fetch_board_sprint_issues(board_id, sprint_id, fields).await
+            client
+                .fetch_board_sprint_issues(board_id, sprint_id, fields)
+                .await
         }
         SprintSelector::Active => {
             match client.get_board_sprints(board_id, "active").await? {
@@ -304,19 +309,17 @@ async fn resolve_query_lanes(
     // Every (lane, key-chunk) membership query is independent, so run them all
     // concurrently. `try_join_all` preserves input order, which we rely on to
     // fold results back into per-lane match lists in lane order.
-    let per_lane_matches: Vec<Vec<String>> = futures::future::try_join_all(lanes.iter().map(
-        |lane| async move {
-            let chunk_matches = futures::future::try_join_all(keys.chunks(LANE_CHUNK).map(
-                |chunk| {
+    let per_lane_matches: Vec<Vec<String>> =
+        futures::future::try_join_all(lanes.iter().map(|lane| async move {
+            let chunk_matches =
+                futures::future::try_join_all(keys.chunks(LANE_CHUNK).map(|chunk| {
                     let jql = membership_jql(chunk, &lane.jql);
                     async move { client.fetch_jql_keys(&jql).await }
-                },
-            ))
-            .await?;
+                }))
+                .await?;
             anyhow::Ok(chunk_matches.into_iter().flatten().collect::<Vec<String>>())
-        },
-    ))
-    .await?;
+        }))
+        .await?;
     let lane_names: Vec<String> = lanes.iter().map(|l| l.name.clone()).collect();
     Ok(build_lane_assignment(
         keys,
@@ -556,8 +559,8 @@ pub fn spawn_preload_details(
                         Ok(mut issue) => {
                             issue.source_id = req.source_id;
                             issue.subsource_idx = req.subsource_idx;
-                            let _ = tx
-                                .send(AppEvent::IssueRefreshed(Box::new(WorkItem::Jira(issue))));
+                            let _ =
+                                tx.send(AppEvent::IssueRefreshed(Box::new(WorkItem::Jira(issue))));
                         }
                         Err(error) => {
                             let _ = tx.send(AppEvent::IssueRefreshError {

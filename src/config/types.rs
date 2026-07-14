@@ -241,8 +241,13 @@ pub struct QueryLane {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwimlaneConfig {
     Auto,
-    Field { field: String },
-    Queries { lanes: Vec<QueryLane>, everything_else: bool },
+    Field {
+        field: String,
+    },
+    Queries {
+        lanes: Vec<QueryLane>,
+        everything_else: bool,
+    },
 }
 
 impl Serialize for SwimlaneConfig {
@@ -670,8 +675,7 @@ mod tests {
 
     #[test]
     fn detail_load_parses_from_lowercase_names() {
-        let cfg: Config =
-            json5::from_str(r#"{ detail_load: "full" }"#).expect("valid config");
+        let cfg: Config = json5::from_str(r#"{ detail_load: "full" }"#).expect("valid config");
         assert_eq!(cfg.detail_load, DetailLoad::Full);
     }
 
