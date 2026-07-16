@@ -39,6 +39,13 @@ pub enum AppEvent {
     },
     /// Git-based update warnings for team configs (sent once on startup).
     UpdateWarnings(Vec<String>),
+    /// A backlog rank mutation finished. Success rewrites that source's
+    /// cache with the already-applied optimistic order; failure refetches
+    /// the source so the server's order is truth again.
+    IssueRanked {
+        source_id: String,
+        result: Result<(), anyhow::Error>,
+    },
     /// A single-issue background refresh completed successfully.
     IssueRefreshed(Box<WorkItem>),
     /// A single-issue background refresh failed.
@@ -97,6 +104,16 @@ pub enum ActionResult {
     TransitionsLoaded {
         issue_key: String,
         transitions: Vec<Transition>,
+    },
+    /// Sprint list for the backlog's send-to-sprint picker. `None` means the
+    /// board doesn't support sprints (kanban).
+    SprintsLoaded {
+        issue_key: String,
+        sprints: Option<Vec<crate::jira::types::Sprint>>,
+    },
+    /// An issue left the backlog for a sprint.
+    MovedToSprint {
+        issue_key: String,
     },
     CommentPosted {
         issue_key: String,

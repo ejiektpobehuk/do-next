@@ -44,7 +44,9 @@ fn try_render_modal_hints(f: &mut Frame, area: Rect, action_state: &ActionState)
                 area,
             );
         }
-        ActionState::SelectingFieldOption { .. } | ActionState::SelectingFieldOptions { .. } => {
+        ActionState::SelectingFieldOption { .. }
+        | ActionState::SelectingFieldOptions { .. }
+        | ActionState::SelectingSprint { .. } => {
             let title = Line::from(vec![
                 Span::raw("┤ "),
                 Span::styled("↕", Style::default().fg(Color::Blue)),
@@ -85,7 +87,8 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         return;
     }
 
-    if app.board_view.is_some() && !app.fullscreen_detail {
+    let dedicated_kind = app.active_tab_source_kind();
+    if dedicated_kind == Some(crate::config::types::SourceKind::Board) && !app.fullscreen_detail {
         let title = Line::from(vec![
             Span::raw("┤ "),
             Span::styled("←→", Style::default().fg(Color::Blue)),
@@ -98,6 +101,36 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
             Span::raw(" move  "),
             Span::styled("P", Style::default().fg(Color::Blue)),
             Span::raw(" preload  "),
+            Span::styled("Tab", Style::default().fg(Color::Blue)),
+            Span::raw(" switch  "),
+            Span::styled("?", Style::default().fg(Color::Blue)),
+            Span::raw(" ├──"),
+        ])
+        .alignment(Alignment::Right)
+        .style(Style::default().fg(theme::MUTED));
+        f.render_widget(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(theme::MUTED))
+                .title_bottom(title),
+            area,
+        );
+        return;
+    }
+
+    if dedicated_kind == Some(crate::config::types::SourceKind::Backlog) && !app.fullscreen_detail {
+        let title = Line::from(vec![
+            Span::raw("┤ "),
+            Span::styled("↕", Style::default().fg(Color::Blue)),
+            Span::raw(" navigate  "),
+            Span::styled("J/K", Style::default().fg(Color::Blue)),
+            Span::raw(" reorder  "),
+            Span::styled("s", Style::default().fg(Color::Blue)),
+            Span::raw(" sprint  "),
+            Span::styled("n", Style::default().fg(Color::Blue)),
+            Span::raw(" new  "),
+            Span::styled("t", Style::default().fg(Color::Blue)),
+            Span::raw(" status  "),
             Span::styled("Tab", Style::default().fg(Color::Blue)),
             Span::raw(" switch  "),
             Span::styled("?", Style::default().fg(Color::Blue)),
@@ -205,9 +238,14 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         hints.push(Span::styled("q/Esc", Style::default().fg(Color::Blue)));
         hints.push(Span::raw(" search ├──"));
     } else if app.board_view.is_some() && app.fullscreen_detail {
-        // Detail opened from a board: q/Esc step back to the board.
+        // Detail opened from a board/backlog tab: q/Esc step back to it.
+        let back_to = if dedicated_kind == Some(crate::config::types::SourceKind::Backlog) {
+            " backlog ├──"
+        } else {
+            " board ├──"
+        };
         hints.push(Span::styled("q/Esc", Style::default().fg(Color::Blue)));
-        hints.push(Span::raw(" board ├──"));
+        hints.push(Span::raw(back_to));
     } else {
         hints.push(Span::raw("("));
         hints.push(Span::styled("q", Style::default().fg(Color::Red)));

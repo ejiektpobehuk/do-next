@@ -95,6 +95,7 @@ pub fn spawn_board_fetch(
     tokio::spawn(async move {
         // Validation guarantees Some; unwrap_or_default keeps the task panic-free.
         let filters = source_cfg.board.clone().unwrap_or_default();
+        let sprint = filters.sprint.unwrap_or_default();
 
         // Without columns the kanban view can't place a single card, so a
         // failed configuration fetch fails the whole source (matching how a
@@ -118,7 +119,7 @@ pub fn spawn_board_fetch(
             source_id,
             board_type,
             config.column_config.columns.len(),
-            filters.sprint
+            sprint
         );
         let _ = tx.send(AppEvent::BoardConfigLoaded(
             source_id.clone(),
@@ -134,22 +135,17 @@ pub fn spawn_board_fetch(
         };
         let partial = detail_load == DetailLoad::Lazy;
 
-        let issues = match fetch_issues_for_selector(
-            &client,
-            filters.board_id,
-            filters.sprint,
-            board_type,
-            &fields,
-        )
-        .await
-        {
-            Ok(issues) => issues,
-            Err(e) => {
-                log::debug!("Board '{source_id}': issue fetch failed: {e:#}");
-                let _ = tx.send(AppEvent::SourceError(source_id, e));
-                return;
-            }
-        };
+        let issues =
+            match fetch_issues_for_selector(&client, filters.board_id, sprint, board_type, &fields)
+                .await
+            {
+                Ok(issues) => issues,
+                Err(e) => {
+                    log::debug!("Board '{source_id}': issue fetch failed: {e:#}");
+                    let _ = tx.send(AppEvent::SourceError(source_id, e));
+                    return;
+                }
+            };
 
         let keys: Vec<String> = issues.iter().map(|i| i.key.clone()).collect();
         let items: Vec<WorkItem> = issues
@@ -211,6 +207,77 @@ pub fn spawn_board_fetch(
 
         let result = resolve_query_lanes(&client, &keys, &lanes, everything_else, &else_name).await;
         let _ = tx.send(AppEvent::BoardLanesLoaded(source_id, result));
+    });
+}
+
+/// Spawn a background task that fetches a board's backlog (rank-ordered
+/// issues outside active sprints) as a plain list source.
+///
+/// The board configuration is fetched best-effort — it only supplies the
+/// board name and the rank field id for rank mutations, so unlike a board
+/// source its failure never fails the backlog (rank calls fall back to
+/// Jira's default Rank field).
+pub fn spawn_backlog_fetch(
+    client: JiraClient,
+    source_cfg: SourceConfig,
+    detail_load: DetailLoad,
+    cache: CacheConfig,
+    tx: UnboundedSender<AppEvent>,
+) {
+    let source_id = source_cfg.id.clone();
+    tokio::spawn(async move {
+        // Validation guarantees Some; unwrap_or_default keeps the task panic-free.
+        let filters = source_cfg.board.clone().unwrap_or_default();
+
+        let config = match client.get_board_configuration(filters.board_id).await {
+            Ok(config) => {
+                let _ = tx.send(AppEvent::BoardConfigLoaded(
+                    source_id.clone(),
+                    config.clone(),
+                ));
+                Some(config)
+            }
+            Err(e) => {
+                log::debug!("Backlog '{source_id}': configuration fetch failed (degrading): {e:#}");
+                None
+            }
+        };
+
+        let fields = match detail_load {
+            DetailLoad::Full => "*all",
+            DetailLoad::Lazy => BOARD_FIELDS,
+        };
+        let partial = detail_load == DetailLoad::Lazy;
+
+        let issues = match client
+            .fetch_board_backlog_issues(filters.board_id, fields)
+            .await
+        {
+            Ok(issues) => issues,
+            Err(e) => {
+                log::debug!("Backlog '{source_id}': issue fetch failed: {e:#}");
+                let _ = tx.send(AppEvent::SourceError(source_id, e));
+                return;
+            }
+        };
+
+        // Response order IS Jira rank order — never re-sort.
+        let items: Vec<WorkItem> = issues
+            .into_iter()
+            .map(|mut issue| {
+                issue.partial = partial;
+                let mut item = WorkItem::Jira(issue);
+                item.set_source(source_id.clone(), 0);
+                item
+            })
+            .collect();
+        log::debug!(
+            "Backlog source '{}' fetch complete: {} items",
+            source_id,
+            items.len()
+        );
+        crate::sources::cache::write(&cache, &source_id, &items, config.as_ref(), None);
+        let _ = tx.send(AppEvent::SourceLoaded(source_id, items));
     });
 }
 

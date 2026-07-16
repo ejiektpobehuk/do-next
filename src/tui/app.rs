@@ -119,6 +119,21 @@ pub enum ActionState {
     LoadingTransitions {
         issue_key: String,
     },
+    /// Backlog send-to-sprint: waiting for the board's sprint list.
+    LoadingSprints {
+        issue_key: String,
+    },
+    /// Backlog send-to-sprint picker: the board's active and future sprints.
+    SelectingSprint {
+        issue_key: String,
+        sprints: Vec<crate::jira::types::Sprint>,
+        selected: usize,
+    },
+    /// Confirmed sprint choice, waiting for dispatch.
+    PendingMoveToSprint {
+        issue_key: String,
+        sprint_id: u64,
+    },
     /// Waiting for an async operation; description is display-only (never a signal).
     AwaitingAction {
         description: String,
@@ -594,9 +609,22 @@ pub struct AppState {
     pub board_configs: HashMap<String, BoardConfiguration>,
     /// Resolved query-swimlanes per board source (`source_id` → state).
     pub board_lanes: HashMap<String, LanesState>,
-    /// Some(`source_id`) while the kanban board view covers the main area.
-    /// Selection stays in `nav_idx`; the board cursor is derived from it.
+    /// Some(`source_id`) while a dedicated-tab source (board or backlog)
+    /// covers the main area. Selection stays in `nav_idx`; on board tabs the
+    /// board cursor is derived from it.
     pub board_view: Option<String>,
+    /// The latest optimistic backlog reorder, waiting out its debounce window
+    /// before being sent to Jira. Consecutive moves of the same issue
+    /// collapse into it. Not team-scoped: it is self-contained and survives
+    /// tab/team switches via `rank_flush_queue`.
+    pub pending_rank: Option<crate::tui::backlog::PendingRank>,
+    /// Rank mutations that must dispatch on the next loop iteration without
+    /// waiting for the debounce (a different issue started moving, or a
+    /// team/tab switch displaced `pending_rank`).
+    pub rank_flush_queue: Vec<crate::tui::backlog::PendingRank>,
+    /// Set when a rank mutation failed: the backlog source to refetch so the
+    /// list falls back to the server's order.
+    pub pending_rank_refetch: Option<String>,
     /// Global default board detail-load mode (per-board config overrides it).
     pub detail_load: crate::config::types::DetailLoad,
     /// On-disk source cache settings (stale-while-revalidate).
@@ -688,6 +716,9 @@ impl AppState {
             board_configs: HashMap::new(),
             board_lanes: HashMap::new(),
             board_view,
+            pending_rank: None,
+            rank_flush_queue: Vec::new(),
+            pending_rank_refetch: None,
             detail_load: config.detail_load,
             cache: config.cache.clone(),
         }
@@ -770,6 +801,11 @@ impl AppState {
         self.pending_refresh_all = false;
         self.pending_preload = false;
         self.pending_refresh_issue = None;
+        // A pending rank move must still reach Jira — its anchor was captured
+        // at keypress, so it dispatches as-is without the old team's state.
+        if let Some(pending) = self.pending_rank.take() {
+            self.rank_flush_queue.push(pending);
+        }
 
         // Recompute the flat list from the (correct, full) restored sources for
         // the team-list tab. The saved `issues`/`nav_items` may have been
@@ -787,15 +823,31 @@ impl AppState {
         }
     }
 
+    /// Whether a source kind renders as its own dedicated tab (rather than
+    /// as rows in the team's flat list).
+    pub(crate) const fn is_dedicated_tab_kind(kind: crate::config::types::SourceKind) -> bool {
+        matches!(
+            kind,
+            crate::config::types::SourceKind::Board | crate::config::types::SourceKind::Backlog
+        )
+    }
+
+    /// The kind of the active dedicated-tab source, `None` on a list tab.
+    pub(crate) fn active_tab_source_kind(&self) -> Option<crate::config::types::SourceKind> {
+        let id = self.board_view.as_deref()?;
+        source_config_for(self.team_config(), id).map(|s| s.kind)
+    }
+
     /// The default view for a team's tab: `None` (the flat list) normally,
-    /// or the first board source for a board-only team — such teams get no
-    /// list tab (it would always be empty).
+    /// or the first source for a team with only dedicated-tab sources
+    /// (boards/backlogs) — such teams get no list tab (it would always be
+    /// empty).
     fn default_view_for(team: &ResolvedTeam) -> Option<String> {
         if team
             .config
             .sources
             .iter()
-            .any(|s| s.kind != crate::config::types::SourceKind::Board)
+            .any(|s| !Self::is_dedicated_tab_kind(s.kind))
         {
             return None;
         }
@@ -803,9 +855,9 @@ impl AppState {
     }
 
     /// The ordered tab list. Each team contributes a list tab (unless all its
-    /// sources are boards), followed by one tab per board source it defines.
-    /// A tab is identified by `(team_idx, Option<board_source_id>)`; `None`
-    /// is the team's list view.
+    /// sources are boards/backlogs), followed by one tab per board or backlog
+    /// source it defines. A tab is identified by
+    /// `(team_idx, Option<source_id>)`; `None` is the team's list view.
     pub fn tab_list(&self) -> Vec<(usize, Option<String>)> {
         let mut tabs = Vec::new();
         for (i, team) in self.resolved_teams.iter().enumerate() {
@@ -813,7 +865,7 @@ impl AppState {
                 tabs.push((i, None));
             }
             for src in &team.config.sources {
-                if src.kind == crate::config::types::SourceKind::Board {
+                if Self::is_dedicated_tab_kind(src.kind) {
                     tabs.push((i, Some(src.id.clone())));
                 }
             }
@@ -909,15 +961,16 @@ impl AppState {
 
     /// Whether a source's items belong in the currently active tab.
     ///
-    /// Board sources are their own tabs, never part of a team's flat list: on
-    /// a team-list tab (`board_view == None`) all board sources are excluded;
-    /// on a board tab only that one board source is included.
-    fn source_in_active_tab(&self, source_id: &str) -> bool {
-        let is_board = source_config_for(self.team_config(), source_id)
-            .is_some_and(|s| s.kind == crate::config::types::SourceKind::Board);
+    /// Board and backlog sources are their own tabs, never part of a team's
+    /// flat list: on a team-list tab (`board_view == None`) all dedicated-tab
+    /// sources are excluded; on a board/backlog tab only that one source is
+    /// included.
+    pub(crate) fn source_in_active_tab(&self, source_id: &str) -> bool {
+        let is_dedicated = source_config_for(self.team_config(), source_id)
+            .is_some_and(|s| Self::is_dedicated_tab_kind(s.kind));
         self.board_view
             .as_deref()
-            .map_or(!is_board, |active| source_id == active)
+            .map_or(!is_dedicated, |active| source_id == active)
     }
 
     /// Rebuild the flat items list from loaded source states (in priority order, deduped),
@@ -1113,6 +1166,8 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
         AppEvent::UpdateWarnings(warnings) => {
             app.update_warnings = warnings;
         }
+
+        AppEvent::IssueRanked { source_id, result } => apply_issue_ranked(app, source_id, result),
 
         AppEvent::IssueRefreshed(item) => {
             let item = *item;
@@ -1571,6 +1626,10 @@ fn handle_action_done(app: &mut AppState, result: ActionResult) {
             issue_key,
             transitions,
         } => apply_transitions_loaded(app, issue_key, transitions),
+        ActionResult::SprintsLoaded { issue_key, sprints } => {
+            apply_sprints_loaded(app, issue_key, sprints);
+        }
+        ActionResult::MovedToSprint { ref issue_key } => apply_moved_to_sprint(app, issue_key),
         ActionResult::AssignedToMe { ref issue_key } => {
             apply_assigned_to_me(app, issue_key);
             app.action_state = ActionState::None;
@@ -2636,6 +2695,10 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
             handle_board_column_input(app, &event);
             return;
         }
+        ActionState::SelectingSprint { .. } => {
+            handle_sprint_picker_input(app, &event);
+            return;
+        }
         ActionState::HidePopup { .. } => {
             handle_hide_input(app, event);
             return;
@@ -2698,6 +2761,8 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
         }
         ActionState::AwaitingAction { .. }
         | ActionState::LoadingTransitions { .. }
+        | ActionState::LoadingSprints { .. }
+        | ActionState::PendingMoveToSprint { .. }
         | ActionState::PendingTransition { .. }
         | ActionState::PendingCompleteTask { .. }
         | ActionState::PendingHide { .. }
@@ -2864,6 +2929,10 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         (KeyCode::Char('R'), _) => key_refresh_all(app),
         (KeyCode::Char('r'), _) => key_refresh_focused(app),
         (KeyCode::Char('P'), _) => key_preload_details(app),
+        // Backlog grooming: Shift+K/Shift+J re-rank, `s` sends to a sprint.
+        (KeyCode::Char('K'), _) if backlog_mode_active(app) => key_rank_move(app, true),
+        (KeyCode::Char('J'), _) if backlog_mode_active(app) => key_rank_move(app, false),
+        (KeyCode::Char('s'), _) if backlog_mode_active(app) => key_send_to_sprint(app),
         (KeyCode::Char('/'), _) => key_open_search(app),
         (KeyCode::Char('n'), _) => key_open_create(app),
         _ => {}
@@ -2871,9 +2940,215 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
 }
 
 /// True while the kanban board covers the main area (fullscreen detail on a
-/// card temporarily leaves board key handling).
-const fn board_mode_active(app: &AppState) -> bool {
-    app.board_view.is_some() && !app.fullscreen_detail
+/// card temporarily leaves board key handling). Backlog tabs also live in
+/// `board_view` but render as a plain list, so they keep list navigation.
+fn board_mode_active(app: &AppState) -> bool {
+    app.active_tab_source_kind() == Some(crate::config::types::SourceKind::Board)
+        && !app.fullscreen_detail
+}
+
+/// True while a backlog tab covers the main area — enables the backlog-only
+/// keys (rank reorder, send-to-sprint) on top of normal list handling.
+fn backlog_mode_active(app: &AppState) -> bool {
+    app.active_tab_source_kind() == Some(crate::config::types::SourceKind::Backlog)
+        && !app.fullscreen_detail
+}
+
+/// Optimistically move the selected backlog issue one step up/down in rank
+/// order (both in the source's items and the flat list), then schedule the
+/// debounced Jira rank mutation. Consecutive moves of the same issue collapse
+/// into one call anchored at the final neighbors.
+fn key_rank_move(app: &mut AppState, up: bool) {
+    let Some(source_id) = app.board_view.clone() else {
+        return;
+    };
+    let Some(issue_key) = app.selected_item().map(|i| i.key().to_owned()) else {
+        return;
+    };
+
+    let Some(SourceState::Loaded(items)) = app.sources.get_mut(&source_id) else {
+        return;
+    };
+    let keys: Vec<String> = items.iter().map(|i| i.key().to_owned()).collect();
+    let Some((target, anchor)) = crate::tui::backlog::compute_rank_move(&keys, &issue_key, up)
+    else {
+        return;
+    };
+    let moved_idx = if up { target + 1 } else { target - 1 };
+    items.swap(moved_idx, target);
+
+    // Mirror the swap in the flat list, which holds all team sources.
+    let flat_moved = app.issues.iter().position(|i| i.key() == issue_key);
+    let flat_neighbor = app.issues.iter().position(|i| i.key() == keys[target]);
+    if let (Some(a), Some(b)) = (flat_moved, flat_neighbor) {
+        app.issues.swap(a, b);
+    }
+    app.rebuild_nav();
+    // Selection follows the moved issue.
+    if let Some(pos) = app.nav_items.iter().position(|n| {
+        matches!(n, NavItem::Issue(i) if app.issues.get(*i).map(WorkItem::key) == Some(issue_key.as_str()))
+    }) {
+        app.nav_idx = pos;
+    }
+
+    let rank_field_id = app
+        .board_configs
+        .get(&source_id)
+        .and_then(|c| c.ranking.as_ref())
+        .map(|r| r.rank_custom_field_id);
+    // A different issue's pending move dispatches first, unchanged.
+    if let Some(prev) = app.pending_rank.take() {
+        if prev.issue_key == issue_key {
+            // Collapsed: the new anchor supersedes it.
+        } else {
+            app.rank_flush_queue.push(prev);
+        }
+    }
+    app.pending_rank = Some(crate::tui::backlog::PendingRank {
+        source_id,
+        issue_key,
+        anchor,
+        rank_field_id,
+        last_move_at: std::time::Instant::now(),
+    });
+}
+
+/// Open the send-to-sprint flow for the selected backlog issue: the sprint
+/// list is fetched first (`LoadingSprints` → `SelectingSprint`).
+fn key_send_to_sprint(app: &mut AppState) {
+    let Some(issue_key) = app.selected_issue().map(|i| i.key.clone()) else {
+        return;
+    };
+    app.action_state = ActionState::LoadingSprints { issue_key };
+}
+
+/// A rank mutation came back: persist the confirmed order to the cache on
+/// success; on failure surface the error and refetch the backlog so the
+/// server's order is truth again.
+fn apply_issue_ranked(app: &mut AppState, source_id: String, result: Result<(), anyhow::Error>) {
+    match result {
+        Ok(()) => {
+            if let Some(SourceState::Loaded(items)) = app.sources.get(&source_id) {
+                crate::sources::cache::write(
+                    &app.cache,
+                    &source_id,
+                    items,
+                    app.board_configs.get(&source_id),
+                    None,
+                );
+            }
+        }
+        Err(e) => {
+            app.pending_rank_refetch = Some(source_id);
+            // Don't clobber an open overlay; the refetch alone restores the
+            // server's order.
+            if matches!(app.action_state, ActionState::None) {
+                app.action_state = ActionState::Error {
+                    error: Arc::new(e),
+                    scroll: 0,
+                };
+            }
+        }
+    }
+}
+
+/// Route the fetched sprint list into the picker. Kanban boards (`None`) and
+/// boards without upcoming sprints get a plain explanation instead.
+fn apply_sprints_loaded(
+    app: &mut AppState,
+    issue_key: String,
+    sprints: Option<Vec<crate::jira::types::Sprint>>,
+) {
+    match sprints {
+        None => {
+            app.action_state = ActionState::Error {
+                error: Arc::new(anyhow::anyhow!(
+                    "This board has no sprints — kanban boards can't receive backlog issues via a sprint."
+                )),
+                scroll: 0,
+            };
+        }
+        Some(sprints) if sprints.is_empty() => {
+            app.action_state = ActionState::Error {
+                error: Arc::new(anyhow::anyhow!(
+                    "No active or future sprints on this board. Create a sprint in Jira first."
+                )),
+                scroll: 0,
+            };
+        }
+        Some(sprints) => {
+            // Cursor starts on the first active sprint — the usual target.
+            let selected = sprints
+                .iter()
+                .position(|s| s.state == "active")
+                .unwrap_or(0);
+            app.action_state = ActionState::SelectingSprint {
+                issue_key,
+                sprints,
+                selected,
+            };
+        }
+    }
+}
+
+/// The issue left the backlog for a sprint: drop it from both lists, keep the
+/// cache in sync, and close the overlay.
+fn apply_moved_to_sprint(app: &mut AppState, issue_key: &str) {
+    let source_id = app
+        .issues
+        .iter()
+        .find(|i| i.key() == issue_key)
+        .and_then(|i| i.source_id().map(str::to_owned));
+    app.issues.retain(|i| i.key() != issue_key);
+    if let Some(sid) = &source_id
+        && let Some(SourceState::Loaded(items)) = app.sources.get_mut(sid)
+    {
+        items.retain(|i| i.key() != issue_key);
+        if let Some(SourceState::Loaded(items)) = app.sources.get(sid) {
+            crate::sources::cache::write(&app.cache, sid, items, app.board_configs.get(sid), None);
+        }
+    }
+    app.rebuild_nav();
+    app.action_state = ActionState::None;
+}
+
+fn handle_sprint_picker_input(app: &mut AppState, event: &crossterm::event::Event) {
+    use crossterm::event::{Event, KeyEvent};
+    let ActionState::SelectingSprint {
+        ref issue_key,
+        ref sprints,
+        ref mut selected,
+    } = app.action_state
+    else {
+        return;
+    };
+
+    if let Event::Key(KeyEvent { code, .. }) = *event {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.action_state = ActionState::None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < sprints.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(sprint) = sprints.get(*selected) {
+                    let key = issue_key.clone();
+                    let sprint_id = sprint.id;
+                    app.action_state = ActionState::PendingMoveToSprint {
+                        issue_key: key,
+                        sprint_id,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Board-mode key handling. Returns true when the key was consumed.
@@ -5006,6 +5281,49 @@ mod tests {
         }
     }
 
+    fn backlog_source(id: &str) -> cfg::SourceConfig {
+        cfg::SourceConfig {
+            id: id.into(),
+            kind: cfg::SourceKind::Backlog,
+            board: Some(cfg::BoardFilters {
+                board_id: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn backlog_source_gets_its_own_tab_and_stays_out_of_the_list() {
+        let teams = vec![resolved_team(
+            "platform",
+            vec![jira_source("mine"), backlog_source("bl")],
+        )];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        assert_eq!(app.tab_list(), vec![(0, None), (0, Some("bl".into()))]);
+
+        // On the list tab the backlog source is excluded…
+        assert_eq!(app.board_view, None);
+        assert!(app.source_in_active_tab("mine"));
+        assert!(!app.source_in_active_tab("bl"));
+
+        // …and on the backlog tab it is the only source, in list (not board) mode.
+        app.activate_tab(1);
+        assert_eq!(app.board_view.as_deref(), Some("bl"));
+        assert!(app.source_in_active_tab("bl"));
+        assert!(!app.source_in_active_tab("mine"));
+        assert_eq!(app.active_tab_source_kind(), Some(cfg::SourceKind::Backlog));
+        assert!(!board_mode_active(&app));
+    }
+
+    #[test]
+    fn backlog_only_team_gets_no_list_tab() {
+        let teams = vec![resolved_team("groom", vec![backlog_source("bl")])];
+        let app = AppState::new(teams, &cfg::Config::default());
+        assert_eq!(app.tab_list(), vec![(0, Some("bl".into()))]);
+        assert_eq!(app.board_view.as_deref(), Some("bl"));
+    }
+
     #[test]
     fn board_only_team_gets_no_list_tab() {
         let teams = vec![
@@ -5120,6 +5438,191 @@ mod tests {
             issue.fields.status.id.as_str(),
             issue.fields.status.name.as_str(),
         )
+    }
+
+    /// A team with a normal list source plus a backlog of B-1..B-3, with the
+    /// backlog tab active.
+    fn backlog_app() -> AppState {
+        let teams = vec![resolved_team(
+            "platform",
+            vec![jira_source("mine"), backlog_source("bl")],
+        )];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        app.sources.insert(
+            "mine".into(),
+            SourceState::Loaded(vec![make_item("M-1", "To Do", Some("mine"))]),
+        );
+        app.sources.insert(
+            "bl".into(),
+            SourceState::Loaded(vec![
+                make_item("B-1", "To Do", Some("bl")),
+                make_item("B-2", "To Do", Some("bl")),
+                make_item("B-3", "To Do", Some("bl")),
+            ]),
+        );
+        app.rebuild_issues();
+        app.activate_tab(1);
+        assert_eq!(app.board_view.as_deref(), Some("bl"));
+        app
+    }
+
+    fn select_key(app: &mut AppState, key: &str) {
+        let pos = app
+            .nav_items
+            .iter()
+            .position(|n| {
+                matches!(n, NavItem::Issue(i) if app.issues.get(*i).map(WorkItem::key) == Some(key))
+            })
+            .expect("key not navigable");
+        app.nav_idx = pos;
+    }
+
+    fn source_keys(app: &AppState, source_id: &str) -> Vec<String> {
+        let Some(SourceState::Loaded(items)) = app.sources.get(source_id) else {
+            panic!("expected Loaded");
+        };
+        items.iter().map(|i| i.key().to_owned()).collect()
+    }
+
+    #[test]
+    fn rank_move_reorders_both_lists_and_selection_follows() {
+        let mut app = backlog_app();
+        select_key(&mut app, "B-2");
+        key_rank_move(&mut app, true);
+
+        assert_eq!(source_keys(&app, "bl"), ["B-2", "B-1", "B-3"]);
+        // On a backlog tab the flat list holds only the backlog source.
+        let flat: Vec<&str> = app.issues.iter().map(WorkItem::key).collect();
+        assert_eq!(flat, ["B-2", "B-1", "B-3"]);
+        assert_eq!(app.selected_item().map(WorkItem::key), Some("B-2"));
+
+        let pending = app.pending_rank.as_ref().expect("pending rank");
+        assert_eq!(pending.source_id, "bl");
+        assert_eq!(pending.issue_key, "B-2");
+        assert_eq!(
+            pending.anchor,
+            crate::jira::types::RankAnchor::Before("B-1".into())
+        );
+        assert!(app.rank_flush_queue.is_empty());
+    }
+
+    #[test]
+    fn rank_moves_of_one_issue_collapse_into_the_latest_anchor() {
+        let mut app = backlog_app();
+        select_key(&mut app, "B-2");
+        key_rank_move(&mut app, true);
+        key_rank_move(&mut app, false); // back where it started
+
+        assert_eq!(source_keys(&app, "bl"), ["B-1", "B-2", "B-3"]);
+        let pending = app.pending_rank.as_ref().expect("pending rank");
+        assert_eq!(
+            pending.anchor,
+            crate::jira::types::RankAnchor::After("B-1".into())
+        );
+        assert!(
+            app.rank_flush_queue.is_empty(),
+            "same-issue moves must not queue extra API calls"
+        );
+    }
+
+    #[test]
+    fn moving_a_different_issue_flushes_the_pending_one() {
+        let mut app = backlog_app();
+        select_key(&mut app, "B-2");
+        key_rank_move(&mut app, true);
+        select_key(&mut app, "B-3");
+        key_rank_move(&mut app, true);
+
+        assert_eq!(app.rank_flush_queue.len(), 1);
+        assert_eq!(app.rank_flush_queue[0].issue_key, "B-2");
+        assert_eq!(
+            app.pending_rank.as_ref().map(|p| p.issue_key.as_str()),
+            Some("B-3")
+        );
+    }
+
+    #[test]
+    fn rank_move_at_the_edge_is_a_no_op() {
+        let mut app = backlog_app();
+        select_key(&mut app, "B-1");
+        key_rank_move(&mut app, true);
+
+        assert_eq!(source_keys(&app, "bl"), ["B-1", "B-2", "B-3"]);
+        assert!(app.pending_rank.is_none());
+    }
+
+    #[test]
+    fn switching_teams_flushes_the_pending_rank() {
+        let teams = vec![
+            resolved_team("platform", vec![jira_source("mine"), backlog_source("bl")]),
+            resolved_team("other", vec![jira_source("theirs")]),
+        ];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        app.sources.insert(
+            "bl".into(),
+            SourceState::Loaded(vec![
+                make_item("B-1", "To Do", Some("bl")),
+                make_item("B-2", "To Do", Some("bl")),
+            ]),
+        );
+        app.rebuild_issues();
+        app.activate_tab(1); // platform's backlog tab
+        select_key(&mut app, "B-2");
+        key_rank_move(&mut app, true);
+        assert!(app.pending_rank.is_some());
+
+        app.switch_team(1);
+        assert!(app.pending_rank.is_none());
+        assert_eq!(app.rank_flush_queue.len(), 1);
+        assert_eq!(app.rank_flush_queue[0].issue_key, "B-2");
+    }
+
+    #[test]
+    fn moved_to_sprint_leaves_both_lists_and_clamps_selection() {
+        let mut app = backlog_app();
+        select_key(&mut app, "B-3"); // last item
+        app.cache.enabled = false; // no disk writes from a unit test
+        apply_moved_to_sprint(&mut app, "B-3");
+
+        assert_eq!(source_keys(&app, "bl"), ["B-1", "B-2"]);
+        let flat: Vec<&str> = app.issues.iter().map(WorkItem::key).collect();
+        assert_eq!(flat, ["B-1", "B-2"]);
+        assert!(app.nav_idx < app.nav_items.len());
+        assert!(matches!(app.action_state, ActionState::None));
+    }
+
+    #[test]
+    fn sprints_loaded_starts_on_the_first_active_sprint() {
+        let mut app = backlog_app();
+        let sprint = |id: u64, name: &str, state: &str| crate::jira::types::Sprint {
+            id,
+            name: name.into(),
+            state: state.into(),
+        };
+        apply_sprints_loaded(
+            &mut app,
+            "B-1".into(),
+            Some(vec![
+                sprint(1, "Sprint 1", "future"),
+                sprint(2, "Sprint 2", "active"),
+                sprint(3, "Sprint 3", "future"),
+            ]),
+        );
+        let ActionState::SelectingSprint { selected, .. } = app.action_state else {
+            panic!("expected sprint picker");
+        };
+        assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn sprints_loaded_explains_kanban_and_empty_boards() {
+        let mut app = backlog_app();
+        apply_sprints_loaded(&mut app, "B-1".into(), None);
+        assert!(matches!(app.action_state, ActionState::Error { .. }));
+
+        app.action_state = ActionState::None;
+        apply_sprints_loaded(&mut app, "B-1".into(), Some(Vec::new()));
+        assert!(matches!(app.action_state, ActionState::Error { .. }));
     }
 
     #[test]

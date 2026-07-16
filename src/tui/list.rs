@@ -31,8 +31,10 @@ pub fn render_list(
     for (source_id, state) in &app.sources {
         let src_cfg = source_config_for(app.team_config(), source_id);
 
-        // Board sources are their own tabs, never rows in a team's list.
-        if src_cfg.is_some_and(|s| s.kind == crate::config::types::SourceKind::Board) {
+        // Dedicated-tab sources (boards/backlogs) render in their own tabs:
+        // skip them on the list tab, and on a backlog tab render only the
+        // active backlog source.
+        if !app.source_in_active_tab(source_id) {
             continue;
         }
 

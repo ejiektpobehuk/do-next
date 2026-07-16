@@ -111,5 +111,9 @@ fn right_column() -> Vec<Line<'static>> {
         key_line("↑ ↓ / j k", "move between cards / lanes"),
         key_line("t", "move card to a column"),
         key_line("Enter", "open card (Esc returns to board)"),
+        Line::raw(""),
+        section_header("Backlog tab"),
+        key_line("Shift+K / J", "move issue up / down in rank"),
+        key_line("s", "send issue to a sprint"),
     ]
 }

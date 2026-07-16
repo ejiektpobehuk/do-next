@@ -10,7 +10,8 @@ use crate::jira::auth::Auth;
 use crate::jira::types::{
     AgileIssuesResponse, AgilePage, Attachment, BoardConfiguration, Comment, FieldMeta,
     FieldSchema, GreenHopperBoardData, GreenHopperSwimlane, Issue, IssueTypeField, ProjectInfo,
-    SearchResponse, Sprint, StatusCategory, StatusInfo, Transition, TransitionsResponse,
+    RankAnchor, SearchResponse, Sprint, StatusCategory, StatusInfo, Transition,
+    TransitionsResponse,
 };
 
 const MAX_RESULTS: u32 = 100;
@@ -291,6 +292,69 @@ impl JiraClient {
         }
 
         Ok(all_issues)
+    }
+
+    /// All issues in a board's backlog (on the board but not in an active
+    /// sprint), in rank order.
+    pub async fn fetch_board_backlog_issues(
+        &self,
+        board_id: u64,
+        fields: &str,
+    ) -> Result<Vec<Issue>> {
+        self.fetch_agile_issues(&format!("board/{board_id}/backlog"), fields)
+            .await
+    }
+
+    /// Re-rank issues directly before/after the anchor issue
+    /// (`PUT /rest/agile/1.0/issue/rank`). Needs the *Schedule Issues*
+    /// permission. `rank_field_id` disambiguates instances with multiple Rank
+    /// fields; `None` uses Jira's default Rank field.
+    pub async fn rank_issues(
+        &self,
+        keys: &[String],
+        anchor: &RankAnchor,
+        rank_field_id: Option<u64>,
+    ) -> Result<()> {
+        let url = format!("{}/rest/agile/1.0/issue/rank", self.base_url);
+        let body = rank_payload(keys, anchor, rank_field_id);
+        self.maybe_refresh().await?;
+        let resp = self
+            .apply_auth(self.client.put(&url))
+            .await
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to send rank request")?;
+
+        let status = resp.status();
+        // 207 Multi-Status means some issues failed to rank — a partial
+        // success is still a failure for our single-issue moves.
+        if !status.is_success() || status == reqwest::StatusCode::MULTI_STATUS {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+        Ok(())
+    }
+
+    /// Move issues from the backlog into a sprint
+    /// (`POST /rest/agile/1.0/sprint/{id}/issue`).
+    pub async fn move_issues_to_sprint(&self, sprint_id: u64, keys: &[String]) -> Result<()> {
+        let url = format!("{}/rest/agile/1.0/sprint/{sprint_id}/issue", self.base_url);
+        self.maybe_refresh().await?;
+        let resp = self
+            .apply_auth(self.client.post(&url))
+            .await
+            .json(&serde_json::json!({ "issues": keys }))
+            .send()
+            .await
+            .context("Failed to send move-to-sprint request")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+        Ok(())
     }
 
     /// Fetch a single page of an Agile issue endpoint at the given `startAt`.
@@ -1149,9 +1213,50 @@ fn agile_page_offsets(stride: u32, total: u32) -> Vec<u32> {
     (stride..total).step_by(stride as usize).collect()
 }
 
+/// Request body for `PUT /rest/agile/1.0/issue/rank`.
+fn rank_payload(
+    keys: &[String],
+    anchor: &RankAnchor,
+    rank_field_id: Option<u64>,
+) -> serde_json::Value {
+    let mut body = json!({ "issues": keys });
+    match anchor {
+        RankAnchor::Before(key) => body["rankBeforeIssue"] = json!(key),
+        RankAnchor::After(key) => body["rankAfterIssue"] = json!(key),
+    }
+    if let Some(id) = rank_field_id {
+        body["rankCustomFieldId"] = json!(id);
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
-    use super::agile_page_offsets;
+    use super::{agile_page_offsets, rank_payload};
+    use crate::jira::types::RankAnchor;
+    use serde_json::json;
+
+    #[test]
+    fn rank_payload_places_before_or_after_the_anchor() {
+        let keys = vec!["PROJ-2".to_string()];
+        assert_eq!(
+            rank_payload(&keys, &RankAnchor::Before("PROJ-1".into()), None),
+            json!({ "issues": ["PROJ-2"], "rankBeforeIssue": "PROJ-1" })
+        );
+        assert_eq!(
+            rank_payload(&keys, &RankAnchor::After("PROJ-3".into()), None),
+            json!({ "issues": ["PROJ-2"], "rankAfterIssue": "PROJ-3" })
+        );
+    }
+
+    #[test]
+    fn rank_payload_includes_rank_field_only_when_known() {
+        let keys = vec!["PROJ-2".to_string()];
+        let with_field = rank_payload(&keys, &RankAnchor::Before("PROJ-1".into()), Some(10019));
+        assert_eq!(with_field["rankCustomFieldId"], json!(10019));
+        let without = rank_payload(&keys, &RankAnchor::Before("PROJ-1".into()), None);
+        assert!(without.get("rankCustomFieldId").is_none());
+    }
 
     #[test]
     fn offsets_cover_all_pages_after_the_first_in_order() {

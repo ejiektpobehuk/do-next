@@ -81,9 +81,11 @@ pub fn render(
     let popup = app.popup_active();
     if app.fullscreen_detail {
         render_detail(f, main_area, app, !popup, render_out);
-    } else if app.board_view.is_some() {
+    } else if app.active_tab_source_kind() == Some(crate::config::types::SourceKind::Board) {
         crate::tui::board::render_board(f, main_area, app, !popup);
     } else {
+        // List tabs and backlog tabs share the list+detail layout — a backlog
+        // is just a rank-ordered list of one source.
         // Main: list (30%) | detail (70%)
         let main = Layout::default()
             .direction(Direction::Horizontal)
@@ -127,6 +129,12 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
         ActionState::SelectingBoardColumn { .. } => {
             overlays::board_column::render_board_column_overlay(f, &app.action_state);
         }
+        ActionState::SelectingSprint { .. } => {
+            overlays::sprint_picker::render_sprint_picker_overlay(f, &app.action_state);
+        }
+        ActionState::LoadingSprints { .. } => {
+            overlays::await_spinner::render_await(f, "Fetching sprints…", app.tick_count);
+        }
         ActionState::HidePopup { .. } => {
             overlays::hide::render_hide_overlay(f, &app.action_state, app.team_config());
         }
@@ -138,6 +146,9 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
         }
         ActionState::PendingTransition { .. } => {
             overlays::await_spinner::render_await(f, "Applying transition…", app.tick_count);
+        }
+        ActionState::PendingMoveToSprint { .. } => {
+            overlays::await_spinner::render_await(f, "Moving to sprint…", app.tick_count);
         }
         ActionState::PendingHide { .. } => {
             overlays::await_spinner::render_await(f, "Hiding…", app.tick_count);
@@ -304,14 +315,18 @@ fn render_tab_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
             spans.push(Span::raw(" "));
         }
         let team = &app.resolved_teams[*team_idx];
-        // Board tabs are labelled by the board source's display name and
-        // prefixed to read as a distinct kind of tab.
+        // Board/backlog tabs are labelled by the source's display name and
+        // prefixed to read as a distinct kind of tab (▤ board, ≡ backlog).
         let label = board.as_ref().map_or_else(
             || format!(" {} ", team.id),
             |src_id| {
-                let name = source_config_for(&team.config, src_id)
-                    .map_or(src_id.as_str(), |s| s.display_name());
-                format!(" ▤ {name} ")
+                let src = source_config_for(&team.config, src_id);
+                let name = src.map_or(src_id.as_str(), |s| s.display_name());
+                let prefix = match src.map(|s| s.kind) {
+                    Some(crate::config::types::SourceKind::Backlog) => "≡",
+                    _ => "▤",
+                };
+                format!(" {prefix} {name} ")
             },
         );
         if i == active {

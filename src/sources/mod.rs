@@ -9,7 +9,7 @@ use crate::config::types::{CacheConfig, DetailLoad, SourceKind, TeamConfig};
 use crate::confluence::ConfluenceClient;
 use crate::events::AppEvent;
 use crate::jira::JiraClient;
-use fetcher::{spawn_board_fetch, spawn_confluence_fetch, spawn_fetch};
+use fetcher::{spawn_backlog_fetch, spawn_board_fetch, spawn_confluence_fetch, spawn_fetch};
 
 /// Per-backend HTTP clients, keyed by base URL.
 pub struct Clients {
@@ -62,6 +62,20 @@ pub fn spawn_fetches(
                     .and_then(|b| b.detail_load)
                     .unwrap_or(default_detail_load);
                 spawn_board_fetch(
+                    jira.clone(),
+                    source_cfg.clone(),
+                    detail_load,
+                    cache.clone(),
+                    tx.clone(),
+                );
+            }
+            SourceKind::Backlog => {
+                let detail_load = source_cfg
+                    .board
+                    .as_ref()
+                    .and_then(|b| b.detail_load)
+                    .unwrap_or(default_detail_load);
+                spawn_backlog_fetch(
                     jira.clone(),
                     source_cfg.clone(),
                     detail_load,

@@ -410,10 +410,10 @@ mod tests {
     #[test]
     fn board_source_parses_with_all_sprint_forms() {
         for (form, expected) in [
-            (r#"sprint: "active","#, types::SprintSelector::Active),
-            (r#"sprint: "all","#, types::SprintSelector::All),
-            ("sprint: 137,", types::SprintSelector::Id(137)),
-            ("", types::SprintSelector::Active), // omitted → default
+            (r#"sprint: "active","#, Some(types::SprintSelector::Active)),
+            (r#"sprint: "all","#, Some(types::SprintSelector::All)),
+            ("sprint: 137,", Some(types::SprintSelector::Id(137))),
+            ("", None), // omitted → fetcher defaults to Active
         ] {
             let src: SourceConfig = json5::from_str(&format!(
                 r#"{{ id: "b", kind: "board", board: {{ board_id: 42, {form} }} }}"#
@@ -488,13 +488,13 @@ mod tests {
         for board in [
             types::BoardFilters {
                 board_id: 7,
-                sprint: types::SprintSelector::Id(137),
+                sprint: Some(types::SprintSelector::Id(137)),
                 swimlanes: Some(types::SwimlaneConfig::Auto),
                 detail_load: None,
             },
             types::BoardFilters {
                 board_id: 7,
-                sprint: types::SprintSelector::All,
+                sprint: Some(types::SprintSelector::All),
                 swimlanes: Some(types::SwimlaneConfig::Queries {
                     lanes: vec![types::QueryLane {
                         name: "Expedite".into(),
@@ -584,6 +584,85 @@ mod tests {
             ..Default::default()
         });
         assert!(validate_source_config(&blank_field).is_err());
+    }
+
+    // ── Backlog sources ───────────────────────────────────────────────────
+
+    fn backlog_source(board: types::BoardFilters) -> SourceConfig {
+        SourceConfig {
+            id: "backlog".into(),
+            kind: SourceKind::Backlog,
+            board: Some(board),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn backlog_source_parses_shortcut_and_rich_forms() {
+        let shortcut: SourceConfig =
+            json5::from_str(r#"{ id: "bl", kind: "backlog", board: { board_id: 42 } }"#).unwrap();
+        assert_eq!(shortcut.kind, SourceKind::Backlog);
+        assert_eq!(shortcut.board.as_ref().unwrap().board_id, 42);
+        assert!(validate_source_config(&shortcut).is_ok());
+
+        let rich: SourceConfig = json5::from_str(
+            r#"{ id: "bl", display_name: "Backlog", kind: "backlog",
+                 board: { board_id: 42, detail_load: "full" } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rich.board.as_ref().unwrap().detail_load,
+            Some(types::DetailLoad::Full)
+        );
+        assert!(validate_source_config(&rich).is_ok());
+    }
+
+    #[test]
+    fn backlog_source_requires_board_block_and_positive_id() {
+        let missing = SourceConfig {
+            id: "bl".into(),
+            kind: SourceKind::Backlog,
+            ..Default::default()
+        };
+        let err = validate_source_config(&missing).expect_err("must reject");
+        assert!(err.to_string().contains("board"));
+
+        let zero = backlog_source(types::BoardFilters::default());
+        assert!(validate_source_config(&zero).is_err());
+    }
+
+    #[test]
+    fn backlog_source_rejects_board_only_and_jira_only_options() {
+        let base = || types::BoardFilters {
+            board_id: 42,
+            ..Default::default()
+        };
+
+        let with_sprint = backlog_source(types::BoardFilters {
+            sprint: Some(types::SprintSelector::Active),
+            ..base()
+        });
+        let err = validate_source_config(&with_sprint).expect_err("must reject sprint");
+        assert!(err.to_string().contains("sprint"));
+
+        let with_lanes = backlog_source(types::BoardFilters {
+            swimlanes: Some(types::SwimlaneConfig::Auto),
+            ..base()
+        });
+        let err = validate_source_config(&with_lanes).expect_err("must reject swimlanes");
+        assert!(err.to_string().contains("swimlanes"));
+
+        let mut with_jql = backlog_source(base());
+        with_jql.jql = "project = X".into();
+        assert!(validate_source_config(&with_jql).is_err());
+
+        let mut with_subsources = backlog_source(base());
+        with_subsources.subsources = vec![types::SubsourceConfig::default()];
+        assert!(validate_source_config(&with_subsources).is_err());
+
+        let mut with_confluence = backlog_source(base());
+        with_confluence.confluence = Some(ConfluenceFilters::default());
+        assert!(validate_source_config(&with_confluence).is_err());
     }
 
     #[test]
@@ -820,7 +899,7 @@ fn validate_source_config(source: &types::SourceConfig) -> Result<()> {
             }
             if source.board.is_some() {
                 return Err(anyhow!(
-                    "source '{}': `board` filters are only valid with `kind: \"board\"`",
+                    "source '{}': `board` filters are only valid with `kind: \"board\"` or `kind: \"backlog\"`",
                     source.id
                 ));
             }
@@ -846,7 +925,7 @@ fn validate_source_config(source: &types::SourceConfig) -> Result<()> {
             }
             if source.board.is_some() {
                 return Err(anyhow!(
-                    "source '{}': `board` filters are only valid with `kind: \"board\"`",
+                    "source '{}': `board` filters are only valid with `kind: \"board\"` or `kind: \"backlog\"`",
                     source.id
                 ));
             }
@@ -855,6 +934,53 @@ fn validate_source_config(source: &types::SourceConfig) -> Result<()> {
             }
         }
         SourceKind::Board => validate_board_source(source)?,
+        SourceKind::Backlog => validate_backlog_source(source)?,
+    }
+    Ok(())
+}
+
+fn validate_backlog_source(source: &types::SourceConfig) -> Result<()> {
+    let Some(board) = &source.board else {
+        return Err(anyhow!(
+            "source '{}': a `board` block with `board_id` is required for a backlog source",
+            source.id
+        ));
+    };
+    if board.board_id == 0 {
+        return Err(anyhow!(
+            "source '{}': `board_id` must be a positive board id",
+            source.id
+        ));
+    }
+    if !source.jql.is_empty() {
+        return Err(anyhow!(
+            "source '{}': `jql` is not valid for a backlog source (the board's backlog defines the query)",
+            source.id
+        ));
+    }
+    if !source.subsources.is_empty() {
+        return Err(anyhow!(
+            "source '{}': `subsources` are not valid for a backlog source",
+            source.id
+        ));
+    }
+    if source.confluence.is_some() {
+        return Err(anyhow!(
+            "source '{}': `confluence` filters are only valid with `kind: \"confluence\"`",
+            source.id
+        ));
+    }
+    if board.sprint.is_some() {
+        return Err(anyhow!(
+            "source '{}': `sprint` is not valid for a backlog source (the backlog is what's outside sprints)",
+            source.id
+        ));
+    }
+    if board.swimlanes.is_some() {
+        return Err(anyhow!(
+            "source '{}': `swimlanes` are not valid for a backlog source (it renders as a rank-ordered list)",
+            source.id
+        ));
     }
     Ok(())
 }
@@ -1090,7 +1216,7 @@ pub fn extra_scopes_for<'a>(
         for source in &team.sources {
             match source.kind {
                 SourceKind::Confluence => extra.confluence = true,
-                SourceKind::Board => extra.board = true,
+                SourceKind::Board | SourceKind::Backlog => extra.board = true,
                 SourceKind::Jira => {}
             }
         }
@@ -1107,3 +1233,4 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     }
     PathBuf::from(path)
 }
+

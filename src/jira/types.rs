@@ -169,6 +169,18 @@ pub struct BoardConfiguration {
     pub board_type: BoardType,
     #[serde(rename = "columnConfig")]
     pub column_config: ColumnConfig,
+    /// The board's rank field, needed by rank mutations when an instance has
+    /// more than one Rank field. Defaulted so pre-existing cache files (and
+    /// odd responses) keep deserializing.
+    #[serde(default)]
+    pub ranking: Option<RankingConfig>,
+}
+
+/// The `ranking` block of a board configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RankingConfig {
+    #[serde(rename = "rankCustomFieldId")]
+    pub rank_custom_field_id: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -195,6 +207,14 @@ impl BoardColumn {
     pub fn contains_status(&self, status_id: &str) -> bool {
         self.statuses.iter().any(|s| s.id == status_id)
     }
+}
+
+/// Where a rank mutation places the issues: directly before or directly
+/// after the anchor issue (`PUT /rest/agile/1.0/issue/rank`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RankAnchor {
+    Before(String),
+    After(String),
 }
 
 /// Agile sprint (`GET /rest/agile/1.0/board/{id}/sprint`).
@@ -395,6 +415,20 @@ mod tests {
         assert!(cols[2].contains_status("3"));
         assert!(cols[2].contains_status("10101"));
         assert!(!cols[2].contains_status("10100"));
+        assert_eq!(cfg.ranking.unwrap().rank_custom_field_id, 10019);
+    }
+
+    #[test]
+    fn board_configuration_tolerates_missing_ranking() {
+        // Pre-existing cache files were written without `ranking`.
+        let cfg: BoardConfiguration = serde_json::from_str(
+            r#"{
+            "id": 1, "name": "b", "type": "scrum",
+            "columnConfig": { "columns": [] }
+        }"#,
+        )
+        .unwrap();
+        assert!(cfg.ranking.is_none());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 pub mod app;
+pub mod backlog;
 pub mod board;
 pub mod detail;
 pub mod hint_bar;
@@ -12,7 +13,7 @@ pub mod theme;
 pub mod views;
 pub mod widgets;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use crossterm::{
     event::EventStream,
     execute,
@@ -126,10 +127,13 @@ async fn run_inner(
         }
 
         // Manage tick task lifecycle: run while sources are loading or any
-        // single-issue refresh is in flight (so the spinner animates), or while
-        // the search popup is open (to drive the debounced Jira dispatch).
+        // single-issue refresh is in flight (so the spinner animates), while
+        // the search popup is open (to drive the debounced Jira dispatch), or
+        // while a rank move waits out its debounce window.
         if app.any_source_loading()
             || !app.refreshing_issues.is_empty()
+            || app.pending_rank.is_some()
+            || !app.rank_flush_queue.is_empty()
             || matches!(
                 app.action_state,
                 crate::tui::app::ActionState::Searching { .. }
@@ -450,6 +454,32 @@ fn dispatch_action(
             };
             spawn_transition(issue_key, transition_id, client.clone(), tx.clone());
         }
+        ActionState::LoadingSprints { issue_key } => {
+            // The backlog tab's board id; `s` is only reachable there.
+            let board_id = app
+                .board_view
+                .as_deref()
+                .and_then(|id| crate::tui::app::source_config_for(app.team_config(), id))
+                .and_then(|s| s.board.as_ref())
+                .map(|b| b.board_id);
+            if let Some(board_id) = board_id {
+                app.action_state = ActionState::AwaitingAction {
+                    description: "Fetching sprints…".into(),
+                };
+                spawn_load_sprints(board_id, issue_key, client.clone(), tx.clone());
+            } else {
+                app.action_state = ActionState::None;
+            }
+        }
+        ActionState::PendingMoveToSprint {
+            issue_key,
+            sprint_id,
+        } => {
+            app.action_state = ActionState::AwaitingAction {
+                description: "Moving to sprint…".into(),
+            };
+            spawn_move_to_sprint(sprint_id, issue_key, client.clone(), tx.clone());
+        }
         ActionState::PendingCompleteTask { item_key, task_id } => {
             app.action_state = ActionState::AwaitingAction {
                 description: "Completing task…".into(),
@@ -620,6 +650,8 @@ fn dispatch_background_tasks(
         }
     }
 
+    dispatch_pending_ranks(app, client, tx);
+
     // Debounced Jira-side search dispatch.
     maybe_dispatch_search(app, client, tx);
 
@@ -739,6 +771,71 @@ fn spawn_create_issue(
 }
 
 const SEARCH_DEBOUNCE_MS: u128 = 250;
+
+/// How long a backlog rank move sits before dispatching to Jira, so rapid
+/// repeated moves of one issue collapse into a single API call.
+const RANK_DEBOUNCE_MS: u128 = 400;
+
+/// Backlog rank mutations: displaced entries (issue changed, team switched)
+/// flush immediately; the current one waits out its debounce window so a run
+/// of K/K/K collapses into one call at the final position. Also refetches a
+/// backlog whose rank mutation failed, restoring the server's order.
+fn dispatch_pending_ranks(app: &mut AppState, client: &JiraClient, tx: &UnboundedSender<AppEvent>) {
+    let mut ranks_to_send = std::mem::take(&mut app.rank_flush_queue);
+    if app
+        .pending_rank
+        .as_ref()
+        .is_some_and(|p| p.last_move_at.elapsed().as_millis() >= RANK_DEBOUNCE_MS)
+        && let Some(pending) = app.pending_rank.take()
+    {
+        ranks_to_send.push(pending);
+    }
+    for pending in ranks_to_send {
+        spawn_rank_issue(client.clone(), pending, tx.clone());
+    }
+
+    if let Some(source_id) = app.pending_rank_refetch.take()
+        && let Some(src_cfg) =
+            crate::tui::app::source_config_for(app.team_config(), &source_id).cloned()
+    {
+        if let Some(state) = app.sources.get_mut(&source_id) {
+            *state = crate::tui::app::SourceState::Loading;
+        }
+        let detail_load = src_cfg
+            .board
+            .as_ref()
+            .and_then(|b| b.detail_load)
+            .unwrap_or(app.detail_load);
+        crate::sources::fetcher::spawn_backlog_fetch(
+            client.clone(),
+            src_cfg,
+            detail_load,
+            app.cache.clone(),
+            tx.clone(),
+        );
+    }
+}
+
+fn spawn_rank_issue(
+    client: JiraClient,
+    pending: crate::tui::backlog::PendingRank,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .rank_issues(
+                std::slice::from_ref(&pending.issue_key),
+                &pending.anchor,
+                pending.rank_field_id,
+            )
+            .await
+            .with_context(|| format!("Failed to re-rank {}", pending.issue_key));
+        let _ = tx.send(AppEvent::IssueRanked {
+            source_id: pending.source_id,
+            result,
+        });
+    });
+}
 
 fn maybe_dispatch_search(app: &mut AppState, client: &JiraClient, tx: &UnboundedSender<AppEvent>) {
     let (jql, token) = {
@@ -1014,6 +1111,50 @@ fn spawn_load_transitions(issue_key: String, client: JiraClient, tx: UnboundedSe
                 let _ = tx.send(AppEvent::ActionDone(ActionResult::TransitionsLoaded {
                     issue_key,
                     transitions,
+                }));
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::Error(e)));
+            }
+        }
+    });
+}
+
+fn spawn_load_sprints(
+    board_id: u64,
+    issue_key: String,
+    client: JiraClient,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match client.get_board_sprints(board_id, "active,future").await {
+            Ok(sprints) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::SprintsLoaded {
+                    issue_key,
+                    sprints,
+                }));
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::Error(e)));
+            }
+        }
+    });
+}
+
+fn spawn_move_to_sprint(
+    sprint_id: u64,
+    issue_key: String,
+    client: JiraClient,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match client
+            .move_issues_to_sprint(sprint_id, std::slice::from_ref(&issue_key))
+            .await
+        {
+            Ok(()) => {
+                let _ = tx.send(AppEvent::ActionDone(ActionResult::MovedToSprint {
+                    issue_key,
                 }));
             }
             Err(e) => {

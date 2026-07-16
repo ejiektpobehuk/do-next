@@ -147,6 +147,10 @@ pub enum SourceKind {
     /// A Jira Software (Agile) board: issues + column layout from
     /// `/rest/agile/1.0/`, rendered as a kanban view.
     Board,
+    /// A Jira Software (Agile) board's backlog: rank-ordered issues not in an
+    /// active sprint, from `/rest/agile/1.0/board/{id}/backlog`, rendered as
+    /// a plain list in its own tab.
+    Backlog,
 }
 
 /// Which issues a board source shows: the active sprint (default), all board
@@ -332,14 +336,16 @@ impl<'de> Deserialize<'de> for SwimlaneConfig {
     }
 }
 
-/// Per-source Jira Agile board filters. Required when `kind` is `board`.
+/// Per-source Jira Agile board filters. Required when `kind` is `board` or
+/// `backlog` (backlog sources use only `board_id` and `detail_load`).
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct BoardFilters {
     /// Numeric Agile board id (the `rapidView=<id>` in the board URL).
     pub board_id: u64,
     /// Sprint selection: "active" (default) | "all" | a numeric sprint id.
+    /// Board sources only; not valid for backlog sources.
     #[serde(default)]
-    pub sprint: SprintSelector,
+    pub sprint: Option<SprintSelector>,
     /// Swimlane strategy. Absent = no lanes.
     #[serde(default)]
     pub swimlanes: Option<SwimlaneConfig>,
