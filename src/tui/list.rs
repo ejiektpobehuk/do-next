@@ -27,6 +27,14 @@ pub fn render_list(
 
     let mut issue_pos = 0usize;
 
+    // Separators exist to tell sources apart; with a single source in the
+    // tab (e.g. a backlog tab, or a list tab with one source) they are noise.
+    let visible_sources = app
+        .sources
+        .iter()
+        .filter(|(id, _)| app.source_in_active_tab(id))
+        .count();
+
     // Build display items by iterating source order
     for (source_id, state) in &app.sources {
         let src_cfg = source_config_for(app.team_config(), source_id);
@@ -39,12 +47,14 @@ pub fn render_list(
         }
 
         // Add source separator
-        let sep_text = source_separator_text(source_id, src_cfg);
-        items.push(ListItem::new(Line::from(Span::styled(
-            sep_text,
-            Style::default().add_modifier(Modifier::DIM),
-        ))));
-        item_nav_indices.push(None);
+        if visible_sources > 1 {
+            let sep_text = source_separator_text(source_id, src_cfg);
+            items.push(ListItem::new(Line::from(Span::styled(
+                sep_text,
+                Style::default().add_modifier(Modifier::DIM),
+            ))));
+            item_nav_indices.push(None);
+        }
 
         match state {
             SourceState::Loaded(_) => {
