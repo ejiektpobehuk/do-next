@@ -40,9 +40,63 @@ pub struct CompanyRef {
     pub url: Option<String>,
     /// Local clone directory containing `company.json5`. `~` is expanded.
     pub path: String,
-    /// Team ids selected from the manifest catalog.
+    /// Teams selected from the manifest catalog. The shortcut form is a
+    /// plain id string; the rich form adds per-team options:
+    /// `{ id: "core", backlog: true }`.
     #[serde(default)]
-    pub teams: Vec<String>,
+    pub teams: Vec<CompanyTeamSelection>,
+}
+
+/// One selected company team: a plain id (shortcut) or an id with per-team
+/// options. Optional features default to off — the backlog tab is opt-in.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CompanyTeamSelection {
+    Id(String),
+    Options {
+        id: String,
+        /// Show this team's backlog sources as tabs.
+        #[serde(default)]
+        backlog: bool,
+    },
+}
+
+impl CompanyTeamSelection {
+    /// Normalizing constructor: all-default options collapse to the shortcut
+    /// form so the written config stays minimal.
+    pub fn new(id: impl Into<String>, backlog: bool) -> Self {
+        let id = id.into();
+        if backlog {
+            Self::Options { id, backlog }
+        } else {
+            Self::Id(id)
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Id(id) | Self::Options { id, .. } => id,
+        }
+    }
+
+    pub const fn backlog(&self) -> bool {
+        match self {
+            Self::Id(_) => false,
+            Self::Options { backlog, .. } => *backlog,
+        }
+    }
+}
+
+impl From<&str> for CompanyTeamSelection {
+    fn from(id: &str) -> Self {
+        Self::Id(id.into())
+    }
+}
+
+impl From<String> for CompanyTeamSelection {
+    fn from(id: String) -> Self {
+        Self::Id(id)
+    }
 }
 
 /// A reference to a team config directory.
@@ -54,6 +108,11 @@ pub struct TeamRef {
     pub path: String,
     /// Config file name inside `path` (default: "do-next.json5").
     pub file: Option<String>,
+    /// Show this team's backlog sources as tabs. Unset means enabled: manual
+    /// team configs are user-authored, so the source's presence is the
+    /// switch. Company team selections set it explicitly (opt-in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backlog: Option<bool>,
 }
 
 /// Partial Jira overrides for team configs. All fields optional — only set fields
@@ -659,7 +718,61 @@ mod tests {
         let company = cfg.company.expect("company block");
         assert_eq!(company.url.as_deref(), Some("git@github.com:acme/cfg.git"));
         assert_eq!(company.path, "~/.config/do-next/company/cfg");
-        assert_eq!(company.teams, vec!["platform", "billing"]);
+        let ids: Vec<&str> = company.teams.iter().map(CompanyTeamSelection::id).collect();
+        assert_eq!(ids, vec!["platform", "billing"]);
+        assert!(company.teams.iter().all(|t| !t.backlog()));
+    }
+
+    #[test]
+    fn company_team_selection_accepts_shortcut_and_rich_forms() {
+        let cfg: Config = json5::from_str(
+            r#"{ company: {
+                path: "/tmp/cfg",
+                teams: ["platform", { id: "billing", backlog: true }, { id: "core" }],
+            } }"#,
+        )
+        .expect("valid config");
+        let teams = cfg.company.expect("company block").teams;
+        assert_eq!(teams.len(), 3);
+        assert_eq!(teams[0].id(), "platform");
+        assert!(!teams[0].backlog());
+        assert_eq!(teams[1].id(), "billing");
+        assert!(teams[1].backlog());
+        // Rich form without options behaves like the shortcut.
+        assert_eq!(teams[2].id(), "core");
+        assert!(!teams[2].backlog());
+    }
+
+    #[test]
+    fn company_team_selection_normalizes_defaults_to_shortcut() {
+        assert_eq!(
+            CompanyTeamSelection::new("platform", false),
+            CompanyTeamSelection::Id("platform".into())
+        );
+        // Default options serialize as the plain string form.
+        let s = json5::to_string(&CompanyTeamSelection::new("platform", false)).unwrap();
+        assert_eq!(s, r#""platform""#);
+        // Enabled backlog keeps the rich form and round-trips.
+        let rich = CompanyTeamSelection::new("billing", true);
+        let s = json5::to_string(&rich).unwrap();
+        let back: CompanyTeamSelection = json5::from_str(&s).unwrap();
+        assert_eq!(back, rich);
+        assert!(back.backlog());
+    }
+
+    #[test]
+    fn team_ref_backlog_is_optional_and_omitted_when_unset() {
+        let tr: TeamRef =
+            json5::from_str(r#"{ id: "t", path: "/tmp/t" }"#).expect("valid team ref");
+        assert_eq!(tr.backlog, None);
+        let s = json5::to_string(&tr).unwrap();
+        assert!(
+            !s.contains("backlog"),
+            "unset backlog must not serialize: {s}"
+        );
+        let tr: TeamRef = json5::from_str(r#"{ id: "t", path: "/tmp/t", backlog: false }"#)
+            .expect("valid team ref");
+        assert_eq!(tr.backlog, Some(false));
     }
 
     #[test]

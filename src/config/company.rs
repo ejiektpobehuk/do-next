@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use super::types::{ConfluenceConfig, JiraConfig, TeamRef};
+use super::types::{CompanyTeamSelection, ConfluenceConfig, JiraConfig, TeamRef};
 
 /// Manifest file name at the root of a company config repo.
 pub const MANIFEST_FILE: &str = "company.json5";
@@ -151,17 +151,18 @@ pub fn apply_company_defaults(user: &JiraConfig, manifest: &CompanyManifest) -> 
     jira
 }
 
-/// Synthesize `TeamRef`s for the selected catalog ids. Ids missing from the
+/// Synthesize `TeamRef`s for the selected catalog teams. Ids missing from the
 /// catalog produce per-team error strings (non-fatal, like team load errors).
 pub fn company_team_refs(
     clone_dir: &Path,
     manifest: &CompanyManifest,
-    selected: &[String],
+    selected: &[CompanyTeamSelection],
 ) -> (Vec<TeamRef>, Vec<String>) {
     let mut refs = Vec::new();
     let mut errors = Vec::new();
-    for id in selected {
-        if let Some(entry) = manifest.teams.iter().find(|t| &t.id == id) {
+    for selection in selected {
+        let id = selection.id();
+        if let Some(entry) = manifest.teams.iter().find(|t| t.id == id) {
             refs.push(TeamRef {
                 id: entry.id.clone(),
                 path: clone_dir
@@ -169,6 +170,8 @@ pub fn company_team_refs(
                     .to_string_lossy()
                     .into_owned(),
                 file: entry.file.clone(),
+                // Explicit either way: company backlog tabs are per-user opt-in.
+                backlog: Some(selection.backlog()),
             });
         } else {
             errors.push(format!(
@@ -394,11 +397,25 @@ mod tests {
             "/home/u/.config/do-next/company/acme/teams/platform"
         );
         assert_eq!(refs[0].file, None);
+        // Shortcut selections opt out of the backlog tab explicitly.
+        assert_eq!(refs[0].backlog, Some(false));
         assert_eq!(
             refs[1].path,
             "/home/u/.config/do-next/company/acme/squads/billing"
         );
         assert_eq!(refs[1].file.as_deref(), Some("team.json5"));
+    }
+
+    #[test]
+    fn team_refs_carry_the_backlog_opt_in() {
+        let clone_dir = Path::new("/tmp/acme");
+        let (refs, errors) = company_team_refs(
+            clone_dir,
+            &manifest(),
+            &[CompanyTeamSelection::new("platform", true)],
+        );
+        assert!(errors.is_empty());
+        assert_eq!(refs[0].backlog, Some(true));
     }
 
     #[test]

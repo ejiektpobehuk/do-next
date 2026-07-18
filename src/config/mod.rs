@@ -42,7 +42,8 @@ pub fn load() -> Result<LoadedConfig> {
     team_refs.extend(config.teams.iter().cloned());
     for team_ref in &team_refs {
         match load_team_config(team_ref) {
-            Ok((team_config, warnings)) => {
+            Ok((mut team_config, warnings)) => {
+                apply_backlog_choice(team_ref, &mut team_config);
                 for w in warnings {
                     load_errors.push(format!("team '{}': {w}", team_ref.id));
                 }
@@ -136,6 +137,15 @@ pub fn load_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
     json5::from_str(&content)
         .with_context(|| format!("Failed to parse config file: {}", path.display()))
+}
+
+/// The backlog tab is a per-user choice: when the team ref opts out, its
+/// backlog sources are dropped before the team reaches the app, so tabs,
+/// fetches and OAuth scopes all follow. Unset means enabled.
+fn apply_backlog_choice(team_ref: &TeamRef, config: &mut TeamConfig) {
+    if !team_ref.backlog.unwrap_or(true) {
+        config.sources.retain(|s| s.kind != SourceKind::Backlog);
+    }
 }
 
 /// Load a single team config from disk. Returns the parsed config plus
@@ -734,7 +744,7 @@ mod tests {
             company: Some(types::CompanyRef {
                 url: None,
                 path: dir.path().to_string_lossy().into_owned(),
-                teams: teams.iter().map(ToString::to_string).collect(),
+                teams: teams.iter().map(|&t| t.into()).collect(),
             }),
             ..Default::default()
         }
@@ -805,6 +815,7 @@ mod tests {
                 id: "personal".into(),
                 path: "/tmp/personal".into(),
                 file: None,
+                backlog: None,
             }],
             ..Default::default()
         };
@@ -827,6 +838,82 @@ mod tests {
             ..Default::default()
         };
         assert!(!has_team_refs(&company_no_selection));
+    }
+
+    #[test]
+    fn company_selection_gates_backlog_sources_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("company.json5"),
+            r#"{
+                name: "Acme",
+                jira: { base_url: "https://acme.atlassian.net" },
+                teams: [{ id: "platform" }],
+            }"#,
+        )
+        .expect("write manifest");
+        let team_dir = dir.path().join("teams/platform");
+        std::fs::create_dir_all(&team_dir).expect("team dir");
+        std::fs::write(
+            team_dir.join("do-next.json5"),
+            r#"{ sources: [
+                { id: "mine", jql: "assignee = currentUser()" },
+                { id: "bl", kind: "backlog", board: { board_id: 7 } },
+            ] }"#,
+        )
+        .expect("write team config");
+
+        let load_platform = |teams_json: &str| {
+            let mut config: Config = json5::from_str(&format!(
+                r#"{{ company: {{ path: "{}", teams: [{teams_json}] }} }}"#,
+                dir.path().display()
+            ))
+            .expect("valid config");
+            let mut errors = Vec::new();
+            let refs = resolve_company(&mut config, &mut errors);
+            assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+            let (mut team, _) = load_team_config(&refs[0]).expect("team loads");
+            apply_backlog_choice(&refs[0], &mut team);
+            team
+        };
+
+        // The shortcut form (and rich form without the flag) opts out.
+        for teams_json in [r#""platform""#, r#"{ id: "platform" }"#] {
+            let team = load_platform(teams_json);
+            assert_eq!(team.sources.len(), 1, "selection: {teams_json}");
+            assert_eq!(team.sources[0].kind, SourceKind::Jira);
+        }
+        // The rich form with backlog: true keeps the backlog source.
+        let team = load_platform(r#"{ id: "platform", backlog: true }"#);
+        assert_eq!(team.sources.len(), 2);
+    }
+
+    // ── apply_backlog_choice ──────────────────────────────────────────────
+
+    fn ref_with_backlog(backlog: Option<bool>) -> TeamRef {
+        TeamRef {
+            id: "t".into(),
+            path: "/tmp/t".into(),
+            file: None,
+            backlog,
+        }
+    }
+
+    #[test]
+    fn backlog_sources_stay_unless_opted_out() {
+        for keep in [None, Some(true)] {
+            let mut team = team_with_kinds(&[SourceKind::Backlog, SourceKind::Board]);
+            apply_backlog_choice(&ref_with_backlog(keep), &mut team);
+            assert_eq!(team.sources.len(), 2, "backlog: {keep:?}");
+        }
+    }
+
+    #[test]
+    fn opting_out_drops_only_backlog_sources() {
+        let mut team = team_with_kinds(&[SourceKind::Backlog, SourceKind::Board, SourceKind::Jira]);
+        apply_backlog_choice(&ref_with_backlog(Some(false)), &mut team);
+        let kinds: Vec<SourceKind> = team.sources.iter().map(|s| s.kind).collect();
+        assert_eq!(kinds, vec![SourceKind::Board, SourceKind::Jira]);
     }
 
     // ── extra_scopes_for ──────────────────────────────────────────────────
@@ -1233,4 +1320,3 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     }
     PathBuf::from(path)
 }
-

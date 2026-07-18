@@ -10,13 +10,15 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::company as company_cfg;
 use crate::config::company::CompanyManifest;
-use crate::config::types::{CompanyRef, Config, JiraConfig, TeamConfig};
+use crate::config::types::{
+    CompanyRef, CompanyTeamSelection, Config, JiraConfig, SourceKind, TeamConfig,
+};
 use crate::config::{LoadedConfig, extra_scopes_for};
 use crate::jira::auth::OAuthStore;
 
 use super::{
-    StorageChoice, apply_token_storage, prompt, prompt_oauth_storage, prompt_token_storage,
-    prompt_yes_no, run_multi_selection,
+    MultiRow, StorageChoice, apply_token_storage, prompt, prompt_oauth_storage,
+    prompt_token_storage, prompt_yes_no, run_multi_selection,
 };
 
 /// First-run "Join a company" branch: writes a fresh user config, then loads
@@ -49,7 +51,8 @@ pub fn run_company_join_command(raw: &mut Config, source: &str) -> Result<()> {
     Ok(())
 }
 
-/// `do-next company teams`: re-run the team picker over the manifest catalog.
+/// `do-next company teams`: re-run the team picker (including the per-team
+/// backlog opt-in sub-rows) over the manifest catalog.
 pub fn run_company_teams_command(raw: &mut Config) -> Result<()> {
     let Some(company) = raw.company.clone() else {
         bail!("No company configured. Run `do-next company join <url>` first.");
@@ -63,14 +66,15 @@ pub fn run_company_teams_command(raw: &mut Config) -> Result<()> {
     let old_extra = extra_scopes_for(&old_configs);
 
     let picked = pick_teams(&dir, &manifest, &company.teams)?;
-    let new_extra = extra_scopes_for(picked.iter().map(|(_, tc)| tc));
-    let ids: Vec<String> = picked.into_iter().map(|(id, _)| id).collect();
+    let new_extra = selection_scopes(&picked);
+    let selections: Vec<CompanyTeamSelection> =
+        picked.into_iter().map(|(selection, _)| selection).collect();
 
     if let Some(c) = raw.company.as_mut() {
-        c.teams.clone_from(&ids);
+        c.teams.clone_from(&selections);
     }
     write_user_config(raw)?;
-    println!("Active company teams: {}", ids.join(", "));
+    println!("Active company teams: {}", describe_selections(&selections));
 
     let effective = company_cfg::apply_company_defaults(&raw.jira, &manifest);
     let needs_more_scopes =
@@ -95,33 +99,71 @@ pub(super) fn join_company_into(config: &mut Config, source: &str) -> Result<()>
     println!();
 
     let picked = pick_teams(&dir, &manifest, &[])?;
-    let extra = extra_scopes_for(picked.iter().map(|(_, tc)| tc));
+    let extra = selection_scopes(&picked);
     let auth = run_company_auth(&manifest, extra)?;
     apply_auth_fields(config, &manifest, auth);
 
     config.company = Some(CompanyRef {
         url,
         path: dir.to_string_lossy().into_owned(),
-        teams: picked.into_iter().map(|(id, _)| id).collect(),
+        teams: picked.into_iter().map(|(selection, _)| selection).collect(),
     });
     write_user_config(config)
 }
 
 /// Best-effort load of the team configs behind a selection; entries that
 /// fail to parse simply don't contribute (used only for scope comparison).
+/// Backlog sources the selection opted out of are dropped, mirroring the
+/// load pipeline, so scopes reflect what actually runs.
 fn load_selected_team_configs(
     dir: &Path,
     manifest: &CompanyManifest,
-    selected: &[String],
+    selected: &[CompanyTeamSelection],
 ) -> Vec<TeamConfig> {
     let (refs, _) = company_cfg::company_team_refs(dir, manifest, selected);
     refs.iter()
         .filter_map(|r| {
             let path = crate::config::expand_tilde(&r.path)
                 .join(r.file.as_deref().unwrap_or("do-next.json5"));
-            crate::config::load_file(&path).ok()
+            let mut config: TeamConfig = crate::config::load_file(&path).ok()?;
+            if !r.backlog.unwrap_or(true) {
+                config.sources.retain(|s| s.kind != SourceKind::Backlog);
+            }
+            Some(config)
         })
         .collect()
+}
+
+/// Scopes a selection needs, ignoring backlog sources on teams that keep the
+/// backlog tab off (they would otherwise force the `board` scope for nothing).
+fn selection_scopes(
+    picked: &[(CompanyTeamSelection, TeamConfig)],
+) -> crate::jira::oauth::ExtraScopes {
+    let effective: Vec<TeamConfig> = picked
+        .iter()
+        .map(|(selection, config)| {
+            let mut config = config.clone();
+            if !selection.backlog() {
+                config.sources.retain(|s| s.kind != SourceKind::Backlog);
+            }
+            config
+        })
+        .collect();
+    extra_scopes_for(&effective)
+}
+
+fn describe_selections(selections: &[CompanyTeamSelection]) -> String {
+    selections
+        .iter()
+        .map(|s| {
+            if s.backlog() {
+                format!("{} (+backlog)", s.id())
+            } else {
+                s.id().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A local directory containing `company.json5` is used in place; anything
@@ -158,13 +200,15 @@ fn resolve_source(source: &str) -> Result<(Option<String>, PathBuf)> {
 }
 
 /// Multi-select over the manifest catalog. Entries whose config fails to
-/// parse are shown but can't be selected. Returns the picked ids with their
-/// already-parsed team configs (used for scope computation).
+/// parse are shown but can't be selected. Teams with a backlog source get a
+/// dependent sub-row for the (opt-in) backlog tab, greyed out while the team
+/// itself is unselected. Returns the picked selections with their
+/// already-parsed team configs, in catalog order.
 fn pick_teams(
     dir: &Path,
     manifest: &CompanyManifest,
-    preselected_ids: &[String],
-) -> Result<Vec<(String, TeamConfig)>> {
+    preselected: &[CompanyTeamSelection],
+) -> Result<Vec<(CompanyTeamSelection, TeamConfig)>> {
     if manifest.teams.is_empty() {
         bail!(
             "the company manifest has no teams in its catalog — \
@@ -172,18 +216,18 @@ fn pick_teams(
         );
     }
 
+    const BACKLOG_LABEL: &str = "backlog";
     let label_width = manifest
         .teams
         .iter()
         .map(|t| t.display_name().chars().count())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(BACKLOG_LABEL.chars().count() + 2);
 
-    let mut labels = Vec::new();
-    let mut descriptions = Vec::new();
-    let mut tags = Vec::new();
-    let mut preselected = Vec::new();
-    let mut selectable = Vec::new();
+    let mut rows: Vec<MultiRow> = Vec::new();
+    // Manifest index → (team row, optional backlog sub-row).
+    let mut row_map: Vec<(usize, Option<usize>)> = Vec::new();
     let mut configs: Vec<Option<TeamConfig>> = Vec::new();
 
     for entry in &manifest.teams {
@@ -191,40 +235,68 @@ fn pick_teams(
             .join(entry.rel_path())
             .join(entry.file.as_deref().unwrap_or("do-next.json5"));
         let loaded: Result<TeamConfig> = crate::config::load_file(&config_path);
-        labels.push(format!("{:<label_width$}", entry.display_name()));
-        descriptions.push(entry.description.clone().unwrap_or_default());
         let ok = loaded.is_ok();
-        tags.push(if ok {
-            String::new()
-        } else {
-            "  [config error]".into()
-        });
-        selectable.push(ok);
-        let wanted = if preselected_ids.is_empty() {
+        let wanted = if preselected.is_empty() {
             entry.default
         } else {
-            preselected_ids.contains(&entry.id)
+            preselected.iter().any(|s| s.id() == entry.id)
         };
-        preselected.push(wanted && ok);
+        let team_row = rows.len();
+        rows.push(MultiRow {
+            label: format!("{:<label_width$}", entry.display_name()),
+            description: entry.description.clone().unwrap_or_default(),
+            tag: if ok {
+                String::new()
+            } else {
+                "  [config error]".into()
+            },
+            checked: wanted && ok,
+            selectable: ok,
+            parent: None,
+        });
+        let has_backlog = loaded
+            .as_ref()
+            .is_ok_and(|tc| tc.sources.iter().any(|s| s.kind == SourceKind::Backlog));
+        let backlog_row = has_backlog.then(|| {
+            let sub_row = rows.len();
+            rows.push(MultiRow {
+                // The renderer indents sub-rows by two columns; the shorter
+                // label keeps the description column aligned.
+                label: format!("{BACKLOG_LABEL:<width$}", width = label_width - 2),
+                description: "optional tab: rank issues, send to sprint".into(),
+                tag: String::new(),
+                // A sub-row never starts checked under an unchecked parent,
+                // matching the toggle behavior (unchecking a team clears it).
+                checked: wanted
+                    && ok
+                    && preselected
+                        .iter()
+                        .any(|s| s.id() == entry.id && s.backlog()),
+                selectable: true,
+                parent: Some(team_row),
+            });
+            sub_row
+        });
+        row_map.push((team_row, backlog_row));
         configs.push(loaded.ok());
     }
 
-    let picked = run_multi_selection(
-        "Which teams do you want on your board?",
-        &labels,
-        &descriptions,
-        &tags,
-        &preselected,
-        &selectable,
-    )?;
+    let picked: std::collections::HashSet<usize> =
+        run_multi_selection("Which teams do you want on your board?", &rows, false)?
+            .into_iter()
+            .collect();
 
-    Ok(picked
-        .into_iter()
-        .map(|i| {
+    Ok(manifest
+        .teams
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| picked.contains(&row_map[*i].0))
+        .map(|(i, entry)| {
+            let backlog = row_map[i].1.is_some_and(|r| picked.contains(&r));
             let config = configs[i]
                 .take()
                 .expect("unselectable rows can't be picked");
-            (manifest.teams[i].id.clone(), config)
+            (CompanyTeamSelection::new(entry.id.clone(), backlog), config)
         })
         .collect())
 }

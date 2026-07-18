@@ -60,7 +60,7 @@ enum Commands {
 enum CompanyAction {
     /// Join a company config repo (git URL or local path)
     Join { source: String },
-    /// Change which company teams are active
+    /// Change which company teams are active and toggle their backlog tabs
     Teams,
 }
 

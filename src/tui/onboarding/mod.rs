@@ -191,6 +191,7 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
         id: "personal".into(),
         path: team_dir.to_string_lossy().into_owned(),
         file: None,
+        backlog: None,
     };
 
     let config = Config {
@@ -425,6 +426,7 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
             id: "personal".into(),
             path: team_dir.to_string_lossy().into_owned(),
             file: None,
+            backlog: None,
         };
         (tr, tc, config.jira.clone())
     } else {
@@ -460,6 +462,7 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
             id: id.clone(),
             path: path.clone(),
             file: None,
+            backlog: None,
         };
         println!("Team '{id}' added from {path}");
         (tr, tc, jira)
@@ -764,32 +767,61 @@ pub(super) fn run_selection(
     }
 }
 
-/// Render a vertical multi-select list and return the checked indices.
-/// Space toggles, Enter confirms (at least one selection required),
-/// Esc/q cancels. `selectable[i] == false` rows can't be toggled.
+/// One row of a multi-select list. `parent` links a dependent sub-row to an
+/// earlier row: the sub-row only toggles (and only counts as selected) while
+/// its parent is checked, and renders greyed out otherwise.
+pub(super) struct MultiRow {
+    pub label: String,
+    pub description: String,
+    pub tag: String,
+    pub checked: bool,
+    pub selectable: bool,
+    pub parent: Option<usize>,
+}
+
+/// A row can be toggled when it's selectable and its parent (if any) is
+/// currently checked.
+fn row_enabled(rows: &[MultiRow], checked: &[bool], i: usize) -> bool {
+    rows[i].selectable && rows[i].parent.is_none_or(|p| checked[p])
+}
+
+/// Checked rows that actually count. Toggling keeps sub-rows of unchecked
+/// parents cleared; the parent guard here covers stray preselections.
+fn effective_indices(rows: &[MultiRow], checked: &[bool]) -> Vec<usize> {
+    (0..rows.len())
+        .filter(|&i| checked[i] && rows[i].parent.is_none_or(|p| checked[p]))
+        .collect()
+}
+
+/// Flip row `i`; unchecking a parent also clears its sub-rows, so a greyed
+/// out checkbox is never left ticked — what's shown is what confirms.
+fn toggle_row(rows: &[MultiRow], checked: &mut [bool], i: usize) {
+    checked[i] = !checked[i];
+    if !checked[i] {
+        for (j, row) in rows.iter().enumerate() {
+            if row.parent == Some(i) {
+                checked[j] = false;
+            }
+        }
+    }
+}
+
+/// Render a vertical multi-select list and return the effectively checked
+/// indices. Space toggles, Enter confirms (at least one top-level selection
+/// required unless `allow_empty`), Esc/q cancels. Rows with `selectable ==
+/// false` can't be toggled; sub-rows only while their parent is checked.
 pub(super) fn run_multi_selection(
     title: &str,
-    labels: &[String],
-    descriptions: &[String],
-    tags: &[String],
-    preselected: &[bool],
-    selectable: &[bool],
+    rows: &[MultiRow],
+    allow_empty: bool,
 ) -> Result<Vec<usize>> {
-    let count = labels.len();
+    let count = rows.len();
 
     println!("{title}");
     println!();
-    let mut checked: Vec<bool> = preselected.to_vec();
+    let mut checked: Vec<bool> = rows.iter().map(|r| r.checked).collect();
     let mut cursor = 0;
-    render_multi_options(
-        labels,
-        descriptions,
-        tags,
-        &checked,
-        selectable,
-        cursor,
-        false,
-    )?;
+    render_multi_options(rows, &checked, cursor, false)?;
     render_multi_hint()?;
     io::stdout().flush()?;
 
@@ -805,15 +837,7 @@ pub(super) fn run_multi_selection(
             MoveUp(lines),
             Clear(ClearType::FromCursorDown)
         )?;
-        render_multi_options(
-            labels,
-            descriptions,
-            tags,
-            checked,
-            selectable,
-            cursor,
-            confirmed,
-        )?;
+        render_multi_options(rows, checked, cursor, confirmed)?;
         render_multi_hint()?;
         io::stdout().flush()?;
         Ok(())
@@ -833,17 +857,18 @@ pub(super) fn run_multi_selection(
                     redraw(&checked, cursor, false)?;
                 }
                 KeyCode::Char(' ') => {
-                    if selectable.get(cursor).copied().unwrap_or(true) {
-                        checked[cursor] = !checked[cursor];
+                    if row_enabled(rows, &checked, cursor) {
+                        toggle_row(rows, &mut checked, cursor);
                         redraw(&checked, cursor, false)?;
                     }
                 }
                 KeyCode::Enter => {
-                    if checked.iter().any(|&c| c) {
+                    let effective = effective_indices(rows, &checked);
+                    if allow_empty || effective.iter().any(|&i| rows[i].parent.is_none()) {
                         redraw(&checked, cursor, true)?;
                         disable_raw_mode()?;
                         println!();
-                        return Ok((0..count).filter(|&i| checked[i]).collect());
+                        return Ok(effective);
                     }
                     // At least one selection required — ignore Enter.
                 }
@@ -870,38 +895,48 @@ pub(super) fn run_multi_selection(
 }
 
 fn render_multi_options(
-    labels: &[String],
-    descriptions: &[String],
-    tags: &[String],
+    rows: &[MultiRow],
     checked: &[bool],
-    selectable: &[bool],
     cursor: usize,
     confirmed: bool,
 ) -> Result<()> {
-    for i in 0..labels.len() {
+    for (i, row) in rows.iter().enumerate() {
         let pointer = if i == cursor && !confirmed { ">" } else { " " };
-        let tag = tags.get(i).map_or("", String::as_str);
-        let row = format!("{}   {}{}", labels[i], descriptions[i], tag);
-        if checked[i] && confirmed {
+        // Sub-rows shift right as a whole, checkbox included.
+        let indent = if row.parent.is_some() { "  " } else { "" };
+        let text = format!("{}   {}{}", row.label, row.description, row.tag);
+        let effective = checked[i] && row.parent.is_none_or(|p| checked[p]);
+        if effective && confirmed {
             crossterm::execute!(
                 io::stdout(),
-                Print("  "),
+                Print(format!("  {indent}")),
                 SetForegroundColor(Color::Green),
                 Print("[\u{2713}] "),
                 ResetColor,
-                Print(format!("{row}\r\n")),
+                Print(format!("{text}\r\n")),
             )?;
-        } else if !selectable.get(i).copied().unwrap_or(true) {
+        } else if !row.selectable {
             crossterm::execute!(
                 io::stdout(),
-                Print(format!("{pointer} ")),
+                Print(format!("{pointer} {indent}")),
                 SetForegroundColor(Color::DarkGrey),
-                Print(format!("[-] {row}\r\n")),
+                Print(format!("[-] {text}\r\n")),
+                ResetColor,
+            )?;
+        } else if !row_enabled(rows, checked, i) {
+            // Sub-row whose parent is unchecked: inert and always unticked
+            // (toggling the parent off clears it), so the grey box never
+            // suggests a choice that won't apply.
+            crossterm::execute!(
+                io::stdout(),
+                Print(format!("{pointer} {indent}")),
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!("[ ] {text}\r\n")),
                 ResetColor,
             )?;
         } else {
             let mark = if checked[i] { "[x]" } else { "[ ]" };
-            print!("{pointer} {mark} {row}\r\n");
+            print!("{pointer} {indent}{mark} {text}\r\n");
         }
     }
     Ok(())
@@ -1372,4 +1407,67 @@ pub(super) fn prompt_masked(message: &str) -> Result<String> {
     disable_raw_mode()?;
     println!();
     Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(selectable: bool, parent: Option<usize>) -> MultiRow {
+        MultiRow {
+            label: String::new(),
+            description: String::new(),
+            tag: String::new(),
+            checked: false,
+            selectable,
+            parent,
+        }
+    }
+
+    #[test]
+    fn sub_row_toggles_only_while_parent_is_checked() {
+        let rows = [row(true, None), row(true, Some(0))];
+        assert!(!row_enabled(&rows, &[false, false], 1));
+        assert!(row_enabled(&rows, &[true, false], 1));
+        // The parent itself never depends on anyone.
+        assert!(row_enabled(&rows, &[false, false], 0));
+        // Unselectable rows stay off-limits even with a checked parent.
+        let rows = [row(true, None), row(false, Some(0))];
+        assert!(!row_enabled(&rows, &[true, false], 1));
+    }
+
+    #[test]
+    fn checked_sub_row_of_unchecked_parent_is_inert() {
+        let rows = [row(true, None), row(true, Some(0)), row(true, None)];
+        assert_eq!(effective_indices(&rows, &[false, true, true]), vec![2]);
+        assert_eq!(effective_indices(&rows, &[true, true, false]), vec![0, 1]);
+        assert_eq!(effective_indices(&rows, &[true, false, true]), vec![0, 2]);
+    }
+
+    #[test]
+    fn unchecking_a_parent_clears_its_sub_rows() {
+        let rows = [
+            row(true, None),
+            row(true, Some(0)),
+            row(true, None),
+            row(true, Some(2)),
+        ];
+        let mut checked = vec![true, true, true, true];
+        toggle_row(&rows, &mut checked, 0);
+        // Row 0 and its sub-row cleared; the other pair untouched.
+        assert_eq!(checked, vec![false, false, true, true]);
+        // Re-checking the parent does not resurrect the sub-row.
+        toggle_row(&rows, &mut checked, 0);
+        assert_eq!(checked, vec![true, false, true, true]);
+    }
+
+    #[test]
+    fn toggling_a_sub_row_touches_only_itself() {
+        let rows = [row(true, None), row(true, Some(0))];
+        let mut checked = vec![true, true];
+        toggle_row(&rows, &mut checked, 1);
+        assert_eq!(checked, vec![true, false]);
+        toggle_row(&rows, &mut checked, 1);
+        assert_eq!(checked, vec![true, true]);
+    }
 }
