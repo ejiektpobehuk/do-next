@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use super::types::{CompanyTeamSelection, ConfluenceConfig, JiraConfig, TeamRef};
+use super::types::{CompanyTeamSelection, ConfluenceConfig, GrafanaConfig, JiraConfig, TeamRef};
 
 /// Manifest file name at the root of a company config repo.
 pub const MANIFEST_FILE: &str = "company.json5";
@@ -49,6 +49,8 @@ pub struct CompanyDefaults {
     pub confluence: Option<ConfluenceConfig>,
     pub slack_team_id: Option<String>,
     pub open_slack_in_app: Option<bool>,
+    /// Grafana `OnCall` connection defaults (e.g. the company's API URL).
+    pub grafana: Option<GrafanaConfig>,
 }
 
 /// One entry in the manifest's team catalog.

@@ -1,4 +1,5 @@
 mod company;
+pub mod grafana;
 
 pub use company::{run_company_join_command, run_company_teams_command};
 
@@ -61,12 +62,16 @@ const TOKEN_STORAGE_LABELS: [&str; TOKEN_STORAGE_COUNT] = [
     "Environment var ",
 ];
 
-const TOKEN_STORAGE_DESCRIPTIONS: [&str; TOKEN_STORAGE_COUNT] = [
-    KEYRING_DESCRIPTION,
-    "~/.config/do-next/credentials.json5 (chmod 600)",
-    "fetch via shell command (pass, bitwarden CLI, …)",
-    "set DO_NEXT_JIRA_API_TOKEN env manually",
-];
+/// Storage menu descriptions; the env row names the flow's own variable
+/// (Jira vs Grafana).
+fn token_storage_descriptions(env_var: &str) -> [String; TOKEN_STORAGE_COUNT] {
+    [
+        KEYRING_DESCRIPTION.into(),
+        "~/.config/do-next/credentials.json5 (chmod 600)".into(),
+        "fetch via shell command (pass, bitwarden CLI, …)".into(),
+        format!("set {env_var} env manually"),
+    ]
+}
 
 const KEYRING_DESCRIPTION: &str = if cfg!(target_os = "macos") {
     "macOS Keychain (recommended)"
@@ -135,7 +140,7 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
     println!();
     let storage = match auth_method {
         AuthMethod::OAuth => prompt_oauth_storage(None)?,
-        AuthMethod::PersonalToken => prompt_token_storage(None, None)?,
+        AuthMethod::PersonalToken => prompt_token_storage(None, None, "DO_NEXT_JIRA_API_TOKEN")?,
     };
 
     // Step 3: email (only for personal token).
@@ -230,6 +235,8 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
         jira: jira_config,
         open_slack_in_app: true,
         slack_team_id: None,
+        grafana: None,
+        on_duty: false,
     };
 
     Ok(LoadedConfig {
@@ -274,7 +281,9 @@ pub fn run_auth_reset(
     let current_storage = detect_storage_method(effective_jira);
     let storage = match auth_method {
         AuthMethod::OAuth => prompt_oauth_storage(Some(&current_storage))?,
-        AuthMethod::PersonalToken => prompt_token_storage(Some(&current_storage), Some(&status))?,
+        AuthMethod::PersonalToken => {
+            prompt_token_storage(Some(&current_storage), Some(&status), "DO_NEXT_JIRA_API_TOKEN")?
+        }
     };
 
     // The company manifest supplies the OAuth app when the user hasn't set
@@ -484,6 +493,8 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
         jira: team_jira,
         open_slack_in_app: true,
         slack_team_id: None,
+        grafana: None,
+        on_duty: false,
     };
 
     Ok(LoadedConfig {
@@ -1064,6 +1075,7 @@ pub(super) fn prompt_oauth_storage(current: Option<&StorageChoice>) -> Result<St
 pub(super) fn prompt_token_storage(
     current: Option<&StorageChoice>,
     status: Option<&CredentialStatus>,
+    env_var: &str,
 ) -> Result<StorageChoice> {
     let current_idx = current.map(|c| match c {
         StorageChoice::Keyring => 0,
@@ -1074,11 +1086,13 @@ pub(super) fn prompt_token_storage(
     let default = current_idx.unwrap_or(0);
 
     let tags = build_token_storage_tags(status);
+    let descriptions = token_storage_descriptions(env_var);
+    let descriptions: Vec<&str> = descriptions.iter().map(String::as_str).collect();
 
     let idx = run_selection(
         "How would you like to store your API token?",
         &TOKEN_STORAGE_LABELS,
-        &TOKEN_STORAGE_DESCRIPTIONS,
+        &descriptions,
         &tags,
         default,
         current_idx,

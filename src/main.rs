@@ -1,6 +1,7 @@
 mod config;
 mod confluence;
 mod events;
+mod grafana;
 mod items;
 mod jira;
 mod sources;
@@ -100,6 +101,21 @@ async fn main() -> Result<()> {
         let effective_jira = loaded.config.jira.clone();
         tui::onboarding::run_auth_reset(&effective_jira, &mut loaded.raw, extra_scopes)
             .context("Auth reset failed")?;
+        // Teams using the on-call view also carry a Grafana OnCall token;
+        // offer to (re)configure it — this is the rotation path.
+        let grafana_teams = grafana::grafana_api_urls(&loaded.teams);
+        if !grafana_teams.is_empty()
+            && tui::onboarding::prompt_yes_no(
+                "\nAlso configure the Grafana OnCall token (on-call view)? [y/N]: ",
+                false,
+            )?
+        {
+            for target in &grafana_teams {
+                tui::onboarding::grafana::setup_grafana_token(target, &mut loaded.raw)
+                    .await
+                    .context("Grafana token setup failed")?;
+            }
+        }
         return Ok(());
     }
 
@@ -172,6 +188,36 @@ async fn main() -> Result<()> {
             eprintln!("error: {e}");
         }
         anyhow::bail!("no teams loaded successfully; fix the errors above and retry");
+    }
+
+    // Grafana OnCall check: teams with a `grafana` block get their sources
+    // replaced by `on_duty_sources` while the user is on call. TUI launch
+    // only — subcommands shouldn't block on a network check. Must run before
+    // client construction so Confluence needs and fetches see the effective
+    // source set.
+    if cli.command.is_none() {
+        // Teams that want the on-call view but have no token anywhere get an
+        // interactive setup offer first (like the Jira auth prompts).
+        // Declining skips for this launch only; `do-next auth` works any time.
+        let missing = grafana::teams_missing_token(&loaded.teams);
+        if !missing.is_empty() {
+            let mut configured = false;
+            for target in &missing {
+                match tui::onboarding::grafana::setup_grafana_token(target, &mut loaded.raw).await
+                {
+                    Ok(tui::onboarding::grafana::SetupOutcome::Configured) => configured = true,
+                    Ok(_) => {}
+                    // A failed setup must not block the launch; the on-call
+                    // check below reports the still-missing token.
+                    Err(e) => eprintln!("warning: Grafana token setup failed: {e:#}"),
+                }
+            }
+            if configured {
+                loaded = config::load().context("Failed to reload configuration")?;
+            }
+        }
+        let duty_errors = grafana::apply_on_duty_sources(&mut loaded.teams).await;
+        loaded.load_errors.extend(duty_errors);
     }
 
     // Build one JiraClient per unique base_url across all teams.

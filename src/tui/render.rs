@@ -330,7 +330,13 @@ fn render_tab_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
         // Board/backlog tabs are labelled by the source's display name and
         // prefixed to read as a distinct kind of tab (▤ board, ≡ backlog).
         let label = board.as_ref().map_or_else(
-            || format!(" {} ", team.id),
+            || {
+                if team.on_duty {
+                    format!(" {} (on-call) ", team.id)
+                } else {
+                    format!(" {} ", team.id)
+                }
+            },
             |src_id| {
                 let src = source_config_for(&team.config, src_id);
                 let name = src.map_or(src_id.as_str(), |s| s.display_name());

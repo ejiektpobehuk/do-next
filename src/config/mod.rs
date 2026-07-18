@@ -8,8 +8,8 @@ use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
 use types::{
-    Config, ConfluenceConfig, JiraConfig, ResolvedTeam, SourceKind, TeamConfig, TeamJiraOverride,
-    TeamRef,
+    Config, ConfluenceConfig, GrafanaConfig, JiraConfig, ResolvedGrafana, ResolvedTeam,
+    SourceKind, TeamConfig, TeamGrafanaConfig, TeamJiraOverride, TeamRef,
 };
 
 /// Result of loading user config + all team configs.
@@ -61,6 +61,14 @@ pub fn load() -> Result<LoadedConfig> {
                     .slack_team_id
                     .clone()
                     .or_else(|| config.slack_team_id.clone());
+                let (grafana, grafana_error) = resolve_team_grafana(
+                    config.grafana.as_ref(),
+                    team_config.grafana.as_ref(),
+                    &team_ref.id,
+                );
+                if let Some(e) = grafana_error {
+                    load_errors.push(e);
+                }
                 teams.push(ResolvedTeam {
                     id: team_ref.id.clone(),
                     path: team_ref.path.clone(),
@@ -69,6 +77,8 @@ pub fn load() -> Result<LoadedConfig> {
                     confluence,
                     open_slack_in_app,
                     slack_team_id,
+                    grafana,
+                    on_duty: false,
                 });
             }
             Err(e) => {
@@ -114,9 +124,82 @@ fn resolve_company(config: &mut Config, load_errors: &mut Vec<String>) -> Vec<Te
     if config.open_slack_in_app.is_none() {
         config.open_slack_in_app = manifest.defaults.open_slack_in_app;
     }
+    apply_grafana_defaults(&mut config.grafana, manifest.defaults.grafana.as_ref());
     let (refs, errors) = company::company_team_refs(&dir, &manifest, &company_ref.teams);
     load_errors.extend(errors);
     refs
+}
+
+/// Fill unset user Grafana fields from the company defaults, field by field:
+/// a user may set only `credential_command` while taking the company
+/// `oncall_api_url`. Precedence stays: team override > user config > company
+/// manifest.
+fn apply_grafana_defaults(user: &mut Option<GrafanaConfig>, company: Option<&GrafanaConfig>) {
+    let Some(company) = company else {
+        return;
+    };
+    let user = user.get_or_insert_with(GrafanaConfig::default);
+    if user.oncall_api_url.is_none() {
+        user.oncall_api_url.clone_from(&company.oncall_api_url);
+    }
+    if user.instance_url.is_none() {
+        user.instance_url.clone_from(&company.instance_url);
+    }
+    if user.credential_command.is_none() {
+        user.credential_command
+            .clone_from(&company.credential_command);
+    }
+    if user.credential_store.is_none() {
+        user.credential_store.clone_from(&company.credential_store);
+    }
+    if user.credential_key.is_none() {
+        user.credential_key.clone_from(&company.credential_key);
+    }
+}
+
+/// Combine a team's `grafana` block (schedule + duty sources) with the
+/// company-merged user connection settings into the effective settings.
+/// Returns `(None, Some(error))` when the block is present but the
+/// connection is unusable — the team keeps its normal sources and the error
+/// surfaces as a non-fatal load error. `schedule` and `on_duty_sources`
+/// presence is enforced fatally by `validate_team_config`.
+fn resolve_team_grafana(
+    user: Option<&GrafanaConfig>,
+    team: Option<&TeamGrafanaConfig>,
+    team_id: &str,
+) -> (Option<ResolvedGrafana>, Option<String>) {
+    let Some(team) = team else {
+        return (None, None);
+    };
+    let Some(oncall_api_url) = user.and_then(|u| u.oncall_api_url.clone()) else {
+        return (
+            None,
+            Some(format!(
+                "team '{team_id}': grafana.oncall_api_url is not set (set it in your \
+                 config.json5 or the company manifest `defaults.grafana`)"
+            )),
+        );
+    };
+    let Some(schedule) = team.schedule.clone() else {
+        // Unreachable after validation; defensive for direct callers.
+        return (
+            None,
+            Some(format!("team '{team_id}': grafana.schedule is not set")),
+        );
+    };
+    (
+        Some(ResolvedGrafana {
+            oncall_api_url,
+            instance_url: user.and_then(|u| u.instance_url.clone()),
+            schedule,
+            mode: team.mode,
+            on_duty_sources: team.on_duty_sources.clone(),
+            credential_command: user.and_then(|u| u.credential_command.clone()),
+            credential_store: user.and_then(|u| u.credential_store.clone()),
+            credential_key: user.and_then(|u| u.credential_key.clone()),
+        }),
+        None,
+    )
 }
 
 /// True when the config references any team, either manually or through a
@@ -145,6 +228,11 @@ pub fn load_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 fn apply_backlog_choice(team_ref: &TeamRef, config: &mut TeamConfig) {
     if !team_ref.backlog.unwrap_or(true) {
         config.sources.retain(|s| s.kind != SourceKind::Backlog);
+        if let Some(grafana) = &mut config.grafana {
+            grafana
+                .on_duty_sources
+                .retain(|s| s.kind != SourceKind::Backlog);
+        }
     }
 }
 
@@ -164,6 +252,34 @@ fn load_team_config(team_ref: &TeamRef) -> Result<(TeamConfig, Vec<String>)> {
 fn validate_team_config(team: &TeamConfig) -> Result<()> {
     for source in &team.sources {
         validate_source_config(source)?;
+    }
+    if let Some(grafana) = &team.grafana {
+        if grafana.schedule.is_none() {
+            return Err(anyhow!(
+                "grafana: set `schedule` to a schedule name or {{ id: ... }}"
+            ));
+        }
+        if grafana.on_duty_sources.is_empty() {
+            return Err(anyhow!(
+                "grafana: `on_duty_sources` must not be empty (it replaces `sources` while on call)"
+            ));
+        }
+        for source in &grafana.on_duty_sources {
+            validate_source_config(source)?;
+        }
+        // In prepend mode both sets are active at once — an id collision
+        // would produce two live sources with the same identity.
+        if grafana.mode == types::OnDutyMode::Prepend {
+            for duty in &grafana.on_duty_sources {
+                if team.sources.iter().any(|s| s.id == duty.id) {
+                    return Err(anyhow!(
+                        "grafana: on-duty source id '{}' collides with a normal source \
+                         (ids must be distinct in `prepend` mode)",
+                        duty.id
+                    ));
+                }
+            }
+        }
     }
     for (view_id, view) in &team.views {
         for section in &view.sections {
@@ -952,6 +1068,213 @@ mod tests {
         assert!(extra.board);
     }
 
+    // ── grafana on-duty config ────────────────────────────────────────────
+
+    fn duty_source(id: &str, kind: SourceKind) -> SourceConfig {
+        SourceConfig {
+            id: id.into(),
+            kind,
+            board: matches!(kind, SourceKind::Board | SourceKind::Backlog).then(|| {
+                types::BoardFilters {
+                    board_id: 7,
+                    ..Default::default()
+                }
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn team_grafana(sources: Vec<SourceConfig>) -> types::TeamGrafanaConfig {
+        types::TeamGrafanaConfig {
+            schedule: Some(types::ScheduleSelector::Name("primary".into())),
+            on_duty_sources: sources,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn grafana_block_requires_schedule_and_duty_sources() {
+        let mut grafana = team_grafana(vec![duty_source("inc", SourceKind::Jira)]);
+        grafana.schedule = None;
+        let team = TeamConfig {
+            grafana: Some(grafana),
+            ..Default::default()
+        };
+        let err = validate_team_config(&team).expect_err("missing schedule");
+        assert!(err.to_string().contains("schedule"), "{err}");
+
+        let team = TeamConfig {
+            grafana: Some(team_grafana(vec![])),
+            ..Default::default()
+        };
+        let err = validate_team_config(&team).expect_err("empty duty sources");
+        assert!(err.to_string().contains("on_duty_sources"), "{err}");
+    }
+
+    #[test]
+    fn grafana_duty_sources_validate_like_normal_sources() {
+        // A jira-kind source with confluence filters is invalid anywhere.
+        let bad = SourceConfig {
+            id: "inc".into(),
+            confluence: Some(types::ConfluenceFilters::default()),
+            ..Default::default()
+        };
+        let team = TeamConfig {
+            grafana: Some(team_grafana(vec![bad])),
+            ..Default::default()
+        };
+        assert!(validate_team_config(&team).is_err());
+
+        let team = TeamConfig {
+            grafana: Some(team_grafana(vec![duty_source("inc", SourceKind::Jira)])),
+            ..Default::default()
+        };
+        assert!(validate_team_config(&team).is_ok());
+    }
+
+    #[test]
+    fn prepend_mode_rejects_duty_ids_colliding_with_normal_sources() {
+        let mut grafana = team_grafana(vec![duty_source("mine", SourceKind::Jira)]);
+        grafana.mode = types::OnDutyMode::Prepend;
+        let team = TeamConfig {
+            sources: vec![duty_source("mine", SourceKind::Jira)],
+            grafana: Some(grafana),
+            ..Default::default()
+        };
+        let err = validate_team_config(&team).expect_err("collision in prepend mode");
+        assert!(err.to_string().contains("'mine'"), "{err}");
+        assert!(err.to_string().contains("prepend"), "{err}");
+
+        // Same collision is allowed in replace mode (only one set is active;
+        // the cache caveat is documented, not fatal).
+        let team = TeamConfig {
+            sources: vec![duty_source("mine", SourceKind::Jira)],
+            grafana: Some(team_grafana(vec![duty_source("mine", SourceKind::Jira)])),
+            ..Default::default()
+        };
+        assert!(validate_team_config(&team).is_ok());
+
+        // Distinct ids pass in prepend mode.
+        let mut grafana = team_grafana(vec![duty_source("duty", SourceKind::Jira)]);
+        grafana.mode = types::OnDutyMode::Prepend;
+        let team = TeamConfig {
+            sources: vec![duty_source("mine", SourceKind::Jira)],
+            grafana: Some(grafana),
+            ..Default::default()
+        };
+        assert!(validate_team_config(&team).is_ok());
+    }
+
+    #[test]
+    fn resolve_team_grafana_combines_user_connection_with_team_block() {
+        let user = GrafanaConfig {
+            oncall_api_url: Some("https://user.example/oncall".into()),
+            instance_url: Some("https://user.grafana.net".into()),
+            credential_command: Some("pass show oncall".into()),
+            ..Default::default()
+        };
+        let team = team_grafana(vec![duty_source("inc", SourceKind::Jira)]);
+        let (resolved, err) = resolve_team_grafana(Some(&user), Some(&team), "t");
+        assert!(err.is_none(), "{err:?}");
+        let resolved = resolved.expect("resolved");
+        // Connection comes from the user config (company-merged)...
+        assert_eq!(resolved.oncall_api_url, "https://user.example/oncall");
+        assert_eq!(
+            resolved.credential_command.as_deref(),
+            Some("pass show oncall")
+        );
+        assert_eq!(
+            resolved.instance_url.as_deref(),
+            Some("https://user.grafana.net")
+        );
+        // ...while schedule and duty sources come from the team block.
+        assert_eq!(
+            resolved.schedule,
+            types::ScheduleSelector::Name("primary".into())
+        );
+        assert_eq!(resolved.on_duty_sources.len(), 1);
+    }
+
+    #[test]
+    fn resolve_team_grafana_without_api_url_is_nonfatal() {
+        let team = team_grafana(vec![duty_source("inc", SourceKind::Jira)]);
+        let (resolved, err) = resolve_team_grafana(None, Some(&team), "t");
+        assert!(resolved.is_none());
+        let err = err.expect("error string");
+        assert!(err.contains("oncall_api_url"), "{err}");
+        assert!(err.contains("'t'"), "{err}");
+    }
+
+    #[test]
+    fn resolve_team_grafana_without_block_is_none() {
+        let user = GrafanaConfig {
+            oncall_api_url: Some("https://user.example/oncall".into()),
+            ..Default::default()
+        };
+        let (resolved, err) = resolve_team_grafana(Some(&user), None, "t");
+        assert!(resolved.is_none());
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn grafana_company_defaults_fill_only_unset_fields() {
+        let company = GrafanaConfig {
+            oncall_api_url: Some("https://company.example/oncall".into()),
+            credential_store: Some("keyring".into()),
+            ..Default::default()
+        };
+        // No user block at all: company defaults land wholesale.
+        let mut user = None;
+        apply_grafana_defaults(&mut user, Some(&company));
+        let filled = user.expect("filled from company");
+        assert_eq!(
+            filled.oncall_api_url.as_deref(),
+            Some("https://company.example/oncall")
+        );
+        assert_eq!(filled.credential_store.as_deref(), Some("keyring"));
+
+        // Partial user block: set fields win, unset fields fill in.
+        let mut user = Some(GrafanaConfig {
+            oncall_api_url: Some("https://mine.example/oncall".into()),
+            ..Default::default()
+        });
+        apply_grafana_defaults(&mut user, Some(&company));
+        let merged = user.expect("still present");
+        assert_eq!(
+            merged.oncall_api_url.as_deref(),
+            Some("https://mine.example/oncall")
+        );
+        assert_eq!(merged.credential_store.as_deref(), Some("keyring"));
+
+        // No company defaults: user config untouched.
+        let mut user = None;
+        apply_grafana_defaults(&mut user, None);
+        assert!(user.is_none());
+    }
+
+    #[test]
+    fn backlog_opt_out_also_drops_duty_backlog_sources() {
+        let mut team = team_with_kinds(&[SourceKind::Jira]);
+        team.grafana = Some(team_grafana(vec![
+            duty_source("inc", SourceKind::Jira),
+            duty_source("bl", SourceKind::Backlog),
+        ]));
+        apply_backlog_choice(&ref_with_backlog(Some(false)), &mut team);
+        let duty = &team.grafana.as_ref().unwrap().on_duty_sources;
+        assert_eq!(duty.len(), 1);
+        assert_eq!(duty[0].kind, SourceKind::Jira);
+    }
+
+    #[test]
+    fn extra_scopes_include_duty_sources() {
+        let mut team = team_with_kinds(&[SourceKind::Jira]);
+        team.grafana = Some(team_grafana(vec![duty_source("db", SourceKind::Board)]));
+        let teams = [team];
+        let extra = extra_scopes_for(&teams);
+        assert!(extra.board);
+        assert!(!extra.confluence);
+    }
+
     #[test]
     fn confluence_override_precedence_is_team_over_user_over_jira() {
         let jira = JiraConfig {
@@ -1300,7 +1623,13 @@ pub fn extra_scopes_for<'a>(
 ) -> crate::jira::oauth::ExtraScopes {
     let mut extra = crate::jira::oauth::ExtraScopes::default();
     for team in teams {
-        for source in &team.sources {
+        // Duty sources count too: scopes are minted at `do-next auth` time,
+        // but on-call status changes daily.
+        let duty_sources = team
+            .grafana
+            .iter()
+            .flat_map(|grafana| &grafana.on_duty_sources);
+        for source in team.sources.iter().chain(duty_sources) {
             match source.kind {
                 SourceKind::Confluence => extra.confluence = true,
                 SourceKind::Board | SourceKind::Backlog => extra.board = true,

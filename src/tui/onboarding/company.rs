@@ -327,7 +327,7 @@ fn run_company_auth(
     } else {
         println!("The company manifest defines no OAuth app — using a personal API token.");
         println!();
-        let storage = prompt_token_storage(None, None)?;
+        let storage = prompt_token_storage(None, None, "DO_NEXT_JIRA_API_TOKEN")?;
         let email = prompt("Jira account email: ", None)?;
         let config_dir = dirs::config_dir()
             .context("Cannot determine config directory")?

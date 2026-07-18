@@ -5264,6 +5264,8 @@ mod tests {
             confluence: cfg::JiraConfig::default(),
             open_slack_in_app: true,
             slack_team_id: None,
+            grafana: None,
+            on_duty: false,
         }
     }
 

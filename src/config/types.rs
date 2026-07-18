@@ -11,6 +11,10 @@ pub struct Config {
     /// effective Jira config (same Atlassian site: one API token covers both).
     #[serde(default)]
     pub confluence: Option<ConfluenceConfig>,
+    /// Grafana `OnCall` connection settings. Teams with a `grafana` block use
+    /// these for anything they leave unset.
+    #[serde(default)]
+    pub grafana: Option<GrafanaConfig>,
     #[serde(default)]
     pub cache: CacheConfig,
     /// Default detail-load mode for board sources. A per-board `detail_load`
@@ -156,6 +160,10 @@ pub struct TeamConfig {
     pub open_slack_in_app: Option<bool>,
     /// Slack workspace (team) ID. Overrides the global setting.
     pub slack_team_id: Option<String>,
+    /// Grafana `OnCall` on-duty check: while the current user is on call for
+    /// the configured schedule, `on_duty_sources` replaces `sources`.
+    #[serde(default)]
+    pub grafana: Option<TeamGrafanaConfig>,
 }
 
 /// A fully resolved team: team ref + loaded config + effective Jira config.
@@ -174,6 +182,13 @@ pub struct ResolvedTeam {
     pub open_slack_in_app: bool,
     /// Effective Slack workspace (team) ID for deep links.
     pub slack_team_id: Option<String>,
+    /// Effective Grafana `OnCall` settings (team override merged over user
+    /// config and company defaults). `None` when the team has no `grafana`
+    /// block or the merge produced a non-fatal error.
+    pub grafana: Option<ResolvedGrafana>,
+    /// True when the on-call check replaced `config.sources` with the team's
+    /// `on_duty_sources` for this run.
+    pub on_duty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -474,6 +489,146 @@ pub struct ConfluenceConfig {
     pub credential_store: Option<String>,
     pub credential_key: Option<String>,
     pub auth_method: Option<String>,
+}
+
+/// Grafana `OnCall` connection settings. All fields optional — the effective
+/// value merges team override > user config > company manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct GrafanaConfig {
+    /// `OnCall` API base URL, e.g.
+    /// `https://oncall-prod-us-central-0.grafana.net/oncall`.
+    pub oncall_api_url: Option<String>,
+    /// Grafana instance (web UI) URL, e.g. `https://acme.grafana.net` — a
+    /// different host from the `OnCall` API. Used to link users straight to
+    /// the page where API tokens are created.
+    pub instance_url: Option<String>,
+    /// Shell command whose stdout yields the `OnCall` API token.
+    pub credential_command: Option<String>,
+    /// Use OS keyring for the token ("keyring").
+    pub credential_store: Option<String>,
+    /// Key label for keyring lookup (defaults to `oncall_api_url`).
+    pub credential_key: Option<String>,
+}
+
+/// Which `OnCall` schedule to check for on-duty status.
+///
+/// JSON5 forms: a plain string (schedule name, the shortcut), `{ name: "..." }`,
+/// or `{ id: "..." }`. Serde is hand-written because name and id are both
+/// strings and `#[serde(untagged)]` is unreliable through json5's
+/// `deserialize_any`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleSelector {
+    Name(String),
+    Id(String),
+}
+
+impl Serialize for ScheduleSelector {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            // Normalizing: the shortcut form stays the plain string.
+            Self::Name(name) => serializer.serialize_str(name),
+            Self::Id(id) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("id", id)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ScheduleSelector {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SelectorVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SelectorVisitor {
+            type Value = ScheduleSelector;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a schedule name string, { name: ... }, or { id: ... }")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(ScheduleSelector::Name(v.into()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut name: Option<String> = None;
+                let mut id: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "name" => name = Some(map.next_value()?),
+                        "id" => id = Some(map.next_value()?),
+                        other => {
+                            return Err(serde::de::Error::custom(format!(
+                                "unknown `schedule` key \"{other}\" (expected `name` or `id`)"
+                            )));
+                        }
+                    }
+                }
+                match (name, id) {
+                    (Some(name), None) => Ok(ScheduleSelector::Name(name)),
+                    (None, Some(id)) => Ok(ScheduleSelector::Id(id)),
+                    (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                        "`schedule` cannot set both `name` and `id`",
+                    )),
+                    (None, None) => Err(serde::de::Error::custom(
+                        "`schedule` object form needs `name` or `id`",
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(SelectorVisitor)
+    }
+}
+
+/// How `on_duty_sources` combine with the normal `sources` while on call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnDutyMode {
+    /// `on_duty_sources` replace the normal set entirely.
+    #[default]
+    Replace,
+    /// `on_duty_sources` go above the normal set (position = priority, so
+    /// duty work sorts first). Duty ids must not collide with normal ids.
+    Prepend,
+}
+
+/// Team-level Grafana `OnCall` block: which schedule to check and which sources
+/// replace or lead the normal set while the current user is on call. The
+/// connection (`oncall_api_url`, `instance_url`, credentials) is
+/// company/user-level — see [`GrafanaConfig`].
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TeamGrafanaConfig {
+    /// Which schedule to check. Shortcut: a plain string is a schedule name.
+    pub schedule: Option<ScheduleSelector>,
+    /// How `on_duty_sources` combine with `sources`: "replace" (default) or
+    /// "prepend".
+    #[serde(default)]
+    pub mode: OnDutyMode,
+    /// Source set used while the user is on call (see `mode`).
+    #[serde(default)]
+    pub on_duty_sources: Vec<SourceConfig>,
+}
+
+/// Effective Grafana `OnCall` settings for one team: the schedule and duty
+/// sources from the team block, the connection from the user config /
+/// company defaults.
+#[derive(Debug, Clone)]
+pub struct ResolvedGrafana {
+    pub oncall_api_url: String,
+    /// Grafana web UI URL for token-creation guidance; not used for API calls.
+    pub instance_url: Option<String>,
+    pub schedule: ScheduleSelector,
+    pub mode: OnDutyMode,
+    pub on_duty_sources: Vec<SourceConfig>,
+    pub credential_command: Option<String>,
+    pub credential_store: Option<String>,
+    pub credential_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -782,6 +937,105 @@ mod tests {
         let company = cfg.company.expect("company block");
         assert_eq!(company.url, None);
         assert!(company.teams.is_empty());
+    }
+
+    #[test]
+    fn config_without_grafana_block_parses_as_none() {
+        let cfg: Config = json5::from_str("{}").expect("valid config");
+        assert!(cfg.grafana.is_none());
+        let team: TeamConfig = json5::from_str("{}").expect("valid team config");
+        assert!(team.grafana.is_none());
+    }
+
+    #[test]
+    fn config_grafana_block_parses() {
+        let cfg: Config = json5::from_str(
+            r#"{ grafana: {
+                oncall_api_url: "https://oncall.example.net/oncall",
+                credential_store: "keyring",
+            } }"#,
+        )
+        .expect("valid config");
+        let grafana = cfg.grafana.expect("grafana block");
+        assert_eq!(
+            grafana.oncall_api_url.as_deref(),
+            Some("https://oncall.example.net/oncall")
+        );
+        assert_eq!(grafana.credential_store.as_deref(), Some("keyring"));
+        assert_eq!(grafana.credential_command, None);
+    }
+
+    #[test]
+    fn team_grafana_block_parses() {
+        let team: TeamConfig = json5::from_str(
+            r#"{ grafana: {
+                schedule: "primary",
+                on_duty_sources: [{ id: "incidents", jql: "project = OPS" }],
+            } }"#,
+        )
+        .expect("valid team config");
+        let grafana = team.grafana.expect("grafana block");
+        assert_eq!(
+            grafana.schedule,
+            Some(ScheduleSelector::Name("primary".into()))
+        );
+        assert_eq!(grafana.on_duty_sources.len(), 1);
+        assert_eq!(grafana.on_duty_sources[0].id, "incidents");
+    }
+
+    #[test]
+    fn on_duty_mode_defaults_to_replace_and_parses_lowercase() {
+        let team: TeamConfig = json5::from_str(
+            r#"{ grafana: { schedule: "primary", on_duty_sources: [{ id: "d" }] } }"#,
+        )
+        .expect("valid team config");
+        assert_eq!(team.grafana.expect("block").mode, OnDutyMode::Replace);
+
+        let team: TeamConfig = json5::from_str(
+            r#"{ grafana: { schedule: "primary", mode: "prepend", on_duty_sources: [{ id: "d" }] } }"#,
+        )
+        .expect("valid team config");
+        assert_eq!(team.grafana.expect("block").mode, OnDutyMode::Prepend);
+
+        json5::from_str::<TeamConfig>(r#"{ grafana: { schedule: "p", mode: "boost" } }"#)
+            .expect_err("unknown mode must fail");
+    }
+
+    #[test]
+    fn schedule_selector_accepts_shortcut_and_rich_forms() {
+        let s: ScheduleSelector = json5::from_str(r#""primary""#).expect("shortcut form");
+        assert_eq!(s, ScheduleSelector::Name("primary".into()));
+
+        let s: ScheduleSelector = json5::from_str(r#"{ name: "primary" }"#).expect("name form");
+        assert_eq!(s, ScheduleSelector::Name("primary".into()));
+
+        let s: ScheduleSelector = json5::from_str(r#"{ id: "SBM7DV7BKFUYU" }"#).expect("id form");
+        assert_eq!(s, ScheduleSelector::Id("SBM7DV7BKFUYU".into()));
+    }
+
+    #[test]
+    fn schedule_selector_rejects_conflicting_and_empty_forms() {
+        let err = json5::from_str::<ScheduleSelector>(r#"{ name: "a", id: "b" }"#)
+            .expect_err("both keys must conflict");
+        assert!(err.to_string().contains("not both") || err.to_string().contains("both"));
+
+        json5::from_str::<ScheduleSelector>("{}").expect_err("empty object must fail");
+
+        json5::from_str::<ScheduleSelector>(r#"{ nam: "typo" }"#)
+            .expect_err("unknown key must fail");
+    }
+
+    #[test]
+    fn schedule_selector_serializes_shortcut_for_name() {
+        // Normalizing: the simple form stays simple.
+        let s = json5::to_string(&ScheduleSelector::Name("primary".into())).unwrap();
+        assert_eq!(s, r#""primary""#);
+        let back: ScheduleSelector = json5::from_str(&s).unwrap();
+        assert_eq!(back, ScheduleSelector::Name("primary".into()));
+
+        let s = json5::to_string(&ScheduleSelector::Id("S123".into())).unwrap();
+        let back: ScheduleSelector = json5::from_str(&s).unwrap();
+        assert_eq!(back, ScheduleSelector::Id("S123".into()));
     }
 
     #[test]
