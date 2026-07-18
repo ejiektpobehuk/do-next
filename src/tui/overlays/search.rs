@@ -12,7 +12,7 @@ use crate::tui::search::{RankedHit, SearchFilters};
 use crate::tui::theme;
 use crate::tui::widgets::scrollbar::render_scrollbar;
 
-pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
+pub fn render_search_overlay(f: &mut Frame, app: &AppState, results_state: &mut ListState) {
     let ActionState::Searching {
         ref query,
         cursor,
@@ -92,6 +92,7 @@ pub fn render_search_overlay(f: &mut Frame, app: &AppState) {
         &ordered,
         selected,
         results_focused,
+        results_state,
     );
     render_footer(f, left_chunks[3], jira_state);
 
@@ -262,6 +263,7 @@ fn filter_slot_spans(digit: &str, label: &str, count: usize, focused: bool) -> V
     spans
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_results(
     f: &mut Frame,
     area: Rect,
@@ -270,6 +272,7 @@ fn render_results(
     ordered: &[&RankedHit],
     selected: usize,
     focused: bool,
+    state: &mut ListState,
 ) {
     let border_color = if focused {
         theme::BORDER_FOCUS
@@ -301,13 +304,14 @@ fn render_results(
         .map(|hit| result_item(hit, find_issue(app, hit, jira)))
         .collect();
 
-    let mut state = ListState::default();
+    // The state persists across frames so the scroll offset survives;
+    // rebuilding it each render pinned the selection to the bottom row.
     state.select(Some(selected));
 
     let list = List::new(items)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, inner, &mut state);
+    f.render_stateful_widget(list, inner, state);
 
     let total = ordered.len();
     let viewport = area.height.saturating_sub(2) as usize;

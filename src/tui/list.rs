@@ -101,13 +101,13 @@ pub fn render_list(
     }
 
     // Sync list_state selection to the visual row that matches the current nav_idx.
+    // Keep the existing scroll offset: resetting the state each frame made
+    // ratatui recompute it from the top, pinning the selection to the bottom
+    // row so scrolling up moved the list instead of the highlight.
     let list_selected = item_nav_indices
         .iter()
         .position(|opt| *opt == Some(app.nav_idx));
-    *list_state = ListState::default();
-    if let Some(pos) = list_selected {
-        list_state.select(Some(pos));
-    }
+    list_state.select(list_selected);
 
     let total = items.len();
 

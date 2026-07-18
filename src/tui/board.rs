@@ -383,9 +383,27 @@ const MIN_COL_WIDTH: u16 = 26;
 /// Rows per card: 3 content lines + 1 blank separator.
 const CARD_H: usize = 4;
 
+/// Frame-persistent scroll offsets for the board view. Recomputing them from
+/// the cursor each frame pinned the cursor to the window edge (the same bug
+/// the list views had); keeping them lets the cursor roam the visible window
+/// and drag it only at the edges.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BoardScroll {
+    /// First visible column (horizontal window over columns).
+    pub h_off: usize,
+    /// First visible card row within the cursor's column.
+    pub card_off: usize,
+}
+
 /// Render the kanban board over the full main area: an info header line,
 /// then swimlane bands stacked vertically, each a row of bordered columns.
-pub fn render_board(f: &mut Frame, area: Rect, app: &AppState, focused: bool) {
+pub fn render_board(
+    f: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    scroll: &mut BoardScroll,
+    focused: bool,
+) {
     let Some(source_id) = app.board_view.as_deref() else {
         return;
     };
@@ -415,10 +433,15 @@ pub fn render_board(f: &mut Frame, area: Rect, app: &AppState, focused: bool) {
     let visible_cols = usize::from((body.width / MIN_COL_WIDTH).max(1)).min(n_cols);
     let cursor = cursor_pos(&g, app.nav_idx);
     let cursor_col = cursor.map_or(0, |(_, c, _)| c);
-    // Keep the cursor column in the horizontal window.
-    let h_off = cursor_col
-        .saturating_sub(visible_cols - 1)
-        .min(n_cols - visible_cols);
+    // Keep the cursor column in the horizontal window, shifting the window
+    // only when the cursor crosses one of its edges.
+    let mut h_off = scroll.h_off.min(n_cols - visible_cols);
+    if cursor_col < h_off {
+        h_off = cursor_col;
+    } else if cursor_col >= h_off + visible_cols {
+        h_off = cursor_col + 1 - visible_cols;
+    }
+    scroll.h_off = h_off;
 
     render_board_header(
         f,
@@ -513,6 +536,7 @@ pub fn render_board(f: &mut Frame, area: Rect, app: &AppState, focused: bool) {
             visible_cols,
             lane_idx == first_band,
             cursor,
+            scroll,
             focused,
         );
         y += band_area.height;
@@ -580,6 +604,7 @@ fn render_band(
     visible_cols: usize,
     titled: bool,
     cursor: Option<(usize, usize, usize)>,
+    scroll: &mut BoardScroll,
     focused: bool,
 ) {
     let lane = &g.lanes[lane_idx];
@@ -622,6 +647,7 @@ fn render_band(
             col_idx,
             titled,
             col_cursor_row,
+            scroll,
             focused,
         );
     }
@@ -637,6 +663,7 @@ fn render_column(
     col_idx: usize,
     titled: bool,
     cursor_row: Option<usize>,
+    board_scroll: &mut BoardScroll,
     focused: bool,
 ) {
     let accent = if cursor_row.is_some() && focused {
@@ -661,8 +688,18 @@ fn render_column(
     let inner_h = usize::from(inner.height);
     // k cards need k*CARD_H - 1 rows (no trailing separator).
     let fit = (inner_h + 1) / CARD_H;
-    // Scroll only the cursor's column, just enough to keep it visible.
-    let scroll = cursor_row.map_or(0, |row| (row + 1).saturating_sub(fit));
+    // Scroll only the cursor's column, shifting the persisted offset just
+    // enough to keep the cursor inside the visible window.
+    let scroll = cursor_row.map_or(0, |row| {
+        let mut off = board_scroll.card_off.min(cards.len().saturating_sub(fit));
+        if row < off {
+            off = row;
+        } else {
+            off = off.max((row + 1).saturating_sub(fit));
+        }
+        board_scroll.card_off = off;
+        off
+    });
     let visible = &cards[scroll.min(cards.len())..cards.len().min(scroll + fit)];
     let hidden_below = cards.len() - scroll.min(cards.len()) - visible.len();
 

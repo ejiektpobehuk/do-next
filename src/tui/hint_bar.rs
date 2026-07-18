@@ -128,8 +128,8 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         spans.push(Span::styled("q", Style::default().fg(Color::Red)));
         spans.push(Span::raw(")uit ├──"));
         let title = Line::from(spans)
-        .alignment(Alignment::Right)
-        .style(Style::default().fg(theme::MUTED));
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(theme::MUTED));
         f.render_widget(
             Block::default()
                 .borders(Borders::BOTTOM)
@@ -171,8 +171,8 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         spans.push(Span::styled("q", Style::default().fg(Color::Red)));
         spans.push(Span::raw(")uit ├──"));
         let title = Line::from(spans)
-        .alignment(Alignment::Right)
-        .style(Style::default().fg(theme::MUTED));
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(theme::MUTED));
         f.render_widget(
             Block::default()
                 .borders(Borders::BOTTOM)

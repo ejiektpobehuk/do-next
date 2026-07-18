@@ -12,6 +12,18 @@ use crate::tui::hint_bar::render_hints;
 use crate::tui::overlays;
 use crate::tui::theme;
 
+/// Widget state that must persist across frames (scroll offsets live here),
+/// owned by the event loop and threaded through every render pass.
+#[derive(Default)]
+pub struct ViewStates {
+    /// Main list panel (list and backlog tabs).
+    pub list: ratatui::widgets::ListState,
+    /// Results list of the search overlay.
+    pub search_results: ratatui::widgets::ListState,
+    /// Kanban board scroll offsets.
+    pub board: crate::tui::board::BoardScroll,
+}
+
 /// Side-channel data written during a render pass, consumed by the event loop.
 #[derive(Default)]
 pub struct RenderOut {
@@ -34,12 +46,7 @@ pub struct RenderOut {
     pub overlay_comment_offsets: Vec<(usize, usize)>,
 }
 
-pub fn render(
-    f: &mut Frame,
-    app: &AppState,
-    list_state: &mut ratatui::widgets::ListState,
-    render_out: &mut RenderOut,
-) {
+pub fn render(f: &mut Frame, app: &AppState, views: &mut ViewStates, render_out: &mut RenderOut) {
     let show_tabs = app.tab_list().len() > 1;
 
     // Layout: top bar (1) | [tab bar (1)] | main area (rest) | hint bar (1)
@@ -82,7 +89,7 @@ pub fn render(
     if app.fullscreen_detail {
         render_detail(f, main_area, app, !popup, render_out);
     } else if app.active_tab_source_kind() == Some(crate::config::types::SourceKind::Board) {
-        crate::tui::board::render_board(f, main_area, app, !popup);
+        crate::tui::board::render_board(f, main_area, app, &mut views.board, !popup);
     } else {
         // List tabs and backlog tabs share the list+detail layout — a backlog
         // is just a rank-ordered list of one source.
@@ -96,7 +103,7 @@ pub fn render(
             f,
             main[0],
             app,
-            list_state,
+            &mut views.list,
             app.focused_panel == FocusedPanel::List && !popup,
         );
         render_detail(
@@ -117,11 +124,16 @@ pub fn render(
     }
 
     // Overlays (drawn on top)
-    render_action_overlays(f, app, render_out);
+    render_action_overlays(f, app, &mut views.search_results, render_out);
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut RenderOut) {
+fn render_action_overlays(
+    f: &mut Frame,
+    app: &AppState,
+    search_list_state: &mut ratatui::widgets::ListState,
+    render_out: &mut RenderOut,
+) {
     match &app.action_state {
         ActionState::SelectingTransition { .. } => {
             overlays::transition::render_transition_overlay(f, &app.action_state);
@@ -257,7 +269,7 @@ fn render_action_overlays(f: &mut Frame, app: &AppState, render_out: &mut Render
             overlays::keybindings::render_keybindings_overlay(f);
         }
         ActionState::Searching { picker, .. } => {
-            overlays::search::render_search_overlay(f, app);
+            overlays::search::render_search_overlay(f, app, search_list_state);
             if picker.is_some() {
                 overlays::search_picker::render_search_picker_overlay(f, app);
             }

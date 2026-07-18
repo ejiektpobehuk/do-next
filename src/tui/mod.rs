@@ -20,7 +20,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
-use ratatui::{Terminal, backend::CrosstermBackend, widgets::ListState};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::time::{Duration, interval};
@@ -95,7 +95,7 @@ async fn run_inner(
     let mut input_task = spawn_input_task(tx.clone());
     // Tick task is spawned on-demand: only while sources are loading.
     let mut tick_handle: Option<tokio::task::JoinHandle<()>> = Some(spawn_tick_task(tx.clone()));
-    let mut list_state = ListState::default();
+    let mut views = render::ViewStates::default();
 
     // Main event loop
     loop {
@@ -185,7 +185,7 @@ async fn run_inner(
         }
 
         let mut render_out = RenderOut::default();
-        terminal.draw(|f| render(f, &app, &mut list_state, &mut render_out))?;
+        terminal.draw(|f| render(f, &app, &mut views, &mut render_out))?;
         app.detail_focus_offsets = std::mem::take(&mut render_out.detail_focus_offsets);
         app.last_detail_viewport_h = render_out.detail_viewport_h;
         app.last_detail_content_h = render_out.detail_content_h;
