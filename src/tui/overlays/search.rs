@@ -463,21 +463,23 @@ fn description_text(issue: &Issue) -> String {
 
 fn search_hints_line() -> Line<'static> {
     Line::from(vec![
-        Span::raw("┤ "),
+        Span::styled("┤ ", Style::default().fg(Color::Reset)),
         Span::styled("Enter", Style::default().fg(Color::Green)),
-        Span::raw(" open  "),
+        Span::raw(" open | "),
         Span::styled("Tab", Style::default().fg(Color::Blue)),
-        Span::raw(" cycle  "),
+        Span::raw(" cycle | "),
         Span::styled("↕", Style::default().fg(Color::Blue)),
-        Span::raw(" nav  "),
+        Span::raw(" nav | "),
         Span::styled("Alt+1", Style::default().fg(Color::Blue)),
-        Span::raw(" status  "),
+        Span::raw(" status | "),
         Span::styled("Alt+2", Style::default().fg(Color::Blue)),
-        Span::raw(" project  "),
+        Span::raw(" project | "),
         Span::styled("Esc", Style::default().fg(Color::Magenta)),
-        Span::raw(" cancel ├──"),
+        Span::raw(" close "),
+        Span::styled("├──", Style::default().fg(Color::Reset)),
     ])
     .alignment(Alignment::Right)
+    .style(Style::default().fg(theme::MUTED))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
