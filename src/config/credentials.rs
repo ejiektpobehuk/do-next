@@ -111,7 +111,10 @@ fn resolve_api_token(jira: &JiraConfig) -> Result<String> {
 
     // 4. Credentials file
     log::debug!("credentials: checking credentials file");
-    if let Some(token) = read_credentials_file()?.and_then(|f| f.jira).and_then(|j| j.api_token) {
+    if let Some(token) = read_credentials_file()?
+        .and_then(|f| f.jira)
+        .and_then(|j| j.api_token)
+    {
         log::debug!("credentials: loaded from credentials file");
         return Ok(token);
     }
@@ -139,7 +142,10 @@ pub fn resolve_grafana_token(grafana: &ResolvedGrafana) -> Result<Option<String>
     }
 
     if grafana.credential_store.as_deref() == Some("keyring") {
-        let key = grafana.credential_key.as_deref().unwrap_or(&grafana.oncall_api_url);
+        let key = grafana
+            .credential_key
+            .as_deref()
+            .unwrap_or(&grafana.oncall_api_url);
         let hints = KeyringHints {
             env_var: "DO_NEXT_GRAFANA_TOKEN",
             refresh: "Store the OnCall API token in the keyring again",
@@ -172,14 +178,9 @@ pub fn credentials_file_path() -> Result<std::path::PathBuf> {
 /// Set `grafana.api_token` in credentials-file content, preserving every
 /// other section. `existing` is the current file content (`None` when the
 /// file doesn't exist yet). Returns the new content.
-pub fn merge_grafana_token_into_credentials(
-    existing: Option<&str>,
-    token: &str,
-) -> Result<String> {
+pub fn merge_grafana_token_into_credentials(existing: Option<&str>, token: &str) -> Result<String> {
     let mut root: serde_json::Value = match existing {
-        Some(content) => {
-            json5::from_str(content).context("Failed to parse credentials.json5")?
-        }
+        Some(content) => json5::from_str(content).context("Failed to parse credentials.json5")?,
         None => serde_json::json!({}),
     };
     let obj = root
@@ -359,7 +360,10 @@ mod tests {
         let merged = merge_grafana_token_into_credentials(None, "t0k3n").expect("merges");
         let file: CredentialsFile = json5::from_str(&merged).expect("output parses");
         assert!(file.jira.is_none());
-        assert_eq!(file.grafana.and_then(|g| g.api_token).as_deref(), Some("t0k3n"));
+        assert_eq!(
+            file.grafana.and_then(|g| g.api_token).as_deref(),
+            Some("t0k3n")
+        );
     }
 
     #[test]
@@ -367,8 +371,7 @@ mod tests {
         // Future sections (or user extras) must survive the rewrite even
         // though CredentialsFile doesn't model them.
         let existing = r#"{ future_thing: { key: "v" }, jira: { api_token: "jt" } }"#;
-        let merged =
-            merge_grafana_token_into_credentials(Some(existing), "gt").expect("merges");
+        let merged = merge_grafana_token_into_credentials(Some(existing), "gt").expect("merges");
         let root: serde_json::Value = json5::from_str(&merged).expect("output parses");
         assert_eq!(root["future_thing"]["key"], "v");
         assert_eq!(root["jira"]["api_token"], "jt");

@@ -2875,9 +2875,16 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
             app.focused_panel = FocusedPanel::Detail;
             request_detail_load_if_partial(app);
         }
-        // Shift+arrows re-rank in backlog tabs; must precede plain arrow nav.
-        (KeyCode::Up, KeyModifiers::SHIFT) if backlog_mode_active(app) => key_rank_move(app, true),
-        (KeyCode::Down, KeyModifiers::SHIFT) if backlog_mode_active(app) => {
+        // Shift+arrows and Shift+K/Shift+J re-rank in backlog tabs; must
+        // precede plain arrow nav.
+        (KeyCode::Up, KeyModifiers::SHIFT) | (KeyCode::Char('K'), _)
+            if backlog_mode_active(app) =>
+        {
+            key_rank_move(app, true);
+        }
+        (KeyCode::Down, KeyModifiers::SHIFT) | (KeyCode::Char('J'), _)
+            if backlog_mode_active(app) =>
+        {
             key_rank_move(app, false);
         }
         (KeyCode::Down | KeyCode::Char('j'), _) => key_nav_down(app),
@@ -2934,9 +2941,8 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         (KeyCode::Char('R'), _) => key_refresh_all(app),
         (KeyCode::Char('r'), _) => key_refresh_focused(app),
         (KeyCode::Char('P'), _) => key_preload_details(app),
-        // Backlog grooming: Shift+K/Shift+J re-rank, `s` sends to a sprint.
-        (KeyCode::Char('K'), _) if backlog_mode_active(app) => key_rank_move(app, true),
-        (KeyCode::Char('J'), _) if backlog_mode_active(app) => key_rank_move(app, false),
+        // Backlog grooming: `s` sends to a sprint (re-rank keys live with the
+        // arrow-nav arms above).
         (KeyCode::Char('s'), _) if backlog_mode_active(app) => key_send_to_sprint(app),
         (KeyCode::Char('/'), _) => key_open_search(app),
         (KeyCode::Char('n'), _) => key_open_create(app),

@@ -203,8 +203,7 @@ async fn main() -> Result<()> {
         if !missing.is_empty() {
             let mut configured = false;
             for target in &missing {
-                match tui::onboarding::grafana::setup_grafana_token(target, &mut loaded.raw).await
-                {
+                match tui::onboarding::grafana::setup_grafana_token(target, &mut loaded.raw).await {
                     Ok(tui::onboarding::grafana::SetupOutcome::Configured) => configured = true,
                     Ok(_) => {}
                     // A failed setup must not block the launch; the on-call

@@ -96,7 +96,10 @@ pub fn grafana_api_urls(teams: &[ResolvedTeam]) -> Vec<TokenSetupTarget> {
         let Some(grafana) = &team.grafana else {
             continue;
         };
-        match groups.iter_mut().find(|g| g.oncall_api_url == grafana.oncall_api_url) {
+        match groups
+            .iter_mut()
+            .find(|g| g.oncall_api_url == grafana.oncall_api_url)
+        {
             Some(group) => {
                 group.team_ids.push(team.id.clone());
                 if group.instance_url.is_none() {

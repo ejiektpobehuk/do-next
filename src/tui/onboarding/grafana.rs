@@ -10,8 +10,10 @@ use crate::config::credentials::{
 };
 use crate::config::types::{Config, GrafanaConfig};
 
-use super::{StorageChoice, check_keyring_available, prompt, prompt_masked, prompt_token_storage,
-    prompt_yes_no};
+use super::{
+    StorageChoice, check_keyring_available, prompt, prompt_masked, prompt_token_storage,
+    prompt_yes_no,
+};
 
 pub enum SetupOutcome {
     /// A token was stored (and, for keyring/command, the user config updated)

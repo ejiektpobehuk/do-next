@@ -281,9 +281,11 @@ pub fn run_auth_reset(
     let current_storage = detect_storage_method(effective_jira);
     let storage = match auth_method {
         AuthMethod::OAuth => prompt_oauth_storage(Some(&current_storage))?,
-        AuthMethod::PersonalToken => {
-            prompt_token_storage(Some(&current_storage), Some(&status), "DO_NEXT_JIRA_API_TOKEN")?
-        }
+        AuthMethod::PersonalToken => prompt_token_storage(
+            Some(&current_storage),
+            Some(&status),
+            "DO_NEXT_JIRA_API_TOKEN",
+        )?,
     };
 
     // The company manifest supplies the OAuth app when the user hasn't set

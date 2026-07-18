@@ -8,8 +8,8 @@ use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
 use types::{
-    Config, ConfluenceConfig, GrafanaConfig, JiraConfig, ResolvedGrafana, ResolvedTeam,
-    SourceKind, TeamConfig, TeamGrafanaConfig, TeamJiraOverride, TeamRef,
+    Config, ConfluenceConfig, GrafanaConfig, JiraConfig, ResolvedGrafana, ResolvedTeam, SourceKind,
+    TeamConfig, TeamGrafanaConfig, TeamJiraOverride, TeamRef,
 };
 
 /// Result of loading user config + all team configs.
