@@ -176,11 +176,12 @@ pub struct BoardConfiguration {
     pub ranking: Option<RankingConfig>,
 }
 
-/// The `ranking` block of a board configuration.
+/// The `ranking` block of a board configuration. Boards not ordered by the
+/// Rank field return an empty object here, so the field id is optional.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RankingConfig {
-    #[serde(rename = "rankCustomFieldId")]
-    pub rank_custom_field_id: u64,
+    #[serde(rename = "rankCustomFieldId", default)]
+    pub rank_custom_field_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -415,7 +416,21 @@ mod tests {
         assert!(cols[2].contains_status("3"));
         assert!(cols[2].contains_status("10101"));
         assert!(!cols[2].contains_status("10100"));
-        assert_eq!(cfg.ranking.unwrap().rank_custom_field_id, 10019);
+        assert_eq!(cfg.ranking.unwrap().rank_custom_field_id, Some(10019));
+    }
+
+    #[test]
+    fn board_configuration_tolerates_empty_ranking() {
+        // Boards not ordered by the Rank field return `"ranking": {}`.
+        let cfg: BoardConfiguration = serde_json::from_str(
+            r#"{
+            "id": 1, "name": "b", "type": "kanban",
+            "columnConfig": { "columns": [] },
+            "ranking": {}
+        }"#,
+        )
+        .unwrap();
+        assert!(cfg.ranking.unwrap().rank_custom_field_id.is_none());
     }
 
     #[test]

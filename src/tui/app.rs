@@ -3000,7 +3000,7 @@ fn key_rank_move(app: &mut AppState, up: bool) {
         .board_configs
         .get(&source_id)
         .and_then(|c| c.ranking.as_ref())
-        .map(|r| r.rank_custom_field_id);
+        .and_then(|r| r.rank_custom_field_id);
     // A different issue's pending move dispatches first, unchanged.
     if let Some(prev) = app.pending_rank.take() {
         if prev.issue_key == issue_key {
