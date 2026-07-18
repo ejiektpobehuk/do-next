@@ -91,27 +91,42 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
     // there is more than one tab to cycle — same condition that shows the bar.
     let show_tab_hint = app.tab_list().len() > 1;
 
+    let nav_color = |active: bool| {
+        if active { Color::Blue } else { Color::DarkGray }
+    };
+
     let dedicated_kind = app.active_tab_source_kind();
     if dedicated_kind == Some(crate::config::types::SourceKind::Board) && !app.fullscreen_detail {
+        use crate::tui::board::{BoardMove, app_board_grouping, move_cursor};
+        let (can_left, can_vertical, can_right) = app
+            .board_view
+            .as_deref()
+            .and_then(|sid| app_board_grouping(app, sid))
+            .map_or((false, false, false), |g| {
+                let can = |mv| move_cursor(&g, app.nav_idx, mv).is_some();
+                (
+                    can(BoardMove::Left),
+                    can(BoardMove::Up) || can(BoardMove::Down),
+                    can(BoardMove::Right),
+                )
+            });
         let mut spans = vec![
-            Span::raw("┤ "),
-            Span::styled("←→", Style::default().fg(Color::Blue)),
-            Span::raw(" column | "),
-            Span::styled("↕", Style::default().fg(Color::Blue)),
-            Span::raw(" card/lane | "),
-            Span::styled("↵", Style::default().fg(Color::Blue)),
-            Span::raw(" open | "),
+            Span::raw("┤ ("),
             Span::styled("t", Style::default().fg(Color::Blue)),
-            Span::raw(" move | "),
-            Span::styled("P", Style::default().fg(Color::Blue)),
-            Span::raw(" preload | "),
+            Span::raw(")ransition | "),
+            Span::styled("←", Style::default().fg(nav_color(can_left))),
+            Span::styled("↕", Style::default().fg(nav_color(can_vertical))),
+            Span::styled("→", Style::default().fg(nav_color(can_right))),
+            Span::raw(" | "),
         ];
         if show_tab_hint {
             spans.push(Span::styled("Tab", Style::default().fg(Color::Blue)));
             spans.push(Span::raw(" | "));
         }
         spans.push(Span::styled("?", Style::default().fg(Color::Blue)));
-        spans.push(Span::raw(" ├──"));
+        spans.push(Span::raw(" | ("));
+        spans.push(Span::styled("q", Style::default().fg(Color::Red)));
+        spans.push(Span::raw(")uit ├──"));
         let title = Line::from(spans)
         .alignment(Alignment::Right)
         .style(Style::default().fg(theme::MUTED));
@@ -130,9 +145,6 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         !app.nav_items.is_empty()
     } else {
         app.selected_item().is_some()
-    };
-    let nav_color = |active: bool| {
-        if active { Color::Blue } else { Color::DarkGray }
     };
 
     if dedicated_kind == Some(crate::config::types::SourceKind::Backlog) && !app.fullscreen_detail {
