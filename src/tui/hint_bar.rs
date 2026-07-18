@@ -87,9 +87,13 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         return;
     }
 
+    // Tab cycles the tab list (teams + board/backlog tabs); hint it only when
+    // there is more than one tab to cycle — same condition that shows the bar.
+    let show_tab_hint = app.tab_list().len() > 1;
+
     let dedicated_kind = app.active_tab_source_kind();
     if dedicated_kind == Some(crate::config::types::SourceKind::Board) && !app.fullscreen_detail {
-        let title = Line::from(vec![
+        let mut spans = vec![
             Span::raw("┤ "),
             Span::styled("←→", Style::default().fg(Color::Blue)),
             Span::raw(" column | "),
@@ -101,41 +105,14 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
             Span::raw(" move | "),
             Span::styled("P", Style::default().fg(Color::Blue)),
             Span::raw(" preload | "),
-            Span::styled("Tab", Style::default().fg(Color::Blue)),
-            Span::raw(" switch | "),
-            Span::styled("?", Style::default().fg(Color::Blue)),
-            Span::raw(" ├──"),
-        ])
-        .alignment(Alignment::Right)
-        .style(Style::default().fg(theme::MUTED));
-        f.render_widget(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(theme::MUTED))
-                .title_bottom(title),
-            area,
-        );
-        return;
-    }
-
-    if dedicated_kind == Some(crate::config::types::SourceKind::Backlog) && !app.fullscreen_detail {
-        let title = Line::from(vec![
-            Span::raw("┤ "),
-            Span::styled("↕", Style::default().fg(Color::Blue)),
-            Span::raw(" navigate | "),
-            Span::styled("J/K", Style::default().fg(Color::Blue)),
-            Span::raw(" reorder | "),
-            Span::styled("s", Style::default().fg(Color::Blue)),
-            Span::raw(" sprint | "),
-            Span::styled("n", Style::default().fg(Color::Blue)),
-            Span::raw(" new | "),
-            Span::styled("t", Style::default().fg(Color::Blue)),
-            Span::raw(" status | "),
-            Span::styled("Tab", Style::default().fg(Color::Blue)),
-            Span::raw(" switch | "),
-            Span::styled("?", Style::default().fg(Color::Blue)),
-            Span::raw(" ├──"),
-        ])
+        ];
+        if show_tab_hint {
+            spans.push(Span::styled("Tab", Style::default().fg(Color::Blue)));
+            spans.push(Span::raw(" | "));
+        }
+        spans.push(Span::styled("?", Style::default().fg(Color::Blue)));
+        spans.push(Span::raw(" ├──"));
+        let title = Line::from(spans)
         .alignment(Alignment::Right)
         .style(Style::default().fg(theme::MUTED));
         f.render_widget(
@@ -157,6 +134,42 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
     let nav_color = |active: bool| {
         if active { Color::Blue } else { Color::DarkGray }
     };
+
+    if dedicated_kind == Some(crate::config::types::SourceKind::Backlog) && !app.fullscreen_detail {
+        let mut spans = vec![
+            Span::raw("┤ "),
+            Span::styled("Shift+↕", Style::default().fg(Color::Blue)),
+            Span::raw(" reorder | "),
+            Span::raw("("),
+            Span::styled("s", Style::default().fg(Color::Blue)),
+            Span::raw(")print | ("),
+            Span::styled("t", Style::default().fg(Color::Blue)),
+            Span::raw(")ransition | "),
+            Span::styled("←", Style::default().fg(nav_color(!list_focused))),
+            Span::styled("↕", Style::default().fg(nav_color(can_move_vertical))),
+            Span::styled("→", Style::default().fg(nav_color(list_focused))),
+            Span::raw(" | "),
+        ];
+        if show_tab_hint {
+            spans.push(Span::styled("Tab", Style::default().fg(Color::Blue)));
+            spans.push(Span::raw(" | "));
+        }
+        spans.push(Span::styled("?", Style::default().fg(Color::Blue)));
+        spans.push(Span::raw(" | ("));
+        spans.push(Span::styled("q", Style::default().fg(Color::Red)));
+        spans.push(Span::raw(")uit ├──"));
+        let title = Line::from(spans)
+        .alignment(Alignment::Right)
+        .style(Style::default().fg(theme::MUTED));
+        f.render_widget(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(theme::MUTED))
+                .title_bottom(title),
+            area,
+        );
+        return;
+    }
 
     let in_detail_view = app.focused_panel == FocusedPanel::Detail
         && matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
@@ -227,9 +240,9 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         Style::default().fg(nav_color(list_focused)),
     ));
     hints.push(Span::raw(" | "));
-    if app.resolved_teams.len() > 1 {
+    if show_tab_hint {
         hints.push(Span::styled("Tab", Style::default().fg(Color::Blue)));
-        hints.push(Span::raw(" team | "));
+        hints.push(Span::raw(" | "));
     }
     hints.push(Span::styled("?", Style::default().fg(Color::Blue)));
     hints.push(Span::raw(" | "));

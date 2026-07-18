@@ -2875,6 +2875,11 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
             app.focused_panel = FocusedPanel::Detail;
             request_detail_load_if_partial(app);
         }
+        // Shift+arrows re-rank in backlog tabs; must precede plain arrow nav.
+        (KeyCode::Up, KeyModifiers::SHIFT) if backlog_mode_active(app) => key_rank_move(app, true),
+        (KeyCode::Down, KeyModifiers::SHIFT) if backlog_mode_active(app) => {
+            key_rank_move(app, false);
+        }
         (KeyCode::Down | KeyCode::Char('j'), _) => key_nav_down(app),
         (KeyCode::Up | KeyCode::Char('k'), _) => key_nav_up(app),
         (KeyCode::Enter, _) => {
