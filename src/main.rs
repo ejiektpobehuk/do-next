@@ -240,10 +240,16 @@ async fn main() -> Result<()> {
     // connection equals the team's Jira one, share the auth handle so OAuth
     // refresh stays coordinated (and no second credential lookup runs).
     for team in &loaded.teams {
-        let needs_confluence = team
-            .config
-            .sources
+        // Consider normal AND on-duty sources: the duty view can be toggled
+        // on at runtime (`D`), so its clients must exist up front.
+        let duty_sources = team
+            .grafana
             .iter()
+            .flat_map(|grafana| &grafana.on_duty_sources);
+        let needs_confluence = team
+            .normal_sources
+            .iter()
+            .chain(duty_sources)
             .any(|s| s.kind == config::types::SourceKind::Confluence);
         if !needs_confluence {
             continue;

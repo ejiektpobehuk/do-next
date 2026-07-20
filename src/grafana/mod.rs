@@ -1,6 +1,7 @@
 //! Grafana IRM (`OnCall`) integration: at startup, check whether the current
-//! user is on call for each team's configured schedule, and if so replace the
-//! team's sources with its `on_duty_sources`. Every failure is non-fatal —
+//! user is on call for each team's configured schedule, and if so switch the
+//! team to its on-duty source set (see [`ResolvedTeam::set_on_duty`]; the
+//! `D` key toggles it manually at runtime). Every failure is non-fatal —
 //! the team keeps its normal sources and the error surfaces as a load
 //! warning.
 
@@ -10,64 +11,9 @@ pub mod types;
 use anyhow::{Context, Result, anyhow};
 
 use crate::config::credentials::resolve_grafana_token;
-use crate::config::types::{
-    OnDutyMode, ResolvedGrafana, ResolvedTeam, ScheduleSelector, SourceConfig,
-};
+use crate::config::types::{ResolvedGrafana, ResolvedTeam, ScheduleSelector};
 use client::GrafanaClient;
 use types::{OnCallUser, is_on_duty};
-
-/// The effective source list while on call: duty sources alone (`replace`)
-/// or above the normal set (`prepend`; position = priority).
-fn combine_on_duty_sources(
-    mode: OnDutyMode,
-    duty: Vec<SourceConfig>,
-    normal: Vec<SourceConfig>,
-) -> Vec<SourceConfig> {
-    match mode {
-        OnDutyMode::Replace => duty,
-        OnDutyMode::Prepend => {
-            let mut combined = duty;
-            combined.extend(normal);
-            combined
-        }
-    }
-}
-
-#[cfg(test)]
-mod combine_tests {
-    use super::*;
-
-    fn src(id: &str) -> SourceConfig {
-        SourceConfig {
-            id: id.into(),
-            ..Default::default()
-        }
-    }
-
-    fn ids(sources: &[SourceConfig]) -> Vec<&str> {
-        sources.iter().map(|s| s.id.as_str()).collect()
-    }
-
-    #[test]
-    fn replace_mode_drops_normal_sources() {
-        let combined = combine_on_duty_sources(
-            OnDutyMode::Replace,
-            vec![src("duty")],
-            vec![src("a"), src("b")],
-        );
-        assert_eq!(ids(&combined), vec!["duty"]);
-    }
-
-    #[test]
-    fn prepend_mode_puts_duty_sources_first_and_keeps_order() {
-        let combined = combine_on_duty_sources(
-            OnDutyMode::Prepend,
-            vec![src("duty1"), src("duty2")],
-            vec![src("a"), src("b")],
-        );
-        assert_eq!(ids(&combined), vec!["duty1", "duty2", "a", "b"]);
-    }
-}
 
 /// Check a token against the `OnCall` API and return the user it belongs to.
 /// Used by the interactive token setup to catch typos before storing.
@@ -203,10 +149,7 @@ pub async fn apply_on_duty_sources(teams: &mut [ResolvedTeam]) -> Vec<String> {
     for ((idx, grafana, _), result) in checks.into_iter().zip(results) {
         match result {
             Ok(true) => {
-                let normal = std::mem::take(&mut teams[idx].config.sources);
-                teams[idx].config.sources =
-                    combine_on_duty_sources(grafana.mode, grafana.on_duty_sources, normal);
-                teams[idx].on_duty = true;
+                teams[idx].set_on_duty(true);
                 log::info!(
                     "team '{}': on call — using on-duty sources ({:?} mode)",
                     teams[idx].id,

@@ -69,6 +69,7 @@ pub fn load() -> Result<LoadedConfig> {
                 if let Some(e) = grafana_error {
                     load_errors.push(e);
                 }
+                let normal_sources = team_config.sources.clone();
                 teams.push(ResolvedTeam {
                     id: team_ref.id.clone(),
                     path: team_ref.path.clone(),
@@ -78,6 +79,7 @@ pub fn load() -> Result<LoadedConfig> {
                     open_slack_in_app,
                     slack_team_id,
                     grafana,
+                    normal_sources,
                     on_duty: false,
                 });
             }

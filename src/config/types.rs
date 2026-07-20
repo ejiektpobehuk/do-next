@@ -186,9 +186,54 @@ pub struct ResolvedTeam {
     /// config and company defaults). `None` when the team has no `grafana`
     /// block or the merge produced a non-fatal error.
     pub grafana: Option<ResolvedGrafana>,
-    /// True when the on-call check replaced `config.sources` with the team's
-    /// `on_duty_sources` for this run.
+    /// The team's normal source set, untouched by the on-duty swap. Kept so
+    /// the on-duty view can be toggled off again at runtime.
+    pub normal_sources: Vec<SourceConfig>,
+    /// True while `config.sources` holds the team's on-duty source set —
+    /// initially from the startup on-call check, after that flipped by the
+    /// manual `D` toggle.
     pub on_duty: bool,
+}
+
+impl ResolvedTeam {
+    /// Switch `config.sources` between the normal and on-duty source sets.
+    /// Every consumer (tabs, fetches, lookups) reads `config.sources`, so the
+    /// swap is the whole switch. No-op when the team has no usable `grafana`
+    /// block. Callers must re-fetch: the previous items belong to the old set.
+    pub fn set_on_duty(&mut self, on_duty: bool) {
+        let duty_available = self
+            .grafana
+            .as_ref()
+            .is_some_and(|g| !g.on_duty_sources.is_empty());
+        self.on_duty = on_duty && duty_available;
+        self.config.sources = if self.on_duty {
+            let grafana = self.grafana.as_ref().expect("checked by duty_available");
+            combine_on_duty_sources(
+                grafana.mode,
+                grafana.on_duty_sources.clone(),
+                self.normal_sources.clone(),
+            )
+        } else {
+            self.normal_sources.clone()
+        };
+    }
+}
+
+/// The effective source list while on call: duty sources alone (`replace`)
+/// or above the normal set (`prepend`; position = priority).
+fn combine_on_duty_sources(
+    mode: OnDutyMode,
+    duty: Vec<SourceConfig>,
+    normal: Vec<SourceConfig>,
+) -> Vec<SourceConfig> {
+    match mode {
+        OnDutyMode::Replace => duty,
+        OnDutyMode::Prepend => {
+            let mut combined = duty;
+            combined.extend(normal);
+            combined
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -999,6 +1044,82 @@ mod tests {
 
         json5::from_str::<TeamConfig>(r#"{ grafana: { schedule: "p", mode: "boost" } }"#)
             .expect_err("unknown mode must fail");
+    }
+
+    fn src(id: &str) -> SourceConfig {
+        SourceConfig {
+            id: id.into(),
+            ..Default::default()
+        }
+    }
+
+    fn source_ids(sources: &[SourceConfig]) -> Vec<&str> {
+        sources.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    fn duty_team(grafana: Option<ResolvedGrafana>) -> ResolvedTeam {
+        let normal = vec![src("a"), src("b")];
+        ResolvedTeam {
+            id: "team".into(),
+            path: "/tmp".into(),
+            config: TeamConfig {
+                sources: normal.clone(),
+                ..Default::default()
+            },
+            jira: JiraConfig::default(),
+            confluence: JiraConfig::default(),
+            open_slack_in_app: true,
+            slack_team_id: None,
+            grafana,
+            normal_sources: normal,
+            on_duty: false,
+        }
+    }
+
+    fn resolved_grafana(mode: OnDutyMode) -> ResolvedGrafana {
+        ResolvedGrafana {
+            oncall_api_url: "https://oncall.example.net".into(),
+            instance_url: None,
+            schedule: ScheduleSelector::Name("primary".into()),
+            mode,
+            on_duty_sources: vec![src("duty")],
+            credential_command: None,
+            credential_store: None,
+            credential_key: None,
+        }
+    }
+
+    #[test]
+    fn set_on_duty_replace_swaps_and_restores() {
+        let mut team = duty_team(Some(resolved_grafana(OnDutyMode::Replace)));
+
+        team.set_on_duty(true);
+        assert!(team.on_duty);
+        assert_eq!(source_ids(&team.config.sources), vec!["duty"]);
+
+        team.set_on_duty(false);
+        assert!(!team.on_duty);
+        assert_eq!(source_ids(&team.config.sources), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn set_on_duty_prepend_puts_duty_sources_first_and_restores() {
+        let mut team = duty_team(Some(resolved_grafana(OnDutyMode::Prepend)));
+
+        team.set_on_duty(true);
+        assert_eq!(source_ids(&team.config.sources), vec!["duty", "a", "b"]);
+
+        team.set_on_duty(false);
+        assert_eq!(source_ids(&team.config.sources), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn set_on_duty_without_grafana_is_a_noop() {
+        let mut team = duty_team(None);
+
+        team.set_on_duty(true);
+        assert!(!team.on_duty);
+        assert_eq!(source_ids(&team.config.sources), vec!["a", "b"]);
     }
 
     #[test]

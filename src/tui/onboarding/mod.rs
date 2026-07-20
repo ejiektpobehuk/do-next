@@ -230,6 +230,7 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
     let resolved = ResolvedTeam {
         id: "personal".into(),
         path: team_dir.to_string_lossy().into_owned(),
+        normal_sources: team_config.sources.clone(),
         config: team_config,
         confluence: jira_config.clone(),
         jira: jira_config,
@@ -490,6 +491,7 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
     let resolved = ResolvedTeam {
         id: team_ref.id,
         path: team_ref.path,
+        normal_sources: team_config.sources.clone(),
         config: team_config,
         confluence: team_jira.clone(),
         jira: team_jira,

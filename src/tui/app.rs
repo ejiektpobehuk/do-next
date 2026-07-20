@@ -1096,21 +1096,29 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
         }
 
         AppEvent::SourceLoaded(source_id, items) => {
-            app.sources.insert(source_id, SourceState::Loaded(items));
-            app.rebuild_issues();
-            // Auto-update view mode for newly selected item
-            if let Some(item) = app.selected_item() {
-                let item = item.clone();
-                let mode = auto_view_mode(&item, app.team_config());
-                if app.view_mode == ViewMode::Default {
-                    app.view_mode = mode;
+            // A fetch spawned before a duty toggle (or team switch) changed
+            // the source set may still deliver: ids outside the current set
+            // would render as phantom list rows, so drop them.
+            if source_config_for(app.team_config(), &source_id).is_some() {
+                app.sources.insert(source_id, SourceState::Loaded(items));
+                app.rebuild_issues();
+                // Auto-update view mode for newly selected item
+                if let Some(item) = app.selected_item() {
+                    let item = item.clone();
+                    let mode = auto_view_mode(&item, app.team_config());
+                    if app.view_mode == ViewMode::Default {
+                        app.view_mode = mode;
+                    }
                 }
             }
         }
 
         AppEvent::SourceError(source_id, e) => {
-            app.sources
-                .insert(source_id, SourceState::Error(Arc::new(e)));
+            // Same stale-fetch guard as SourceLoaded above.
+            if source_config_for(app.team_config(), &source_id).is_some() {
+                app.sources
+                    .insert(source_id, SourceState::Error(Arc::new(e)));
+            }
         }
 
         AppEvent::SubsourceError(source_id, subsource_idx, e) => {
@@ -2940,6 +2948,10 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         }
         (KeyCode::Char('R'), _) => key_refresh_all(app),
         (KeyCode::Char('r'), _) => key_refresh_focused(app),
+        // Duty toggle only fires on the team's list view: on dedicated tabs
+        // (board/backlog) the flip would yank the tab out from under the
+        // user, and grooming keys live nearby (Shift+J/K).
+        (KeyCode::Char('D'), _) if app.board_view.is_none() => key_toggle_duty(app),
         (KeyCode::Char('P'), _) => key_preload_details(app),
         // Backlog grooming: `s` sends to a sprint (re-rank keys live with the
         // arrow-nav arms above).
@@ -3874,6 +3886,60 @@ const fn key_refresh_all(app: &mut AppState) {
         return;
     }
     app.pending_refresh_all = true;
+}
+
+/// `D` (team list view only): flip the active team between its normal and
+/// on-duty source sets, regardless of what the startup schedule check
+/// concluded — this is also the escape hatch when the `OnCall` API is
+/// unreachable. Inert for teams without a `grafana` block. Deliberately
+/// undiscoverable outside the `?` help: automation flips the view in the
+/// normal case. The source set changes under the whole tab, so per-team
+/// state is rebuilt from scratch and a full fetch kicks off (the same shape
+/// as `switch_team`'s first-visit branch; `pending_refresh_all` can't be
+/// reused because it keeps the now-stale source map keys).
+fn key_toggle_duty(app: &mut AppState) {
+    if !refresh_allowed(&app.action_state) {
+        return;
+    }
+    let team = &mut app.resolved_teams[app.active_team_idx];
+    if team.grafana.is_none() {
+        return;
+    }
+    let on_duty = !team.on_duty;
+    team.set_on_duty(on_duty);
+
+    let team = &app.resolved_teams[app.active_team_idx];
+    app.sources = team
+        .config
+        .sources
+        .iter()
+        .map(|s| (s.id.clone(), SourceState::Pending))
+        .collect();
+    // Tabs are derived from sources — the active board/backlog tab may have
+    // just disappeared, so land on the team's default view.
+    app.board_view = AppState::default_view_for(team);
+    app.issues = Vec::new();
+    app.subsource_errors = IndexMap::new();
+    app.nav_items = Vec::new();
+    app.nav_idx = 0;
+    app.board_configs = HashMap::new();
+    app.board_lanes = HashMap::new();
+    app.detail_scroll = 0;
+    app.view_mode = ViewMode::Default;
+    app.focused_panel = FocusedPanel::List;
+    app.fullscreen_detail = false;
+    app.saved_search = None;
+    app.refreshing_issues.clear();
+    app.pending_refresh_all = false;
+    app.pending_preload = false;
+    app.pending_refresh_issue = None;
+    // A pending rank move must still reach Jira — its anchor was captured at
+    // keypress, so it dispatches as-is (mirrors switch_team).
+    if let Some(pending) = app.pending_rank.take() {
+        app.rank_flush_queue.push(pending);
+    }
+    app.rebuild_issues();
+    app.flags.pending_team_fetch = true;
 }
 
 /// Request a full fetch of every partially-loaded (board-trimmed) issue, so
@@ -5262,6 +5328,7 @@ mod tests {
         ResolvedTeam {
             id: id.into(),
             path: "/tmp".into(),
+            normal_sources: sources.clone(),
             config: TeamConfig {
                 sources,
                 ..Default::default()
