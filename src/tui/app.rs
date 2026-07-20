@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyModifiers};
 use indexmap::IndexMap;
 
-use crate::config::types::{ResolvedTeam, SourceConfig, TeamConfig};
+use crate::config::types::{OnDutyMode, ResolvedTeam, SourceConfig, TeamConfig};
 use crate::events::{ActionResult, AppEvent};
 use crate::items::WorkItem;
 use crate::jira::types::{
@@ -625,6 +625,9 @@ pub struct AppState {
     /// Set when a rank mutation failed: the backlog source to refetch so the
     /// list falls back to the server's order.
     pub pending_rank_refetch: Option<String>,
+    /// Source ids the on-duty toggle just added (prepend mode): only these
+    /// are fetched, so the normal sources keep their already-loaded items.
+    pub pending_duty_fetch: Vec<String>,
     /// Global default board detail-load mode (per-board config overrides it).
     pub detail_load: crate::config::types::DetailLoad,
     /// On-disk source cache settings (stale-while-revalidate).
@@ -719,6 +722,7 @@ impl AppState {
             pending_rank: None,
             rank_flush_queue: Vec::new(),
             pending_rank_refetch: None,
+            pending_duty_fetch: Vec::new(),
             detail_load: config.detail_load,
             cache: config.cache.clone(),
         }
@@ -3893,21 +3897,73 @@ const fn key_refresh_all(app: &mut AppState) {
 /// concluded — this is also the escape hatch when the `OnCall` API is
 /// unreachable. Inert for teams without a `grafana` block. Deliberately
 /// undiscoverable outside the `?` help: automation flips the view in the
-/// normal case. The source set changes under the whole tab, so per-team
-/// state is rebuilt from scratch and a full fetch kicks off (the same shape
-/// as `switch_team`'s first-visit branch; `pending_refresh_all` can't be
-/// reused because it keeps the now-stale source map keys).
+/// normal case.
+///
+/// In `prepend` mode the normal sources survive the flip untouched, so their
+/// loaded items are kept: going on duty only inserts the duty sources above
+/// them and fetches those; going off duty only removes them, no fetch at all.
+/// In `replace` mode the whole set changes, so per-team state is rebuilt from
+/// scratch and a full fetch kicks off.
 fn key_toggle_duty(app: &mut AppState) {
     if !refresh_allowed(&app.action_state) {
         return;
     }
     let team = &mut app.resolved_teams[app.active_team_idx];
-    if team.grafana.is_none() {
+    let Some(grafana) = &team.grafana else {
         return;
-    }
+    };
+    let prepend = grafana.mode == OnDutyMode::Prepend;
     let on_duty = !team.on_duty;
     team.set_on_duty(on_duty);
+    if team.on_duty != on_duty {
+        // No usable duty source set — the flip was a no-op.
+        return;
+    }
 
+    if prepend {
+        toggle_duty_prepend(app, on_duty);
+    } else {
+        toggle_duty_replace(app);
+    }
+}
+
+/// The `prepend`-mode duty flip: splice the duty sources in or out of the
+/// source map without disturbing the normal sources' loaded state.
+fn toggle_duty_prepend(app: &mut AppState, on_duty: bool) {
+    let team = &app.resolved_teams[app.active_team_idx];
+    let duty_ids: Vec<String> = team
+        .grafana
+        .as_ref()
+        .map(|g| g.on_duty_sources.iter().map(|s| s.id.clone()).collect())
+        .unwrap_or_default();
+    if on_duty {
+        // Duty ids are distinct from normal ids (validated at load), so these
+        // inserts never displace an existing entry. Position = priority.
+        for (pos, id) in duty_ids.iter().enumerate() {
+            app.sources
+                .shift_insert(pos, id.clone(), SourceState::Pending);
+        }
+        app.pending_duty_fetch = duty_ids;
+    } else {
+        for id in &duty_ids {
+            app.sources.shift_remove(id);
+            app.subsource_errors.shift_remove(id);
+            app.board_configs.remove(id);
+            app.board_lanes.remove(id);
+        }
+        // A toggle-on may still be queued from a quick double-press; its
+        // sources just left the set, so fetching them would only produce
+        // phantom results (dropped by the stale-fetch guard, but pointless).
+        app.pending_duty_fetch.clear();
+    }
+    app.rebuild_issues();
+}
+
+/// The `replace`-mode duty flip: the source set changes under the whole tab,
+/// so per-team state is rebuilt from scratch and a full fetch kicks off (the
+/// same shape as `switch_team`'s first-visit branch; `pending_refresh_all`
+/// can't be reused because it keeps the now-stale source map keys).
+fn toggle_duty_replace(app: &mut AppState) {
     let team = &app.resolved_teams[app.active_team_idx];
     app.sources = team
         .config
@@ -5394,6 +5450,103 @@ mod tests {
         assert!(!app.source_in_active_tab("mine"));
         assert_eq!(app.active_tab_source_kind(), Some(cfg::SourceKind::Backlog));
         assert!(!board_mode_active(&app));
+    }
+
+    fn grafana_team(mode: cfg::OnDutyMode) -> ResolvedTeam {
+        let mut team = resolved_team("ops", vec![jira_source("mine")]);
+        team.grafana = Some(cfg::ResolvedGrafana {
+            oncall_api_url: "https://oncall.example.net".into(),
+            instance_url: None,
+            schedule: cfg::ScheduleSelector::Name("primary".into()),
+            mode,
+            on_duty_sources: vec![jira_source("incidents")],
+            credential_command: None,
+            credential_store: None,
+            credential_key: None,
+        });
+        team
+    }
+
+    #[test]
+    fn prepend_duty_toggle_keeps_loaded_normal_sources() {
+        let teams = vec![grafana_team(cfg::OnDutyMode::Prepend)];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        app.sources.insert(
+            "mine".into(),
+            SourceState::Loaded(vec![make_item("PROJ-1", "Open", Some("mine"))]),
+        );
+        app.rebuild_issues();
+
+        key_toggle_duty(&mut app);
+        assert!(app.resolved_teams[0].on_duty);
+        let keys: Vec<&str> = app.sources.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["incidents", "mine"], "duty sources go on top");
+        assert!(
+            matches!(app.sources.get("mine"), Some(SourceState::Loaded(items)) if items.len() == 1),
+            "normal source keeps its loaded items"
+        );
+        assert!(matches!(
+            app.sources.get("incidents"),
+            Some(SourceState::Pending)
+        ));
+        assert_eq!(app.pending_duty_fetch, vec!["incidents".to_string()]);
+        assert!(
+            !app.flags.pending_team_fetch,
+            "no full-team refetch in prepend mode"
+        );
+        assert_eq!(app.issues.len(), 1, "main list stays painted");
+
+        key_toggle_duty(&mut app);
+        assert!(!app.resolved_teams[0].on_duty);
+        let keys: Vec<&str> = app.sources.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["mine"]);
+        assert!(matches!(
+            app.sources.get("mine"),
+            Some(SourceState::Loaded(_))
+        ));
+        assert!(
+            app.pending_duty_fetch.is_empty(),
+            "queued duty fetch is cancelled"
+        );
+        assert!(!app.flags.pending_team_fetch);
+        assert_eq!(app.issues.len(), 1);
+    }
+
+    #[test]
+    fn replace_duty_toggle_resets_all_sources() {
+        let teams = vec![grafana_team(cfg::OnDutyMode::Replace)];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        app.sources.insert(
+            "mine".into(),
+            SourceState::Loaded(vec![make_item("PROJ-1", "Open", Some("mine"))]),
+        );
+        app.rebuild_issues();
+
+        key_toggle_duty(&mut app);
+        assert!(app.resolved_teams[0].on_duty);
+        let keys: Vec<&str> = app.sources.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["incidents"]);
+        assert!(matches!(
+            app.sources.get("incidents"),
+            Some(SourceState::Pending)
+        ));
+        assert!(app.pending_duty_fetch.is_empty());
+        assert!(
+            app.flags.pending_team_fetch,
+            "replace mode does a full fetch"
+        );
+        assert!(app.issues.is_empty());
+    }
+
+    #[test]
+    fn duty_toggle_without_grafana_is_inert() {
+        let teams = vec![resolved_team("plain", vec![jira_source("mine")])];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+
+        key_toggle_duty(&mut app);
+        assert!(!app.resolved_teams[0].on_duty);
+        assert!(app.pending_duty_fetch.is_empty());
+        assert!(!app.flags.pending_team_fetch);
     }
 
     #[test]

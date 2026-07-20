@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::types::{CacheConfig, DetailLoad, SourceKind, TeamConfig};
+use crate::config::types::{CacheConfig, DetailLoad, SourceConfig, SourceKind, TeamConfig};
 use crate::confluence::ConfluenceClient;
 use crate::events::AppEvent;
 use crate::jira::JiraClient;
@@ -31,58 +31,71 @@ pub fn spawn_fetches(
     tx: &UnboundedSender<AppEvent>,
 ) {
     for source_cfg in &team_config.sources {
-        match source_cfg.kind {
-            SourceKind::Jira => {
-                if source_cfg.jql.is_empty() && source_cfg.subsources.is_empty() {
-                    // No JQL configured for this source; skip silently
-                    let _ = tx.send(AppEvent::SourceLoaded(source_cfg.id.clone(), vec![]));
-                    continue;
-                }
-                spawn_fetch(jira.clone(), source_cfg.clone(), cache.clone(), tx.clone());
+        spawn_source_fetch(jira, confluence, source_cfg, default_detail_load, cache, tx);
+    }
+}
+
+/// Spawn the background fetch task for a single source. Used for partial
+/// refetches (e.g. the on-duty toggle fetching only the duty sources).
+pub fn spawn_source_fetch(
+    jira: &JiraClient,
+    confluence: Option<&ConfluenceClient>,
+    source_cfg: &SourceConfig,
+    default_detail_load: DetailLoad,
+    cache: &CacheConfig,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    match source_cfg.kind {
+        SourceKind::Jira => {
+            if source_cfg.jql.is_empty() && source_cfg.subsources.is_empty() {
+                // No JQL configured for this source; skip silently
+                let _ = tx.send(AppEvent::SourceLoaded(source_cfg.id.clone(), vec![]));
+                return;
             }
-            SourceKind::Confluence => {
-                if let Some(client) = confluence {
-                    spawn_confluence_fetch(
-                        client.clone(),
-                        source_cfg.clone(),
-                        cache.clone(),
-                        tx.clone(),
-                    );
-                } else {
-                    let _ = tx.send(AppEvent::SourceError(
-                        source_cfg.id.clone(),
-                        anyhow::anyhow!("Confluence is not configured for this team"),
-                    ));
-                }
-            }
-            SourceKind::Board => {
-                let detail_load = source_cfg
-                    .board
-                    .as_ref()
-                    .and_then(|b| b.detail_load)
-                    .unwrap_or(default_detail_load);
-                spawn_board_fetch(
-                    jira.clone(),
+            spawn_fetch(jira.clone(), source_cfg.clone(), cache.clone(), tx.clone());
+        }
+        SourceKind::Confluence => {
+            if let Some(client) = confluence {
+                spawn_confluence_fetch(
+                    client.clone(),
                     source_cfg.clone(),
-                    detail_load,
                     cache.clone(),
                     tx.clone(),
                 );
+            } else {
+                let _ = tx.send(AppEvent::SourceError(
+                    source_cfg.id.clone(),
+                    anyhow::anyhow!("Confluence is not configured for this team"),
+                ));
             }
-            SourceKind::Backlog => {
-                let detail_load = source_cfg
-                    .board
-                    .as_ref()
-                    .and_then(|b| b.detail_load)
-                    .unwrap_or(default_detail_load);
-                spawn_backlog_fetch(
-                    jira.clone(),
-                    source_cfg.clone(),
-                    detail_load,
-                    cache.clone(),
-                    tx.clone(),
-                );
-            }
+        }
+        SourceKind::Board => {
+            let detail_load = source_cfg
+                .board
+                .as_ref()
+                .and_then(|b| b.detail_load)
+                .unwrap_or(default_detail_load);
+            spawn_board_fetch(
+                jira.clone(),
+                source_cfg.clone(),
+                detail_load,
+                cache.clone(),
+                tx.clone(),
+            );
+        }
+        SourceKind::Backlog => {
+            let detail_load = source_cfg
+                .board
+                .as_ref()
+                .and_then(|b| b.detail_load)
+                .unwrap_or(default_detail_load);
+            spawn_backlog_fetch(
+                jira.clone(),
+                source_cfg.clone(),
+                detail_load,
+                cache.clone(),
+                tx.clone(),
+            );
         }
     }
 }

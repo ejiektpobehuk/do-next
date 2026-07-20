@@ -97,10 +97,7 @@ fn right_column() -> Vec<Line<'static>> {
         key_line("r", "refresh focused (list or current issue)"),
         key_line("Shift+R", "refresh all issues"),
         key_line("Shift+P", "preload full detail for all cards"),
-        key_line(
-            "Shift+D",
-            "toggle on-duty view",
-        ),
+        key_line("Shift+D", "toggle on-duty view"),
         Line::raw(""),
         section_header("Search"),
         key_line("/", "open search popup"),

@@ -244,7 +244,13 @@ fn spawn_initial_tasks(
     }
     // Paint any fresh cached results instantly; the fetches above revalidate
     // in the background and overwrite each source when they return.
-    hydrate_from_cache(app);
+    let source_ids: Vec<String> = app
+        .team_config()
+        .sources
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+    hydrate_from_cache(app, &source_ids);
 
     // Spawn background update checks for team config repos
     let teams = loaded.teams.clone();
@@ -259,22 +265,16 @@ fn spawn_initial_tasks(
     Ok(active_client)
 }
 
-/// Paint the active team's sources from any fresh on-disk cache so the first
-/// frame shows data instead of spinners. No-op when caching is disabled or a
+/// Paint the given sources from any fresh on-disk cache so the next frame
+/// shows data instead of spinners. No-op when caching is disabled or a
 /// source has no fresh cache; hydrated sources are overwritten by the
 /// in-flight revalidation fetch when it returns.
-fn hydrate_from_cache(app: &mut AppState) {
+fn hydrate_from_cache(app: &mut AppState, source_ids: &[String]) {
     if !app.cache.enabled {
         return;
     }
-    let source_ids: Vec<String> = app
-        .team_config()
-        .sources
-        .iter()
-        .map(|s| s.id.clone())
-        .collect();
     let mut hydrated = false;
-    for id in source_ids {
+    for id in source_ids.iter().cloned() {
         let Some(entry) = crate::sources::cache::read(&app.cache, &id) else {
             continue;
         };
@@ -614,6 +614,31 @@ fn dispatch_background_tasks(
             &app.cache,
             tx,
         );
+    }
+
+    // Duty sources just spliced in by the `D` toggle (prepend mode): fetch
+    // only those — the normal sources keep their already-loaded items. Any
+    // fresh disk cache paints them instantly while the fetch revalidates.
+    if !app.pending_duty_fetch.is_empty() {
+        let ids = std::mem::take(&mut app.pending_duty_fetch);
+        for id in &ids {
+            let Some(src_cfg) = crate::tui::app::source_config_for(app.team_config(), id).cloned()
+            else {
+                continue;
+            };
+            if let Some(state) = app.sources.get_mut(id) {
+                *state = crate::tui::app::SourceState::Loading;
+            }
+            crate::sources::spawn_source_fetch(
+                client,
+                confluence,
+                &src_cfg,
+                app.detail_load,
+                &app.cache,
+                tx,
+            );
+        }
+        hydrate_from_cache(app, &ids);
     }
 
     // Single-issue refresh requested via `r` (detail focus).
