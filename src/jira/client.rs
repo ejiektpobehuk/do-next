@@ -54,24 +54,33 @@ impl JiraClient {
     }
 
     /// Fetch all issues matching a JQL query, paginating automatically.
+    /// `/search/jql` is cursor-based: pagination goes by `nextPageToken`
+    /// (`startAt` is ignored and would refetch the first page forever).
     pub async fn fetch_jql(&self, jql: &str) -> Result<Vec<Issue>> {
         let mut all_issues = Vec::new();
-        let mut start_at = 0u32;
+        let mut next_page_token: Option<String> = None;
 
         loop {
             let url = format!("{}/rest/api/3/search/jql", self.base_url);
-            log::debug!("JQL request: startAt={start_at} jql={jql}");
+            log::debug!(
+                "JQL request: token={} jql={jql}",
+                next_page_token.as_deref().unwrap_or("<first page>")
+            );
+
+            let mut query: Vec<(&str, String)> = vec![
+                ("jql", jql.to_string()),
+                ("maxResults", MAX_RESULTS.to_string()),
+                ("fields", "*all".to_string()),
+            ];
+            if let Some(token) = &next_page_token {
+                query.push(("nextPageToken", token.clone()));
+            }
 
             self.maybe_refresh().await?;
             let resp = self
                 .apply_auth(self.client.get(&url))
                 .await
-                .query(&[
-                    ("jql", jql),
-                    ("maxResults", &MAX_RESULTS.to_string()),
-                    ("startAt", &start_at.to_string()),
-                    ("fields", "*all"),
-                ])
+                .query(&query)
                 .send()
                 .await
                 .map_err(|e| {
@@ -97,15 +106,15 @@ impl JiraClient {
                 .json()
                 .await
                 .context("Failed to parse search response")?;
-            let fetched = u32::try_from(page.issues.len()).unwrap_or(0);
+            let fetched = page.issues.len();
             log::debug!("JQL page: fetched={fetched} isLast={}", page.is_last);
             let is_last = page.is_last;
+            next_page_token = page.next_page_token;
             all_issues.extend(page.issues);
 
-            if is_last || fetched == 0 {
+            if is_last || next_page_token.is_none() || fetched == 0 {
                 break;
             }
-            start_at += fetched;
         }
 
         Ok(all_issues)
@@ -115,20 +124,23 @@ impl JiraClient {
     /// swimlane-membership checks where full issue payloads would be waste.
     pub async fn fetch_jql_keys(&self, jql: &str) -> Result<Vec<String>> {
         let mut all_keys = Vec::new();
-        let mut start_at = 0u32;
+        let mut next_page_token: Option<String> = None;
 
         loop {
             let url = format!("{}/rest/api/3/search/jql", self.base_url);
+            let mut query: Vec<(&str, String)> = vec![
+                ("jql", jql.to_string()),
+                ("maxResults", MAX_RESULTS.to_string()),
+                ("fields", "key".to_string()),
+            ];
+            if let Some(token) = &next_page_token {
+                query.push(("nextPageToken", token.clone()));
+            }
             self.maybe_refresh().await?;
             let resp = self
                 .apply_auth(self.client.get(&url))
                 .await
-                .query(&[
-                    ("jql", jql),
-                    ("maxResults", &MAX_RESULTS.to_string()),
-                    ("startAt", &start_at.to_string()),
-                    ("fields", "key"),
-                ])
+                .query(&query)
                 .send()
                 .await
                 .context("Failed to send JQL keys request")?;
@@ -143,14 +155,14 @@ impl JiraClient {
                 .json()
                 .await
                 .context("Failed to parse search response")?;
-            let fetched = u32::try_from(page.issues.len()).unwrap_or(0);
+            let fetched = page.issues.len();
             let is_last = page.is_last;
+            next_page_token = page.next_page_token;
             all_keys.extend(page.issues.into_iter().map(|i| i.key));
 
-            if is_last || fetched == 0 {
+            if is_last || next_page_token.is_none() || fetched == 0 {
                 break;
             }
-            start_at += fetched;
         }
 
         Ok(all_keys)

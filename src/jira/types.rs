@@ -132,12 +132,16 @@ pub struct Transition {
     pub to: StatusField,
 }
 
-/// Jira Cloud REST API v3 search response envelope.
+/// Envelope of `GET /rest/api/3/search/jql` (enhanced JQL search). The
+/// endpoint is cursor-based: `nextPageToken` requests the next page and is
+/// omitted on the last one; `startAt` is silently ignored.
 #[derive(Debug, Deserialize)]
 pub struct SearchResponse {
     pub issues: Vec<Issue>,
     #[serde(rename = "isLast", default)]
     pub is_last: bool,
+    #[serde(rename = "nextPageToken", default)]
+    pub next_page_token: Option<String>,
 }
 
 /// Jira REST API transitions response envelope.
@@ -456,6 +460,23 @@ mod tests {
             let ty: BoardType = serde_json::from_str(json).unwrap();
             assert_eq!(ty, expected);
         }
+    }
+
+    #[test]
+    fn search_response_paginates_by_cursor_token() {
+        // Mid-stream page: more results exist, cursor present.
+        let page: SearchResponse = serde_json::from_str(
+            r#"{ "issues": [], "isLast": false, "nextPageToken": "CAEaAggD" }"#,
+        )
+        .unwrap();
+        assert!(!page.is_last);
+        assert_eq!(page.next_page_token.as_deref(), Some("CAEaAggD"));
+
+        // Last page omits the token.
+        let last: SearchResponse =
+            serde_json::from_str(r#"{ "issues": [], "isLast": true }"#).unwrap();
+        assert!(last.is_last);
+        assert!(last.next_page_token.is_none());
     }
 
     #[test]
