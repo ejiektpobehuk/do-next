@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::process::Command;
 
-use crate::config::types::{JiraConfig, ResolvedGrafana};
+use crate::config::types::{JiraConfig, ResolvedGitlab, ResolvedGrafana};
 use crate::jira::auth::{Auth, BasicCredentials};
 use crate::jira::oauth;
 
@@ -167,6 +167,44 @@ pub fn resolve_grafana_token(grafana: &ResolvedGrafana) -> Result<Option<String>
     Ok(None)
 }
 
+/// Resolve the GitLab personal access token for a team's merge-request
+/// sources. Same precedence and error shape as [`resolve_grafana_token`]:
+/// env → `credential_command` → keyring → credentials file. `Ok(None)` means
+/// no token is configured anywhere (the caller may offer interactive setup);
+/// `Err` is a hard failure (locked keyring, failing command).
+pub fn resolve_gitlab_token(gitlab: &ResolvedGitlab) -> Result<Option<String>> {
+    if let Ok(token) = std::env::var("DO_NEXT_GITLAB_TOKEN") {
+        log::debug!("credentials: using DO_NEXT_GITLAB_TOKEN env var");
+        return Ok(Some(token));
+    }
+
+    if let Some(cmd) = &gitlab.credential_command {
+        return run_credential_command(cmd).map(Some);
+    }
+
+    if gitlab.credential_store.as_deref() == Some("keyring") {
+        let key = gitlab.credential_key.as_deref().unwrap_or(&gitlab.base_url);
+        let hints = KeyringHints {
+            env_var: "DO_NEXT_GITLAB_TOKEN",
+            refresh: "Store the GitLab personal access token in the keyring again",
+        };
+        if let Some(secret) = keyring_lookup(key, &hints)? {
+            return Ok(Some(secret));
+        }
+    }
+
+    log::debug!("credentials: checking credentials file for gitlab token");
+    if let Some(token) = read_credentials_file()?
+        .and_then(|f| f.gitlab)
+        .and_then(|g| g.api_token)
+    {
+        log::debug!("credentials: loaded gitlab token from credentials file");
+        return Ok(Some(token));
+    }
+
+    Ok(None)
+}
+
 /// Path of the shared credentials file (`~/.config/do-next/credentials.json5`).
 pub fn credentials_file_path() -> Result<std::path::PathBuf> {
     Ok(dirs::config_dir()
@@ -175,10 +213,15 @@ pub fn credentials_file_path() -> Result<std::path::PathBuf> {
         .join("credentials.json5"))
 }
 
-/// Set `grafana.api_token` in credentials-file content, preserving every
-/// other section. `existing` is the current file content (`None` when the
-/// file doesn't exist yet). Returns the new content.
-pub fn merge_grafana_token_into_credentials(existing: Option<&str>, token: &str) -> Result<String> {
+/// Set `<section>.api_token` in credentials-file content, preserving every
+/// other section (including ones this file doesn't model). `existing` is the
+/// current file content (`None` when the file doesn't exist yet). Returns the
+/// new content.
+pub fn merge_token_into_credentials(
+    existing: Option<&str>,
+    section: &str,
+    token: &str,
+) -> Result<String> {
     let mut root: serde_json::Value = match existing {
         Some(content) => json5::from_str(content).context("Failed to parse credentials.json5")?,
         None => serde_json::json!({}),
@@ -186,13 +229,11 @@ pub fn merge_grafana_token_into_credentials(existing: Option<&str>, token: &str)
     let obj = root
         .as_object_mut()
         .context("credentials.json5 must contain an object")?;
-    let grafana = obj
-        .entry("grafana")
-        .or_insert_with(|| serde_json::json!({}));
-    let grafana = grafana
+    let entry = obj.entry(section).or_insert_with(|| serde_json::json!({}));
+    let entry = entry
         .as_object_mut()
-        .context("`grafana` in credentials.json5 must be an object")?;
-    grafana.insert("api_token".into(), serde_json::Value::String(token.into()));
+        .with_context(|| format!("`{section}` in credentials.json5 must be an object"))?;
+    entry.insert("api_token".into(), serde_json::Value::String(token.into()));
     json5::to_string(&root).context("Failed to serialize credentials.json5")
 }
 
@@ -285,17 +326,13 @@ fn keyring_lookup(key: &str, hints: &KeyringHints) -> Result<Option<String>> {
 
 #[derive(serde::Deserialize)]
 struct CredentialsFile {
-    jira: Option<CredentialsFileJira>,
-    grafana: Option<CredentialsFileGrafana>,
+    jira: Option<CredentialsFileToken>,
+    grafana: Option<CredentialsFileToken>,
+    gitlab: Option<CredentialsFileToken>,
 }
 
 #[derive(serde::Deserialize)]
-struct CredentialsFileJira {
-    api_token: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct CredentialsFileGrafana {
+struct CredentialsFileToken {
     api_token: Option<String>,
 }
 
@@ -318,11 +355,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn credentials_file_parses_jira_and_grafana_sections() {
+    fn credentials_file_parses_every_token_section() {
         let file: CredentialsFile = json5::from_str(
             r#"{
                 jira: { api_token: "jt" },
                 grafana: { api_token: "gt" },
+                gitlab: { api_token: "glt" },
             }"#,
         )
         .expect("valid credentials file");
@@ -331,50 +369,74 @@ mod tests {
             file.grafana.and_then(|g| g.api_token).as_deref(),
             Some("gt")
         );
+        assert_eq!(
+            file.gitlab.and_then(|g| g.api_token).as_deref(),
+            Some("glt")
+        );
 
-        // Both sections are optional.
+        // Every section is optional.
         let file: CredentialsFile = json5::from_str("{}").expect("empty file is valid");
         assert!(file.jira.is_none());
         assert!(file.grafana.is_none());
+        assert!(file.gitlab.is_none());
     }
 
     #[test]
-    fn merge_grafana_token_preserves_other_sections() {
+    fn merge_token_preserves_the_other_sections() {
         let existing = r#"{
             // hand-written comment (lost on rewrite, values must survive)
             jira: { api_token: "jt" },
             grafana: { api_token: "old" },
+            gitlab: { api_token: "glt" },
         }"#;
         let merged =
-            merge_grafana_token_into_credentials(Some(existing), "new-token").expect("merges");
+            merge_token_into_credentials(Some(existing), "grafana", "new-token").expect("merges");
         let file: CredentialsFile = json5::from_str(&merged).expect("output parses");
         assert_eq!(file.jira.and_then(|j| j.api_token).as_deref(), Some("jt"));
         assert_eq!(
             file.grafana.and_then(|g| g.api_token).as_deref(),
             Some("new-token")
         );
-    }
+        assert_eq!(
+            file.gitlab.and_then(|g| g.api_token).as_deref(),
+            Some("glt"),
+            "the gitlab token must survive a grafana rewrite"
+        );
 
-    #[test]
-    fn merge_grafana_token_creates_file_content_from_scratch() {
-        let merged = merge_grafana_token_into_credentials(None, "t0k3n").expect("merges");
+        // ...and the mirror image: writing gitlab leaves grafana alone.
+        let merged =
+            merge_token_into_credentials(Some(existing), "gitlab", "fresh").expect("merges");
         let file: CredentialsFile = json5::from_str(&merged).expect("output parses");
-        assert!(file.jira.is_none());
+        assert_eq!(
+            file.gitlab.and_then(|g| g.api_token).as_deref(),
+            Some("fresh")
+        );
         assert_eq!(
             file.grafana.and_then(|g| g.api_token).as_deref(),
-            Some("t0k3n")
+            Some("old")
         );
     }
 
     #[test]
-    fn merge_grafana_token_preserves_unknown_sections() {
+    fn merge_token_creates_file_content_from_scratch() {
+        for section in ["grafana", "gitlab"] {
+            let merged = merge_token_into_credentials(None, section, "t0k3n").expect("merges");
+            let root: serde_json::Value = json5::from_str(&merged).expect("output parses");
+            assert_eq!(root[section]["api_token"], "t0k3n");
+            let file: CredentialsFile = json5::from_str(&merged).expect("output parses");
+            assert!(file.jira.is_none());
+        }
+    }
+
+    #[test]
+    fn merge_token_preserves_unknown_sections() {
         // Future sections (or user extras) must survive the rewrite even
         // though CredentialsFile doesn't model them.
         let existing = r#"{ future_thing: { key: "v" }, jira: { api_token: "jt" } }"#;
-        let merged = merge_grafana_token_into_credentials(Some(existing), "gt").expect("merges");
+        let merged = merge_token_into_credentials(Some(existing), "gitlab", "glt").expect("merges");
         let root: serde_json::Value = json5::from_str(&merged).expect("output parses");
         assert_eq!(root["future_thing"]["key"], "v");
         assert_eq!(root["jira"]["api_token"], "jt");
-        assert_eq!(root["grafana"]["api_token"], "gt");
+        assert_eq!(root["gitlab"]["api_token"], "glt");
     }
 }

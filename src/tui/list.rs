@@ -267,6 +267,31 @@ fn issue_row(
         ]);
     }
 
+    // Merge requests have no Jira-style key — label them by `!iid` plus the
+    // title and/or project name per the source's `label` option.
+    if let Some(mr) = item.as_gitlab() {
+        let mode = src_cfg
+            .and_then(|s| s.gitlab.as_ref())
+            .map(|g| g.label)
+            .unwrap_or_default();
+        let mut label_raw = mr.list_label(mode);
+        let badges = mr_badges(mr, item, src_cfg);
+        if !badges.is_empty() {
+            label_raw = format!("{label_raw} {badges}");
+        }
+        let label = truncate(&label_raw, 68).to_string();
+        let status = format!("{:>16}", truncate(item.status_name(), 16));
+        return Line::from(vec![
+            Span::styled(format!("{symbol} "), base_style),
+            Span::styled(format!("{:<7}", mr.short_ref()), base_style),
+            Span::styled(label, base_style),
+            Span::styled(
+                format!(" {status}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]);
+    }
+
     let key = format!("{:<12}", item.key());
     let priority = item.priority_symbol();
     let status = format!("{:>16}", truncate(item.status_name(), 16));
@@ -285,6 +310,30 @@ fn issue_row(
             Style::default().add_modifier(Modifier::DIM),
         ),
     ])
+}
+
+/// Merge-request row badges: the blockers the status digest can't fit at once
+/// (it only shows the single most blocking one), plus the source's own badges.
+fn mr_badges(
+    mr: &crate::gitlab::types::MergeRequest,
+    item: &WorkItem,
+    src_cfg: Option<&SourceConfig>,
+) -> String {
+    let mut badges = Vec::new();
+    if mr.has_conflicts {
+        badges.push("[⚠ conflicts]".to_owned());
+    }
+    if mr.ci_status.as_deref() == Some("failed") {
+        badges.push("[✗ CI]".to_owned());
+    }
+    if mr.threads_resolved == Some(false) {
+        badges.push("[~ threads]".to_owned());
+    }
+    let configured = issue_badges(item, src_cfg);
+    if !configured.is_empty() {
+        badges.push(configured);
+    }
+    badges.join(" ")
 }
 
 fn issue_badges(item: &WorkItem, src_cfg: Option<&SourceConfig>) -> String {

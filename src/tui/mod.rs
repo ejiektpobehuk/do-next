@@ -27,11 +27,10 @@ use tokio::time::{Duration, interval};
 
 use crate::config::LoadedConfig;
 use crate::config::hidden::{HiddenState, hidden_path};
-use crate::confluence::ConfluenceClient;
 use crate::events::{ActionResult, AppEvent};
 use crate::jira::JiraClient;
 use crate::sources::{
-    Clients,
+    Clients, TeamClients,
     fetcher::{
         spawn_all_statuses_fetch, spawn_jira_search, spawn_preload_details, spawn_projects_fetch,
         spawn_refresh_issue, spawn_team_statuses_fetch,
@@ -109,10 +108,13 @@ async fn run_inner(
             if let Some(team) = app.resolved_teams.get(app.active_team_idx)
                 && let Some(team_client) = clients_map.jira.get(&team.jira.base_url)
             {
-                let team_confluence = clients_map.confluence.get(&team.confluence.base_url);
+                let team_clients = TeamClients {
+                    jira: team_client,
+                    confluence: clients_map.confluence.get(&team.confluence.base_url),
+                    gitlab: clients_map.gitlab.get(&team.gitlab.base_url),
+                };
                 spawn_fetches(
-                    team_client,
-                    team_confluence,
+                    team_clients,
                     app.team_config(),
                     app.detail_load,
                     &app.cache,
@@ -151,11 +153,15 @@ async fn run_inner(
 
         // Resolve the current team's clients for actions
         let active_team = app.resolved_teams.get(app.active_team_idx);
-        let active_client_ref = active_team
-            .and_then(|t| clients_map.jira.get(&t.jira.base_url))
-            .unwrap_or(&client);
-        let active_confluence_ref =
-            active_team.and_then(|t| clients_map.confluence.get(&t.confluence.base_url));
+        let active_clients = TeamClients {
+            jira: active_team
+                .and_then(|t| clients_map.jira.get(&t.jira.base_url))
+                .unwrap_or(&client),
+            confluence: active_team
+                .and_then(|t| clients_map.confluence.get(&t.confluence.base_url)),
+            gitlab: active_team.and_then(|t| clients_map.gitlab.get(&t.gitlab.base_url)),
+        };
+        let active_client_ref = active_clients.jira;
 
         maybe_spawn_field_names_fetch(&mut app, active_client_ref, &tx);
 
@@ -171,14 +177,7 @@ async fn run_inner(
         handle_pending_comment_edit(terminal, &mut app, &mut rx, &mut input_task, &tx);
 
         // Dispatch any pending action signals (transition fetch, hide, assign, move)
-        dispatch_action(
-            &mut app,
-            active_client_ref,
-            active_confluence_ref,
-            &tx,
-            &mut hidden,
-            &hidden_file,
-        )?;
+        dispatch_action(&mut app, active_clients, &tx, &mut hidden, &hidden_file)?;
 
         if app.should_quit {
             break;
@@ -216,10 +215,12 @@ fn spawn_initial_tasks(
         .and_then(|t| clients.jira.get(&t.jira.base_url))
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("No teams configured. Run do-next to set up a team."))?;
-    let active_confluence = app
-        .resolved_teams
-        .first()
-        .and_then(|t| clients.confluence.get(&t.confluence.base_url));
+    let first_team = app.resolved_teams.first();
+    let active_clients = TeamClients {
+        jira: &active_client,
+        confluence: first_team.and_then(|t| clients.confluence.get(&t.confluence.base_url)),
+        gitlab: first_team.and_then(|t| clients.gitlab.get(&t.gitlab.base_url)),
+    };
 
     // Fetch current user (best-effort; subsource sorting depends on it)
     let user_client = active_client.clone();
@@ -232,8 +233,7 @@ fn spawn_initial_tasks(
 
     // Spawn fetch tasks for the active team's sources
     spawn_fetches(
-        &active_client,
-        active_confluence,
+        active_clients,
         app.team_config(),
         app.detail_load,
         &app.cache,
@@ -430,13 +430,14 @@ fn drain_input_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) {
 #[allow(clippy::too_many_lines)]
 fn dispatch_action(
     app: &mut AppState,
-    client: &JiraClient,
-    confluence: Option<&ConfluenceClient>,
+    clients: TeamClients<'_>,
     tx: &UnboundedSender<AppEvent>,
     hidden: &mut HiddenState,
     hidden_file: &std::path::PathBuf,
 ) -> Result<()> {
-    dispatch_background_tasks(app, client, confluence, tx);
+    let client = clients.jira;
+    let confluence = clients.confluence;
+    dispatch_background_tasks(app, clients, tx);
 
     match app.action_state.clone() {
         ActionState::LoadingTransitions { issue_key } => {
@@ -587,10 +588,10 @@ fn dispatch_action(
 
 fn dispatch_background_tasks(
     app: &mut AppState,
-    client: &JiraClient,
-    confluence: Option<&ConfluenceClient>,
+    clients: TeamClients<'_>,
     tx: &UnboundedSender<AppEvent>,
 ) {
+    let client = clients.jira;
     // Silent background attachment fetch (not ActionState-driven)
     if let Some(req) = app.pending_attachment_fetch.take() {
         spawn_cache_attachment(req, false, client.clone(), tx.clone());
@@ -606,14 +607,7 @@ fn dispatch_background_tasks(
             *state = crate::tui::app::SourceState::Loading;
         }
         app.subsource_errors.clear();
-        spawn_fetches(
-            client,
-            confluence,
-            app.team_config(),
-            app.detail_load,
-            &app.cache,
-            tx,
-        );
+        spawn_fetches(clients, app.team_config(), app.detail_load, &app.cache, tx);
     }
 
     // Duty sources just spliced in by the `D` toggle (prepend mode): fetch
@@ -629,14 +623,7 @@ fn dispatch_background_tasks(
             if let Some(state) = app.sources.get_mut(id) {
                 *state = crate::tui::app::SourceState::Loading;
             }
-            crate::sources::spawn_source_fetch(
-                client,
-                confluence,
-                &src_cfg,
-                app.detail_load,
-                &app.cache,
-                tx,
-            );
+            crate::sources::spawn_source_fetch(clients, &src_cfg, app.detail_load, &app.cache, tx);
         }
         hydrate_from_cache(app, &ids);
     }

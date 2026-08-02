@@ -1,6 +1,7 @@
 mod config;
 mod confluence;
 mod events;
+mod gitlab;
 mod grafana;
 mod items;
 mod jira;
@@ -116,6 +117,20 @@ async fn main() -> Result<()> {
                     .context("Grafana token setup failed")?;
             }
         }
+        // Same for teams with GitLab sources — the merge-request token.
+        let gitlab_teams = gitlab::gitlab_api_urls(&loaded.teams);
+        if !gitlab_teams.is_empty()
+            && tui::onboarding::prompt_yes_no(
+                "\nAlso configure the GitLab token (merge requests)? [y/N]: ",
+                false,
+            )?
+        {
+            for target in &gitlab_teams {
+                tui::onboarding::gitlab::setup_gitlab_token(target, &mut loaded.raw)
+                    .await
+                    .context("GitLab token setup failed")?;
+            }
+        }
         return Ok(());
     }
 
@@ -204,7 +219,7 @@ async fn main() -> Result<()> {
             let mut configured = false;
             for target in &missing {
                 match tui::onboarding::grafana::setup_grafana_token(target, &mut loaded.raw).await {
-                    Ok(tui::onboarding::grafana::SetupOutcome::Configured) => configured = true,
+                    Ok(tui::onboarding::SetupOutcome::Configured) => configured = true,
                     Ok(_) => {}
                     // A failed setup must not block the launch; the on-call
                     // check below reports the still-missing token.
@@ -215,6 +230,25 @@ async fn main() -> Result<()> {
                 loaded = config::load().context("Failed to reload configuration")?;
             }
         }
+
+        // Same offer for teams with GitLab sources and no token anywhere. A
+        // declined or failed setup must not block the launch — the GitLab
+        // sources report the missing token as their own error rows.
+        let missing = gitlab::teams_missing_token(&loaded.teams);
+        if !missing.is_empty() {
+            let mut configured = false;
+            for target in &missing {
+                match tui::onboarding::gitlab::setup_gitlab_token(target, &mut loaded.raw).await {
+                    Ok(tui::onboarding::SetupOutcome::Configured) => configured = true,
+                    Ok(_) => {}
+                    Err(e) => eprintln!("warning: GitLab token setup failed: {e:#}"),
+                }
+            }
+            if configured {
+                loaded = config::load().context("Failed to reload configuration")?;
+            }
+        }
+
         let duty_errors = grafana::apply_on_duty_sources(&mut loaded.teams).await;
         loaded.load_errors.extend(duty_errors);
     }
@@ -223,6 +257,7 @@ async fn main() -> Result<()> {
     let mut clients = sources::Clients {
         jira: std::collections::HashMap::new(),
         confluence: std::collections::HashMap::new(),
+        gitlab: std::collections::HashMap::new(),
     };
     for team in &loaded.teams {
         let url = &team.jira.base_url;
@@ -275,6 +310,41 @@ async fn main() -> Result<()> {
         }
         .with_context(|| format!("Failed to create Confluence client for team '{}'", team.id))?;
         clients.confluence.insert(url, client);
+    }
+
+    // Build one GitlabClient per unique instance, but only for teams whose
+    // normal or on-duty sources include a GitLab source (the `D` toggle can
+    // add duty sources at runtime). A missing token is not fatal: the source
+    // reports it, so the rest of the list still loads.
+    for team in &loaded.teams {
+        if !team.uses_gitlab() {
+            continue;
+        }
+        let url = team.gitlab.base_url.clone();
+        if clients.gitlab.contains_key(&url) {
+            continue;
+        }
+        match config::credentials::resolve_gitlab_token(&team.gitlab) {
+            Ok(Some(token)) => {
+                let client = gitlab::GitlabClient::new(&url, token).with_context(|| {
+                    format!("Failed to create GitLab client for team '{}'", team.id)
+                })?;
+                clients.gitlab.insert(url, client);
+            }
+            Ok(None) => {
+                eprintln!(
+                    "warning: team '{}': no GitLab token configured for {url} \
+                     (run `do-next auth` to set it up)",
+                    team.id
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: team '{}': GitLab token resolution failed: {e:#}",
+                    team.id
+                );
+            }
+        }
     }
 
     // For subcommands, use the first team's client (or default jira).

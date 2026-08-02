@@ -5394,6 +5394,7 @@ mod tests {
             open_slack_in_app: true,
             slack_team_id: None,
             grafana: None,
+            gitlab: cfg::ResolvedGitlab::default(),
             on_duty: false,
         }
     }

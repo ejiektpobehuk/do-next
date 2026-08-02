@@ -1,4 +1,5 @@
 mod company;
+pub mod gitlab;
 pub mod grafana;
 
 pub use company::{run_company_join_command, run_company_teams_command};
@@ -31,6 +32,35 @@ const AUTH_METHOD_DESCRIPTIONS: [&str; AUTH_METHOD_COUNT] = [
     "create a token at id.atlassian.com (recommended)",
     "requires an app registered by you at developer.atlassian.com",
 ];
+
+/// Result of one interactive side-service token setup (Grafana `OnCall`,
+/// GitLab). Both flows share it so `main` can treat them alike.
+pub enum SetupOutcome {
+    /// A token was stored (and, for keyring/command, the user config updated)
+    /// — the caller should reload the config so resolution picks it up.
+    Configured,
+    /// The user skipped; ask again next launch, or via `do-next auth`.
+    Declined,
+    /// The user chose the env var; instructions were printed, nothing stored.
+    EnvOnly,
+}
+
+/// Persist the raw user config (mirrors the `do-next auth` rewrite). Shared by
+/// the side-service token flows, which store `credential_store` /
+/// `credential_command` in the user's config.
+pub(super) fn write_user_config(raw: &Config) -> Result<()> {
+    let config_path = crate::config::user_config_path()?;
+    if config_path.exists() {
+        println!("Note: config file will be rewritten in minimal format (comments removed).");
+    }
+    if let Some(dir) = config_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let json5_content = json5::to_string(raw)?;
+    std::fs::write(&config_path, json5_content)
+        .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", config_path.display()))?;
+    Ok(())
+}
 
 // ── Step 2: storage ─────────────────────────────────────────────────────────
 
@@ -237,6 +267,7 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
         open_slack_in_app: true,
         slack_team_id: None,
         grafana: None,
+        gitlab: crate::config::types::ResolvedGitlab::default(),
         on_duty: false,
     };
 
@@ -498,6 +529,7 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
         open_slack_in_app: true,
         slack_team_id: None,
         grafana: None,
+        gitlab: crate::config::types::ResolvedGitlab::default(),
         on_duty: false,
     };
 

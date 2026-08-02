@@ -99,7 +99,7 @@ pub fn view_field_cfg(
 }
 
 /// Resolve the display label for a field, consulting API names, then the
-/// builtin Confluence field names, as fallbacks.
+/// builtin Confluence and GitLab field names, as fallbacks.
 pub fn resolve_field_label(
     field: &CustomViewFieldConfig,
     field_names: &HashMap<String, String>,
@@ -108,9 +108,16 @@ pub fn resolve_field_label(
         .name
         .as_deref()
         .or_else(|| field_names.get(&field.field_id).map(String::as_str))
-        .or_else(|| crate::confluence::types::field_name(&field.field_id))
+        .or_else(|| builtin_field_name(&field.field_id))
         .unwrap_or(&field.field_id)
         .to_string()
+}
+
+/// Builtin display name for a synthetic field id (`conf.*` / `gl.*`), which no
+/// Jira editmeta describes.
+fn builtin_field_name(field_id: &str) -> Option<&'static str> {
+    crate::confluence::types::field_name(field_id)
+        .or_else(|| crate::gitlab::types::field_name(field_id))
 }
 
 /// Public helper used by app.rs to get (`field_id`, current JSON value) for editing.
@@ -452,8 +459,7 @@ fn build_custom_segments(
             // Items without field editing render every field readonly.
             let readonly = field.readonly.unwrap_or(false) || !item.supports_field_edit();
             let is_markdown = item.field(&field.field_id).is_some_and(is_adf)
-                || (field.field_id == crate::confluence::types::FIELD_TASK
-                    && item.as_confluence().is_some());
+                || is_markdown_field(item, &field.field_id);
             segs.push(Segment::EditableField {
                 label,
                 content,
@@ -491,28 +497,40 @@ fn build_custom_segments(
     }
 }
 
+/// A synthetic field whose value is markdown rather than ADF or a plain
+/// scalar: the Confluence task body and a merge request's description.
+fn is_markdown_field(item: &WorkItem, field_id: &str) -> bool {
+    (field_id == crate::confluence::types::FIELD_TASK && item.as_confluence().is_some())
+        || (field_id == crate::gitlab::types::FIELD_DESCRIPTION && item.as_gitlab().is_some())
+}
+
 fn build_default_segments(
     segs: &mut Vec<Segment>,
     item: &WorkItem,
     width: u16,
     field_names: &HashMap<String, String>,
 ) {
-    // Description section (Jira issues carry an ADF description)
-    if let Some(issue) = item.as_jira()
-        && let Some(ref desc) = issue.fields.description
-    {
-        let text = json_to_text(desc);
-        if !text.is_empty() {
-            segs.push(Segment::ReadOnly {
-                lines: vec![
-                    Line::from(""),
-                    section_sep("Description", width),
-                    Line::from(""),
-                ],
-            });
-            let desc_lines = markdown_to_lines(&text.replace('\r', ""));
-            segs.push(Segment::ReadOnly { lines: desc_lines });
-        }
+    // Description section — Jira issues carry an ADF description; merge
+    // requests carry plain markdown in `gl.description`.
+    let description = item
+        .as_jira()
+        .and_then(|issue| issue.fields.description.as_ref().map(json_to_text));
+    let description = description.or_else(|| {
+        item.as_gitlab()
+            .and_then(|_| item.field(crate::gitlab::types::FIELD_DESCRIPTION))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    });
+    if let Some(text) = description.filter(|t| !t.is_empty()) {
+        segs.push(Segment::ReadOnly {
+            lines: vec![
+                Line::from(""),
+                section_sep("Description", width),
+                Line::from(""),
+            ],
+        });
+        let desc_lines = markdown_to_lines(&text.replace('\r', ""));
+        segs.push(Segment::ReadOnly { lines: desc_lines });
     }
 
     // Extra fields section
@@ -525,8 +543,7 @@ fn build_default_segments(
         extra_fields.sort_by_key(|(k, _)| k.as_str());
         for (field_idx, (field_id, value)) in extra_fields.into_iter().enumerate() {
             let label = field_names.get(field_id).cloned().unwrap_or_else(|| {
-                crate::confluence::types::field_name(field_id)
-                    .map_or_else(|| field_id.clone(), str::to_owned)
+                builtin_field_name(field_id).map_or_else(|| field_id.clone(), str::to_owned)
             });
             let content = val_to_str(value);
             segs.push(Segment::EditableField {
@@ -534,9 +551,7 @@ fn build_default_segments(
                 content,
                 field_idx,
                 readonly: !item.supports_field_edit(),
-                is_markdown: is_adf(value)
-                    || (field_id == crate::confluence::types::FIELD_TASK
-                        && item.as_confluence().is_some()),
+                is_markdown: is_adf(value) || is_markdown_field(item, field_id),
             });
         }
     }
@@ -618,7 +633,40 @@ fn header_lines(item: &WorkItem, full: bool) -> Vec<Line<'static>> {
     match item {
         WorkItem::Jira(issue) => jira_header_lines(issue, full),
         WorkItem::Confluence(task) => confluence_header_lines(task, full),
+        WorkItem::Gitlab(mr) => gitlab_header_lines(mr, full),
     }
+}
+
+fn gitlab_header_lines(mr: &crate::gitlab::types::MergeRequest, full: bool) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::raw(format!("{} {}", mr.short_ref(), mr.title)),
+        Span::raw("  "),
+        Span::styled(
+            mr.status_label.clone(),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ])];
+
+    if full {
+        if let Some(project) = &mr.project_path {
+            lines.push(kv_line("Project", project));
+        }
+        if let Some(author) = &mr.author {
+            lines.push(kv_line("Author", author));
+        }
+        if !mr.reviewers.is_empty() {
+            lines.push(kv_line("Reviewers", &mr.reviewers.join(", ")));
+        }
+        if let (Some(source), Some(target)) = (&mr.source_branch, &mr.target_branch) {
+            lines.push(kv_line("Branches", &format!("{source} → {target}")));
+        }
+        lines.push(kv_line("Approvals", &mr.approvals_summary()));
+        lines.push(kv_line("CI", mr.ci_status.as_deref().unwrap_or("—")));
+        lines.push(kv_line("Key", &mr.key));
+    }
+
+    lines.push(Line::from(""));
+    lines
 }
 
 fn confluence_header_lines(

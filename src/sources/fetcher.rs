@@ -7,6 +7,7 @@ use crate::config::types::{
 };
 use crate::confluence::ConfluenceClient;
 use crate::events::{ActionResult, AppEvent};
+use crate::gitlab::GitlabClient;
 use crate::items::WorkItem;
 use crate::jira::JiraClient;
 use crate::jira::types::{BoardSwimlanes, BoardType, Issue};
@@ -454,6 +455,42 @@ pub fn spawn_confluence_fetch(
                     .collect();
                 log::debug!(
                     "Source '{}' fetch complete: {} tasks",
+                    source_id,
+                    items.len()
+                );
+                crate::sources::cache::write(&cache, &source_id, &items, None, None);
+                let _ = tx.send(AppEvent::SourceLoaded(source_id, items));
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::SourceError(source_id, e));
+            }
+        }
+    });
+}
+
+/// Spawn a background task that fetches GitLab merge requests for one source
+/// and sends `AppEvent::SourceLoaded` / `SourceError` when done.
+pub fn spawn_gitlab_fetch(
+    client: GitlabClient,
+    source_cfg: SourceConfig,
+    cache: CacheConfig,
+    tx: UnboundedSender<AppEvent>,
+) {
+    let source_id = source_cfg.id.clone();
+    tokio::spawn(async move {
+        let filters = source_cfg.gitlab.clone().unwrap_or_default();
+        match client.fetch_merge_requests(&filters).await {
+            Ok(merge_requests) => {
+                let items: Vec<WorkItem> = merge_requests
+                    .into_iter()
+                    .map(|mr| {
+                        let mut item = WorkItem::Gitlab(mr);
+                        item.set_source(source_id.clone(), 0);
+                        item
+                    })
+                    .collect();
+                log::debug!(
+                    "Source '{}' fetch complete: {} merge request(s)",
                     source_id,
                     items.len()
                 );

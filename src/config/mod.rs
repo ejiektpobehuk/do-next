@@ -8,8 +8,9 @@ use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
 use types::{
-    Config, ConfluenceConfig, GrafanaConfig, JiraConfig, ResolvedGrafana, ResolvedTeam, SourceKind,
-    TeamConfig, TeamGrafanaConfig, TeamJiraOverride, TeamRef,
+    Config, ConfluenceConfig, GitlabConfig, GrafanaConfig, JiraConfig, ResolvedGitlab,
+    ResolvedGrafana, ResolvedTeam, SourceKind, TeamConfig, TeamGrafanaConfig, TeamJiraOverride,
+    TeamRef,
 };
 
 /// Result of loading user config + all team configs.
@@ -69,6 +70,8 @@ pub fn load() -> Result<LoadedConfig> {
                 if let Some(e) = grafana_error {
                     load_errors.push(e);
                 }
+                let gitlab =
+                    resolve_team_gitlab(config.gitlab.as_ref(), team_config.gitlab.as_ref());
                 let normal_sources = team_config.sources.clone();
                 teams.push(ResolvedTeam {
                     id: team_ref.id.clone(),
@@ -79,6 +82,7 @@ pub fn load() -> Result<LoadedConfig> {
                     open_slack_in_app,
                     slack_team_id,
                     grafana,
+                    gitlab,
                     normal_sources,
                     on_duty: false,
                 });
@@ -127,6 +131,7 @@ fn resolve_company(config: &mut Config, load_errors: &mut Vec<String>) -> Vec<Te
         config.open_slack_in_app = manifest.defaults.open_slack_in_app;
     }
     apply_grafana_defaults(&mut config.grafana, manifest.defaults.grafana.as_ref());
+    apply_gitlab_defaults(&mut config.gitlab, manifest.defaults.gitlab.as_ref());
     let (refs, errors) = company::company_team_refs(&dir, &manifest, &company_ref.teams);
     load_errors.extend(errors);
     refs
@@ -157,6 +162,57 @@ fn apply_grafana_defaults(user: &mut Option<GrafanaConfig>, company: Option<&Gra
     if user.credential_key.is_none() {
         user.credential_key.clone_from(&company.credential_key);
     }
+}
+
+/// Fill unset user GitLab fields from the company defaults, field by field —
+/// a user may set only `credential_command` while taking the company
+/// `base_url`. Precedence stays: team override > user config > company
+/// manifest > `https://gitlab.com`.
+fn apply_gitlab_defaults(user: &mut Option<GitlabConfig>, company: Option<&GitlabConfig>) {
+    let Some(company) = company else {
+        return;
+    };
+    let user = user.get_or_insert_with(GitlabConfig::default);
+    if user.base_url.is_none() {
+        user.base_url.clone_from(&company.base_url);
+    }
+    if user.credential_command.is_none() {
+        user.credential_command
+            .clone_from(&company.credential_command);
+    }
+    if user.credential_store.is_none() {
+        user.credential_store.clone_from(&company.credential_store);
+    }
+    if user.credential_key.is_none() {
+        user.credential_key.clone_from(&company.credential_key);
+    }
+}
+
+/// Merge the effective GitLab connection: team override → company-merged user
+/// config → `https://gitlab.com`. Unlike Grafana this cannot fail: `base_url`
+/// has a default, so every team gets a usable value (whether it has GitLab
+/// sources is a separate question — see [`ResolvedTeam::uses_gitlab`]).
+fn resolve_team_gitlab(user: Option<&GitlabConfig>, team: Option<&GitlabConfig>) -> ResolvedGitlab {
+    let mut resolved = ResolvedGitlab::default();
+    for overlay in [user, team].into_iter().flatten() {
+        if let Some(url) = &overlay.base_url {
+            url.trim_end_matches('/').clone_into(&mut resolved.base_url);
+        }
+        if overlay.credential_command.is_some() {
+            resolved
+                .credential_command
+                .clone_from(&overlay.credential_command);
+        }
+        if overlay.credential_store.is_some() {
+            resolved
+                .credential_store
+                .clone_from(&overlay.credential_store);
+        }
+        if overlay.credential_key.is_some() {
+            resolved.credential_key.clone_from(&overlay.credential_key);
+        }
+    }
+    resolved
 }
 
 /// Combine a team's `grafana` block (schedule + duty sources) with the
@@ -522,6 +578,216 @@ mod tests {
             ..Default::default()
         });
         assert!(validate_source_config(&ok).is_ok());
+    }
+
+    // ── GitLab sources ────────────────────────────────────────────────────
+
+    fn gitlab_source(filters: types::GitlabFilters) -> SourceConfig {
+        SourceConfig {
+            id: "reviews".into(),
+            kind: SourceKind::Gitlab,
+            gitlab: Some(filters),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gitlab_source_parses_with_filters() {
+        let src: SourceConfig = json5::from_str(
+            r#"{
+                id: "reviews",
+                kind: "gitlab",
+                display_name: "My reviews",
+                gitlab: {
+                    role: "reviewer",
+                    state: "opened",
+                    groups: ["backend"],
+                    projects: ["backend/api"],
+                    labels: ["needs-review"],
+                    draft: "exclude",
+                    label: "both",
+                },
+                allow_hide_for_a_day: true,
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(src.kind, SourceKind::Gitlab);
+        let filters = src.gitlab.as_ref().expect("gitlab filters");
+        assert_eq!(filters.role, types::GitlabRole::Reviewer);
+        assert_eq!(filters.groups, vec!["backend"]);
+        assert_eq!(filters.projects, vec!["backend/api"]);
+        assert_eq!(filters.labels, vec!["needs-review"]);
+        assert_eq!(filters.draft, types::DraftFilter::Exclude);
+        assert!(src.allow_hide_for_a_day);
+        assert!(validate_source_config(&src).is_ok());
+
+        // The whole filter block is optional — "my open MRs as reviewer".
+        let bare: SourceConfig = json5::from_str(r#"{ id: "reviews", kind: "gitlab" }"#).unwrap();
+        assert!(bare.gitlab.is_none());
+        assert!(validate_source_config(&bare).is_ok());
+    }
+
+    #[test]
+    fn gitlab_source_rejects_jira_and_confluence_options() {
+        let mut with_jql = gitlab_source(types::GitlabFilters::default());
+        with_jql.jql = "project = X".into();
+        let err = validate_source_config(&with_jql).expect_err("must reject jql");
+        assert!(err.to_string().contains("jql"), "{err}");
+
+        let mut with_subsources = gitlab_source(types::GitlabFilters::default());
+        with_subsources.subsources = vec![types::SubsourceConfig::default()];
+        assert!(validate_source_config(&with_subsources).is_err());
+
+        let mut with_expected = gitlab_source(types::GitlabFilters::default());
+        with_expected.expected_project = Some("OPS".into());
+        assert!(validate_source_config(&with_expected).is_err());
+
+        let mut with_board = gitlab_source(types::GitlabFilters::default());
+        with_board.board = Some(types::BoardFilters {
+            board_id: 42,
+            ..Default::default()
+        });
+        assert!(validate_source_config(&with_board).is_err());
+
+        let mut with_confluence = gitlab_source(types::GitlabFilters::default());
+        with_confluence.confluence = Some(ConfluenceFilters::default());
+        assert!(validate_source_config(&with_confluence).is_err());
+    }
+
+    #[test]
+    fn every_other_source_kind_rejects_a_gitlab_block() {
+        for kind in [
+            SourceKind::Jira,
+            SourceKind::Confluence,
+            SourceKind::Board,
+            SourceKind::Backlog,
+        ] {
+            let src = SourceConfig {
+                id: "s".into(),
+                kind,
+                gitlab: Some(types::GitlabFilters::default()),
+                // Board kinds need an otherwise-valid board block so the
+                // gitlab rejection is what fails, not a missing board_id.
+                board: matches!(kind, SourceKind::Board | SourceKind::Backlog).then(|| {
+                    types::BoardFilters {
+                        board_id: 42,
+                        ..Default::default()
+                    }
+                }),
+                ..Default::default()
+            };
+            let err = validate_source_config(&src).expect_err("must reject: {kind:?}");
+            assert!(
+                err.to_string().contains("gitlab"),
+                "kind {kind:?} rejected for the wrong reason: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn gitlab_filters_validate_paths_labels_and_username() {
+        let empty_group = gitlab_source(types::GitlabFilters {
+            groups: vec![" ".into()],
+            ..Default::default()
+        });
+        assert!(validate_source_config(&empty_group).is_err());
+
+        let empty_label = gitlab_source(types::GitlabFilters {
+            labels: vec![String::new()],
+            ..Default::default()
+        });
+        assert!(validate_source_config(&empty_label).is_err());
+
+        for path in ["/backend/api", "backend/api/"] {
+            let bad = gitlab_source(types::GitlabFilters {
+                projects: vec![path.into()],
+                ..Default::default()
+            });
+            let err = validate_source_config(&bad).expect_err("must reject: {path}");
+            assert!(err.to_string().contains('/'), "{err}");
+        }
+
+        let empty_username = gitlab_source(types::GitlabFilters {
+            username: Some("  ".into()),
+            ..Default::default()
+        });
+        assert!(validate_source_config(&empty_username).is_err());
+
+        let ok = gitlab_source(types::GitlabFilters {
+            groups: vec!["acme/backend".into()],
+            projects: vec!["backend/api".into()],
+            labels: vec!["needs-review".into()],
+            username: Some("someone".into()),
+            ..Default::default()
+        });
+        assert!(validate_source_config(&ok).is_ok());
+    }
+
+    // ── GitLab connection resolution ──────────────────────────────────────
+
+    #[test]
+    fn gitlab_precedence_is_team_over_user_over_company_over_default() {
+        // Nothing configured anywhere → gitlab.com.
+        let resolved = resolve_team_gitlab(None, None);
+        assert_eq!(resolved.base_url, types::GITLAB_DEFAULT_BASE_URL);
+        assert_eq!(resolved.credential_store, None);
+
+        // Company defaults fill an absent user block wholesale...
+        let company = GitlabConfig {
+            base_url: Some("https://gitlab.company.com".into()),
+            credential_store: Some("keyring".into()),
+            ..Default::default()
+        };
+        let mut user = None;
+        apply_gitlab_defaults(&mut user, Some(&company));
+        let resolved = resolve_team_gitlab(user.as_ref(), None);
+        assert_eq!(resolved.base_url, "https://gitlab.company.com");
+        assert_eq!(resolved.credential_store.as_deref(), Some("keyring"));
+
+        // ...but only unset fields: the user's own base_url wins.
+        let mut user = Some(GitlabConfig {
+            base_url: Some("https://gitlab.mine.com".into()),
+            ..Default::default()
+        });
+        apply_gitlab_defaults(&mut user, Some(&company));
+        let resolved = resolve_team_gitlab(user.as_ref(), None);
+        assert_eq!(resolved.base_url, "https://gitlab.mine.com");
+        assert_eq!(resolved.credential_store.as_deref(), Some("keyring"));
+
+        // And a team override beats the user config, field by field.
+        let team = GitlabConfig {
+            credential_key: Some("team-key".into()),
+            ..Default::default()
+        };
+        let resolved = resolve_team_gitlab(user.as_ref(), Some(&team));
+        assert_eq!(resolved.base_url, "https://gitlab.mine.com");
+        assert_eq!(resolved.credential_key.as_deref(), Some("team-key"));
+        assert_eq!(resolved.credential_store.as_deref(), Some("keyring"));
+
+        // No company defaults at all: user config untouched.
+        let mut user = None;
+        apply_gitlab_defaults(&mut user, None);
+        assert!(user.is_none());
+    }
+
+    #[test]
+    fn gitlab_base_url_loses_its_trailing_slash() {
+        let user = GitlabConfig {
+            base_url: Some("https://gitlab.example.com/".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_team_gitlab(Some(&user), None).base_url,
+            "https://gitlab.example.com"
+        );
+    }
+
+    #[test]
+    fn gitlab_sources_need_no_extra_atlassian_scopes() {
+        let teams = [team_with_kinds(&[SourceKind::Gitlab])];
+        let extra = extra_scopes_for(&teams);
+        assert!(!extra.confluence);
+        assert!(!extra.board);
     }
 
     // ── Board sources ─────────────────────────────────────────────────────
@@ -1300,7 +1566,17 @@ mod tests {
     }
 }
 
+/// The error every non-gitlab source kind returns for a stray `gitlab` block.
+fn gitlab_block_not_allowed(source_id: &str) -> anyhow::Error {
+    anyhow!("source '{source_id}': `gitlab` filters are only valid with `kind: \"gitlab\"`")
+}
+
 fn validate_source_config(source: &types::SourceConfig) -> Result<()> {
+    // Every kind but `gitlab` rejects a `gitlab` block; checked once here so
+    // each arm below only spells out its own remaining rules.
+    if source.kind != SourceKind::Gitlab && source.gitlab.is_some() {
+        return Err(gitlab_block_not_allowed(&source.id));
+    }
     match source.kind {
         SourceKind::Jira => {
             if source.confluence.is_some() {
@@ -1316,6 +1592,7 @@ fn validate_source_config(source: &types::SourceConfig) -> Result<()> {
                 ));
             }
         }
+        SourceKind::Gitlab => validate_gitlab_source(source)?,
         SourceKind::Confluence => {
             if !source.jql.is_empty() {
                 return Err(anyhow!(
@@ -1347,6 +1624,79 @@ fn validate_source_config(source: &types::SourceConfig) -> Result<()> {
         }
         SourceKind::Board => validate_board_source(source)?,
         SourceKind::Backlog => validate_backlog_source(source)?,
+    }
+    Ok(())
+}
+
+fn validate_gitlab_source(source: &types::SourceConfig) -> Result<()> {
+    if !source.jql.is_empty() {
+        return Err(anyhow!(
+            "source '{}': `jql` is not valid for a gitlab source (use the `gitlab` filter block)",
+            source.id
+        ));
+    }
+    if !source.subsources.is_empty() {
+        return Err(anyhow!(
+            "source '{}': `subsources` are not valid for a gitlab source",
+            source.id
+        ));
+    }
+    if source.expected_project.is_some() {
+        return Err(anyhow!(
+            "source '{}': `expected_project` is not valid for a gitlab source",
+            source.id
+        ));
+    }
+    if source.board.is_some() {
+        return Err(anyhow!(
+            "source '{}': `board` filters are only valid with `kind: \"board\"` or `kind: \"backlog\"`",
+            source.id
+        ));
+    }
+    if source.confluence.is_some() {
+        return Err(anyhow!(
+            "source '{}': `confluence` filters are only valid with `kind: \"confluence\"`",
+            source.id
+        ));
+    }
+    if let Some(filters) = &source.gitlab {
+        validate_gitlab_filters(&source.id, filters)?;
+    }
+    Ok(())
+}
+
+fn validate_gitlab_filters(source_id: &str, filters: &types::GitlabFilters) -> Result<()> {
+    for (label, values) in [
+        ("groups", &filters.groups),
+        ("projects", &filters.projects),
+        ("labels", &filters.labels),
+    ] {
+        for value in values {
+            if value.trim().is_empty() {
+                return Err(anyhow!(
+                    "source '{source_id}': `{label}` entries must not be empty"
+                ));
+            }
+        }
+    }
+    // Group/project paths are URL-encoded into a single path segment, so a
+    // stray slash silently addresses the wrong namespace.
+    for (label, values) in [("groups", &filters.groups), ("projects", &filters.projects)] {
+        for value in values {
+            if value.starts_with('/') || value.ends_with('/') {
+                return Err(anyhow!(
+                    "source '{source_id}': `{label}` entry \"{value}\" must be a full path \
+                     without leading or trailing '/' (e.g. \"backend/api\")"
+                ));
+            }
+        }
+    }
+    if let Some(username) = &filters.username
+        && username.trim().is_empty()
+    {
+        return Err(anyhow!(
+            "source '{source_id}': `username` must not be empty (omit it to use your own)"
+        ));
     }
     Ok(())
 }
@@ -1635,7 +1985,9 @@ pub fn extra_scopes_for<'a>(
             match source.kind {
                 SourceKind::Confluence => extra.confluence = true,
                 SourceKind::Board | SourceKind::Backlog => extra.board = true,
-                SourceKind::Jira => {}
+                // GitLab authenticates with its own personal access token, not
+                // Atlassian OAuth.
+                SourceKind::Jira | SourceKind::Gitlab => {}
             }
         }
     }

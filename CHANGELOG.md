@@ -4,6 +4,14 @@ All notable changes to `do-next` are documented here.
 
 `do-next` uses a date-based pre-release scheme: `v0.0.0-yyyy.mm.dd`.
 
+## Unreleased
+
+### New features
+
+- GitLab merge requests as a source kind (`kind: "gitlab"`) — read-only rows
+  with approval and CI state, sorted, badged, cached and searched like every
+  other source
+
 ## v0.0.0-2026.7.14 — 2026-07-14
 
 Third feature release.

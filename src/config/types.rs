@@ -15,6 +15,10 @@ pub struct Config {
     /// these for anything they leave unset.
     #[serde(default)]
     pub grafana: Option<GrafanaConfig>,
+    /// GitLab connection settings. Teams with `gitlab` sources use these for
+    /// anything they leave unset.
+    #[serde(default)]
+    pub gitlab: Option<GitlabConfig>,
     #[serde(default)]
     pub cache: CacheConfig,
     /// Default detail-load mode for board sources. A per-board `detail_load`
@@ -164,6 +168,10 @@ pub struct TeamConfig {
     /// the configured schedule, `on_duty_sources` replaces `sources`.
     #[serde(default)]
     pub grafana: Option<TeamGrafanaConfig>,
+    /// Optional GitLab connection overrides for this team. Unset fields fall
+    /// back to the user's `gitlab` config, then the built-in defaults.
+    #[serde(default)]
+    pub gitlab: Option<GitlabConfig>,
 }
 
 /// A fully resolved team: team ref + loaded config + effective Jira config.
@@ -186,6 +194,10 @@ pub struct ResolvedTeam {
     /// config and company defaults). `None` when the team has no `grafana`
     /// block or the merge produced a non-fatal error.
     pub grafana: Option<ResolvedGrafana>,
+    /// Effective GitLab connection (team override → user config → company
+    /// defaults → `https://gitlab.com`). Always present: `base_url` has a
+    /// default, so only [`ResolvedTeam::uses_gitlab`] says whether it matters.
+    pub gitlab: ResolvedGitlab,
     /// The team's normal source set, untouched by the on-duty swap. Kept so
     /// the on-duty view can be toggled off again at runtime.
     pub normal_sources: Vec<SourceConfig>,
@@ -196,6 +208,20 @@ pub struct ResolvedTeam {
 }
 
 impl ResolvedTeam {
+    /// True when any of the team's sources — normal or on-duty — fetches from
+    /// GitLab. Duty sources count: the `D` toggle can splice them in at
+    /// runtime, so the client and its token must exist up front.
+    pub fn uses_gitlab(&self) -> bool {
+        let duty = self
+            .grafana
+            .iter()
+            .flat_map(|grafana| &grafana.on_duty_sources);
+        self.normal_sources
+            .iter()
+            .chain(duty)
+            .any(|s| s.kind == SourceKind::Gitlab)
+    }
+
     /// Switch `config.sources` between the normal and on-duty source sets.
     /// Every consumer (tabs, fetches, lookups) reads `config.sources`, so the
     /// swap is the whole switch. No-op when the team has no usable `grafana`
@@ -270,6 +296,8 @@ pub enum SourceKind {
     /// active sprint, from `/rest/agile/1.0/board/{id}/backlog`, rendered as
     /// a plain list in its own tab.
     Backlog,
+    /// GitLab merge requests from `/api/v4/`, rendered as read-only list rows.
+    Gitlab,
 }
 
 /// Which issues a board source shows: the active sprint (default), all board
@@ -536,6 +564,172 @@ pub struct ConfluenceConfig {
     pub auth_method: Option<String>,
 }
 
+/// Whose merge requests a GitLab source lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitlabRole {
+    /// Review requested from the user — the default: this is the pile that
+    /// blocks other people.
+    #[default]
+    Reviewer,
+    Assignee,
+    Author,
+    /// No user filter at all; the group/project/label filters define the set.
+    Any,
+}
+
+/// Which merge-request states a GitLab source lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitlabState {
+    #[default]
+    Opened,
+    Merged,
+    Closed,
+    All,
+}
+
+impl GitlabState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Opened => "opened",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+            Self::All => "all",
+        }
+    }
+}
+
+/// How draft merge requests are treated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DraftFilter {
+    #[default]
+    Include,
+    Exclude,
+    Only,
+}
+
+/// What identifies a merge request in the list: its title, the project it
+/// lives in, or both ("title · group/project").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitlabLabel {
+    Title,
+    Project,
+    #[default]
+    Both,
+}
+
+/// How a GitLab source orders its merge requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitlabOrderBy {
+    CreatedAt,
+    #[default]
+    UpdatedAt,
+    Title,
+}
+
+impl GitlabOrderBy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CreatedAt => "created_at",
+            Self::UpdatedAt => "updated_at",
+            Self::Title => "title",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirection {
+    Asc,
+    #[default]
+    Desc,
+}
+
+impl SortDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+}
+
+/// Per-source GitLab merge-request filters. An absent block means "open merge
+/// requests where review is requested from me".
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct GitlabFilters {
+    /// Whose merge requests to list. Defaults to `reviewer`.
+    #[serde(default)]
+    pub role: GitlabRole,
+    /// Whose queue to read. Absent = the token's own user.
+    pub username: Option<String>,
+    #[serde(default)]
+    pub state: GitlabState,
+    /// Group full paths (e.g. "backend" or "acme/backend"). Absent = the
+    /// instance-wide merge-request endpoint.
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// Project full paths (e.g. "backend/api").
+    #[serde(default)]
+    pub projects: Vec<String>,
+    /// Merge requests must carry all of these labels.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub draft: DraftFilter,
+    #[serde(default)]
+    pub order_by: GitlabOrderBy,
+    #[serde(default)]
+    pub sort: SortDirection,
+    /// How a merge request is labeled in the list: "title", "project", or
+    /// "both" (default, "title · group/project").
+    #[serde(default)]
+    pub label: GitlabLabel,
+}
+
+/// Partial GitLab connection overrides. All fields optional — the effective
+/// value merges team override > user config > company manifest, and
+/// `base_url` falls back to [`GITLAB_DEFAULT_BASE_URL`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct GitlabConfig {
+    /// Instance base URL, e.g. `https://gitlab.example.com`. The `/api/v4`
+    /// suffix is added by the client.
+    pub base_url: Option<String>,
+    /// Shell command whose stdout yields a GitLab personal access token.
+    pub credential_command: Option<String>,
+    /// Use OS keyring for the token ("keyring").
+    pub credential_store: Option<String>,
+    /// Key label for keyring lookup (defaults to `base_url`).
+    pub credential_key: Option<String>,
+}
+
+/// The instance used when nothing configures a `base_url`.
+pub const GITLAB_DEFAULT_BASE_URL: &str = "https://gitlab.com";
+
+/// Effective GitLab connection settings for one team.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGitlab {
+    pub base_url: String,
+    pub credential_command: Option<String>,
+    pub credential_store: Option<String>,
+    pub credential_key: Option<String>,
+}
+
+impl Default for ResolvedGitlab {
+    fn default() -> Self {
+        Self {
+            base_url: GITLAB_DEFAULT_BASE_URL.to_owned(),
+            credential_command: None,
+            credential_store: None,
+            credential_key: None,
+        }
+    }
+}
+
 /// Grafana `OnCall` connection settings. All fields optional — the effective
 /// value merges team override > user config > company manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -691,6 +885,9 @@ pub struct SourceConfig {
     /// Jira Agile board filters; only meaningful when `kind` is `board`.
     #[serde(default)]
     pub board: Option<BoardFilters>,
+    /// GitLab merge-request filters; only meaningful when `kind` is `gitlab`.
+    #[serde(default)]
+    pub gitlab: Option<GitlabFilters>,
     /// Project key for wrong-project detection (e.g. incidents).
     pub expected_project: Option<String>,
     /// Sort order within source: "updated", "created", "priority".
@@ -1071,6 +1268,7 @@ mod tests {
             open_slack_in_app: true,
             slack_team_id: None,
             grafana,
+            gitlab: ResolvedGitlab::default(),
             normal_sources: normal,
             on_duty: false,
         }
@@ -1157,6 +1355,91 @@ mod tests {
         let s = json5::to_string(&ScheduleSelector::Id("S123".into())).unwrap();
         let back: ScheduleSelector = json5::from_str(&s).unwrap();
         assert_eq!(back, ScheduleSelector::Id("S123".into()));
+    }
+
+    #[test]
+    fn gitlab_blocks_are_optional_everywhere() {
+        let cfg: Config = json5::from_str("{}").expect("valid config");
+        assert!(cfg.gitlab.is_none());
+        let team: TeamConfig = json5::from_str("{}").expect("valid team config");
+        assert!(team.gitlab.is_none());
+        assert_eq!(
+            ResolvedGitlab::default().base_url,
+            GITLAB_DEFAULT_BASE_URL,
+            "base_url falls back to gitlab.com"
+        );
+    }
+
+    #[test]
+    fn gitlab_connection_block_parses() {
+        let cfg: Config = json5::from_str(
+            r#"{ gitlab: {
+                base_url: "https://gitlab.example.com",
+                credential_store: "keyring",
+            } }"#,
+        )
+        .expect("valid config");
+        let gitlab = cfg.gitlab.expect("gitlab block");
+        assert_eq!(
+            gitlab.base_url.as_deref(),
+            Some("https://gitlab.example.com")
+        );
+        assert_eq!(gitlab.credential_store.as_deref(), Some("keyring"));
+        assert_eq!(gitlab.credential_command, None);
+    }
+
+    #[test]
+    fn gitlab_filter_enums_parse_from_lowercase_names() {
+        let filters: GitlabFilters = json5::from_str(
+            r#"{ role: "assignee", state: "all", draft: "only",
+                 order_by: "created_at", sort: "asc", label: "project" }"#,
+        )
+        .expect("valid filters");
+        assert_eq!(filters.role, GitlabRole::Assignee);
+        assert_eq!(filters.state, GitlabState::All);
+        assert_eq!(filters.draft, DraftFilter::Only);
+        assert_eq!(filters.order_by, GitlabOrderBy::CreatedAt);
+        assert_eq!(filters.sort, SortDirection::Asc);
+        assert_eq!(filters.label, GitlabLabel::Project);
+
+        // Defaults: my open MRs as reviewer, newest-updated first, labeled by
+        // title and project.
+        let default = GitlabFilters::default();
+        assert_eq!(default.role, GitlabRole::Reviewer);
+        assert_eq!(default.state, GitlabState::Opened);
+        assert_eq!(default.draft, DraftFilter::Include);
+        assert_eq!(default.order_by, GitlabOrderBy::UpdatedAt);
+        assert_eq!(default.sort, SortDirection::Desc);
+        assert_eq!(default.label, GitlabLabel::Both);
+
+        json5::from_str::<GitlabFilters>(r#"{ role: "approver" }"#)
+            .expect_err("unknown role must fail");
+        json5::from_str::<GitlabFilters>(r#"{ order_by: "popularity" }"#)
+            .expect_err("unknown order_by must fail");
+    }
+
+    #[test]
+    fn uses_gitlab_counts_normal_and_duty_sources() {
+        let gitlab_src = SourceConfig {
+            id: "reviews".into(),
+            kind: SourceKind::Gitlab,
+            ..Default::default()
+        };
+
+        let mut team = duty_team(None);
+        assert!(!team.uses_gitlab());
+
+        team.normal_sources.push(gitlab_src.clone());
+        assert!(team.uses_gitlab());
+
+        // Duty-only GitLab sources count too: `D` can splice them in later.
+        let mut duty_only = duty_team(Some(ResolvedGrafana {
+            on_duty_sources: vec![gitlab_src],
+            ..resolved_grafana(OnDutyMode::Replace)
+        }));
+        assert!(duty_only.uses_gitlab());
+        duty_only.grafana = None;
+        assert!(!duty_only.uses_gitlab());
     }
 
     #[test]

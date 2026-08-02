@@ -6,24 +6,14 @@
 use anyhow::{Context, Result};
 
 use crate::config::credentials::{
-    credentials_file_path, merge_grafana_token_into_credentials, run_credential_command,
+    credentials_file_path, merge_token_into_credentials, run_credential_command,
 };
 use crate::config::types::{Config, GrafanaConfig};
 
 use super::{
-    StorageChoice, check_keyring_available, prompt, prompt_masked, prompt_token_storage,
-    prompt_yes_no,
+    SetupOutcome, StorageChoice, check_keyring_available, prompt, prompt_masked,
+    prompt_token_storage, prompt_yes_no, write_user_config,
 };
-
-pub enum SetupOutcome {
-    /// A token was stored (and, for keyring/command, the user config updated)
-    /// — the caller should reload the config so resolution picks it up.
-    Configured,
-    /// The user skipped; ask again next launch, or via `do-next auth`.
-    Declined,
-    /// The user chose the env var; instructions were printed, nothing stored.
-    EnvOnly,
-}
 
 /// Offer to configure the `OnCall` API token for the teams behind one
 /// `OnCall` API URL. `raw` is the user's on-disk config (never the merged
@@ -73,7 +63,7 @@ pub async fn setup_grafana_token(
                     return Err(e).with_context(|| format!("Failed to read {}", path.display()));
                 }
             };
-            let merged = merge_grafana_token_into_credentials(existing.as_deref(), &token)?;
+            let merged = merge_token_into_credentials(existing.as_deref(), "grafana", &token)?;
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
@@ -157,20 +147,5 @@ async fn greet(oncall_api_url: &str, token: String) -> Result<()> {
     let user = crate::grafana::validate_token(oncall_api_url, token).await?;
     let name = user.username.or(user.email).unwrap_or(user.id);
     println!("Authenticated as {name}.");
-    Ok(())
-}
-
-/// Persist the raw user config (mirrors the `do-next auth` rewrite).
-fn write_user_config(raw: &Config) -> Result<()> {
-    let config_path = crate::config::user_config_path()?;
-    if config_path.exists() {
-        println!("Note: config file will be rewritten in minimal format (comments removed).");
-    }
-    if let Some(dir) = config_path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let json5_content = json5::to_string(raw)?;
-    std::fs::write(&config_path, json5_content)
-        .with_context(|| format!("Failed to write {}", config_path.display()))?;
     Ok(())
 }
