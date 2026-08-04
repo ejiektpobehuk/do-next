@@ -116,5 +116,14 @@ fn right_column() -> Vec<Line<'static>> {
         section_header("Backlog tab"),
         key_line("Shift+↑ ↓ / K J", "move issue up / down in rank"),
         key_line("s", "send issue to a sprint"),
+        Line::raw(""),
+        section_header("Standup tab"),
+        key_line("↑ ↓ / j k", "move between entries"),
+        key_line("<  >", "reach one standup further back / less far"),
+        key_line("w", "whole week"),
+        key_line("d", "last day"),
+        key_line("y", "write the markdown digest to a file"),
+        key_line("Enter", "open the item (Esc returns to the timeline)"),
+        key_line("o", "open the item in a browser"),
     ]
 }

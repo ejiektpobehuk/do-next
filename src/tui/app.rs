@@ -632,6 +632,20 @@ pub struct AppState {
     pub detail_load: crate::config::types::DetailLoad,
     /// On-disk source cache settings (stale-while-revalidate).
     pub cache: crate::config::types::CacheConfig,
+    /// Collected standup activity per standup source (`source_id` → state).
+    /// Parallel to `sources` because a timeline is not a `Vec<WorkItem>`; the
+    /// underlying payloads still arrive through `sources` so Enter can open the
+    /// ordinary detail view.
+    pub standup_data: HashMap<String, CacheState<crate::standup::types::StandupData>>,
+    /// How far back the standup window currently reaches. Reset on team switch.
+    pub standup_shift: crate::standup::window::Shift,
+    /// Selected row index within the standup timeline's `Entry` rows.
+    pub standup_selected: usize,
+    /// Set when the standup window widened past what was fetched: the source to
+    /// refetch with broader coverage.
+    pub pending_standup_refetch: Option<String>,
+    /// Path of the last standup digest written, shown in the hint bar.
+    pub standup_digest_path: Option<String>,
 }
 
 /// Request for a silent background attachment fetch.
@@ -725,6 +739,11 @@ impl AppState {
             pending_duty_fetch: Vec::new(),
             detail_load: config.detail_load,
             cache: config.cache.clone(),
+            standup_data: HashMap::new(),
+            standup_shift: crate::standup::window::Shift::default(),
+            standup_selected: 0,
+            pending_standup_refetch: None,
+            standup_digest_path: None,
         }
     }
 
@@ -748,6 +767,13 @@ impl AppState {
         };
         self.saved_team_states
             .insert(self.active_team_idx, current_state);
+
+        // Standup state is per-source and keyed by source id, so it needs no
+        // save/restore — but the window stepping and cursor are per-*view* and
+        // would otherwise carry a previous team's position into this one.
+        self.standup_shift = crate::standup::window::Shift::default();
+        self.standup_selected = 0;
+        self.standup_digest_path = None;
 
         // Restore new team state
         self.active_team_idx = new_idx;
@@ -832,7 +858,9 @@ impl AppState {
     pub(crate) const fn is_dedicated_tab_kind(kind: crate::config::types::SourceKind) -> bool {
         matches!(
             kind,
-            crate::config::types::SourceKind::Board | crate::config::types::SourceKind::Backlog
+            crate::config::types::SourceKind::Board
+                | crate::config::types::SourceKind::Backlog
+                | crate::config::types::SourceKind::Standup
         )
     }
 
@@ -969,6 +997,90 @@ impl AppState {
     /// flat list: on a team-list tab (`board_view == None`) all dedicated-tab
     /// sources are excluded; on a board/backlog tab only that one source is
     /// included.
+    /// The active tab's standup source id, if this tab is a standup.
+    pub(crate) fn standup_source_id(&self) -> Option<&str> {
+        let id = self.board_view.as_deref()?;
+        let cfg = source_config_for(self.team_config(), id)?;
+        (cfg.kind == crate::config::types::SourceKind::Standup).then_some(id)
+    }
+
+    fn standup_filters(&self) -> crate::config::types::StandupFilters {
+        self.standup_source_id()
+            .and_then(|id| source_config_for(self.team_config(), id))
+            .and_then(|cfg| cfg.standup.clone())
+            .unwrap_or_default()
+    }
+
+    /// Timezone the timeline's days and clock times are rendered in.
+    pub(crate) fn standup_tz(&self) -> crate::datetime::TzSpec {
+        crate::datetime::TzSpec::from_config(self.standup_filters().timezone.as_deref())
+    }
+
+    /// The window currently on display, from the configured schedule plus any
+    /// on-screen stepping. Recomputed rather than stored so it always tracks
+    /// `standup_shift` and the wall clock.
+    pub(crate) fn standup_window(&self) -> crate::standup::window::Window {
+        let filters = self.standup_filters();
+        let schedule = filters.schedule.resolve().unwrap_or_default();
+        crate::standup::window::Window::resolve(
+            chrono::Utc::now(),
+            self.standup_tz(),
+            &schedule,
+            self.standup_shift,
+        )
+    }
+
+    /// Entries inside the displayed window, in timeline order.
+    fn standup_visible_entries(&self) -> Vec<crate::standup::types::StandupEntry> {
+        let window = self.standup_window();
+        self.standup_source_id()
+            .and_then(|id| self.standup_data.get(id))
+            .and_then(CacheState::loaded)
+            .map(|data| data.entries_in(&window).into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn standup_entry_count(&self) -> usize {
+        self.standup_visible_entries().len()
+    }
+
+    /// Item key under the timeline cursor.
+    fn standup_selected_item_key(&self) -> Option<String> {
+        self.standup_visible_entries()
+            .get(self.standup_selected)
+            .map(|e| e.item.key.clone())
+    }
+
+    /// URL under the timeline cursor.
+    fn standup_selected_url(&self) -> Option<String> {
+        self.standup_visible_entries()
+            .get(self.standup_selected)
+            .map(|e| e.item.url.clone())
+    }
+
+    /// After the window moved: clamp the cursor, and decide whether the new
+    /// window can be served from what was already fetched.
+    ///
+    /// Narrowing is always a local filter, which is what makes `d` and `>` feel
+    /// instant. Widening past the fetched coverage needs a refetch.
+    fn after_standup_window_change(&mut self) {
+        let window = self.standup_window();
+        let Some(source_id) = self.standup_source_id().map(str::to_owned) else {
+            return;
+        };
+        let covered = self
+            .standup_data
+            .get(&source_id)
+            .and_then(CacheState::loaded)
+            .and_then(|d| d.coverage)
+            .is_some_and(|coverage| coverage.covers(&window));
+        if !covered {
+            self.pending_standup_refetch = Some(source_id);
+        }
+        let count = self.standup_entry_count();
+        self.standup_selected = self.standup_selected.min(count.saturating_sub(1));
+    }
+
     pub(crate) fn source_in_active_tab(&self, source_id: &str) -> bool {
         let is_dedicated = source_config_for(self.team_config(), source_id)
             .is_some_and(|s| Self::is_dedicated_tab_kind(s.kind));
@@ -1116,6 +1228,8 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
                 }
             }
         }
+
+        AppEvent::StandupLoaded(source_id, data) => apply_standup_loaded(app, source_id, *data),
 
         AppEvent::SourceError(source_id, e) => {
             // Same stale-fetch guard as SourceLoaded above.
@@ -1924,6 +2038,20 @@ fn handle_attachment_cached(
     app.action_state = ActionState::None;
 }
 
+fn apply_standup_loaded(
+    app: &mut AppState,
+    source_id: String,
+    data: crate::standup::types::StandupData,
+) {
+    // Same stale-fetch guard as `SourceLoaded`: a collection spawned before a
+    // team switch may still deliver.
+    if source_config_for(app.team_config(), &source_id).is_none() {
+        return;
+    }
+    app.standup_data.insert(source_id, CacheState::Loaded(data));
+    app.standup_selected = 0;
+}
+
 fn apply_comment_posted(app: &mut AppState, issue_key: &str, new_comment: Comment) {
     if let Some(issue) = app.jira_issue_mut(issue_key) {
         let list = issue
@@ -1932,9 +2060,14 @@ fn apply_comment_posted(app: &mut AppState, issue_key: &str, new_comment: Commen
             .get_or_insert_with(|| crate::jira::types::CommentList {
                 comments: vec![],
                 total: 0,
+                max_results: 0,
+                start_at: 0,
             });
         list.comments.push(new_comment);
         list.total = u32::try_from(list.comments.len()).unwrap_or(0);
+        // The locally-grown list is complete by construction, so keep
+        // `max_results` in step or `is_truncated()` would report a false gap.
+        list.max_results = list.total;
     }
     app.action_state = ActionState::None;
 }
@@ -2831,6 +2964,12 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
         return;
     }
 
+    // Standup mode owns navigation over its own timeline rows, plus the window
+    // and digest keys. Anything it doesn't consume (Tab, q, ?) falls through.
+    if standup_mode_active(app) && handle_standup_key(app, code, modifiers) {
+        return;
+    }
+
     match (code, modifiers) {
         // Tab switching across the tab list (teams + board tabs).
         (KeyCode::Tab, _) => {
@@ -2969,6 +3108,149 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
 /// True while the kanban board covers the main area (fullscreen detail on a
 /// card temporarily leaves board key handling). Backlog tabs also live in
 /// `board_view` but render as a plain list, so they keep list navigation.
+/// True while a standup tab covers the main area.
+fn standup_mode_active(app: &AppState) -> bool {
+    app.active_tab_source_kind() == Some(crate::config::types::SourceKind::Standup)
+        && !app.fullscreen_detail
+}
+
+/// Standup-only keys: window stepping, digest export, and navigation over the
+/// timeline's entry rows. Returns true when the key was consumed.
+fn handle_standup_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    // Never swallow control chords (Ctrl+C must keep quitting).
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    let count = app.standup_entry_count();
+
+    match code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            if count > 0 {
+                app.standup_selected = (app.standup_selected + 1).min(count - 1);
+            }
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.standup_selected = app.standup_selected.saturating_sub(1);
+            true
+        }
+        KeyCode::PageDown => {
+            if count > 0 {
+                app.standup_selected = (app.standup_selected + 10).min(count - 1);
+            }
+            true
+        }
+        KeyCode::PageUp => {
+            app.standup_selected = app.standup_selected.saturating_sub(10);
+            true
+        }
+        KeyCode::Home => {
+            app.standup_selected = 0;
+            true
+        }
+        KeyCode::End => {
+            app.standup_selected = count.saturating_sub(1);
+            true
+        }
+        // Window stepping. `<` reaches one standup further back, `>` comes back.
+        KeyCode::Char('<' | ',') => {
+            app.standup_shift = app.standup_shift.widen();
+            app.after_standup_window_change();
+            true
+        }
+        KeyCode::Char('>' | '.') => {
+            app.standup_shift = app.standup_shift.narrow();
+            app.after_standup_window_change();
+            true
+        }
+        KeyCode::Char('w') => {
+            app.standup_shift = crate::standup::window::Shift::Days(7);
+            app.after_standup_window_change();
+            true
+        }
+        KeyCode::Char('d') => {
+            app.standup_shift = crate::standup::window::Shift::Days(1);
+            app.after_standup_window_change();
+            true
+        }
+        KeyCode::Char('y') => {
+            key_standup_digest(app);
+            true
+        }
+        // Enter opens the underlying item in the ordinary detail view. The
+        // payloads arrived through `SourceLoaded`, so this is a selection change
+        // plus the existing fullscreen flag — no second detail renderer.
+        KeyCode::Enter => {
+            if let Some(key) = app.standup_selected_item_key() {
+                if let Some(idx) = app.issues.iter().position(|i| i.key() == key)
+                    && let Some(nav) = app.nav_items.iter().position(|n| *n == NavItem::Issue(idx))
+                {
+                    app.nav_idx = nav;
+                    app.fullscreen_detail = true;
+                    app.detail_scroll = 0;
+                    if let Some(item) = app.selected_item() {
+                        let item = item.clone();
+                        app.view_mode = auto_view_mode(&item, app.team_config());
+                    }
+                    request_detail_load_if_partial(app);
+                    return true;
+                }
+                // Confluence pages have no WorkItem payload; opening the page in
+                // a browser is the only meaningful action.
+                key_standup_open(app);
+            }
+            true
+        }
+        KeyCode::Char('o') => {
+            key_standup_open(app);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Open the selected timeline row's item in a browser.
+fn key_standup_open(app: &AppState) {
+    if let Some(url) = app.standup_selected_url()
+        && !url.is_empty()
+    {
+        let _ = open::that_detached(url);
+    }
+}
+
+/// Write the current window's digest to a file and remember the path.
+fn key_standup_digest(app: &mut AppState) {
+    let Some(source_id) = app.standup_source_id().map(str::to_owned) else {
+        return;
+    };
+    let Some(data) = app
+        .standup_data
+        .get(&source_id)
+        .and_then(super::app::CacheState::loaded)
+    else {
+        return;
+    };
+    let window = app.standup_window();
+    let tz = app.standup_tz();
+    let markdown = crate::standup::digest::to_markdown(data, &window, tz);
+    let today = window
+        .end
+        .with_timezone(&tz.offset_at(window.end))
+        .date_naive();
+
+    match crate::standup::digest::write_to_file(&std::env::temp_dir(), today, &markdown) {
+        Ok(path) => {
+            app.standup_digest_path = Some(path.display().to_string());
+        }
+        Err(e) => {
+            app.action_state = ActionState::Error {
+                error: Arc::new(e),
+                scroll: 0,
+            };
+        }
+    }
+}
+
 fn board_mode_active(app: &AppState) -> bool {
     app.active_tab_source_kind() == Some(crate::config::types::SourceKind::Board)
         && !app.fullscreen_detail
@@ -5639,6 +5921,7 @@ mod tests {
             source_id: source_id.map(str::to_string),
             subsource_idx: 0,
             partial: false,
+            changelog: None,
         }
     }
 

@@ -20,6 +20,11 @@ pub struct Issue {
     /// Absent from Jira API responses (`default`); persisted in the cache.
     #[serde(default)]
     pub partial: bool,
+    /// Present only when the fetch asked for `expand=changelog` (the standup
+    /// collector). Skipped when serializing so the source cache does not grow a
+    /// copy of every issue's history.
+    #[serde(default, skip_serializing)]
+    pub changelog: Option<Changelog>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -102,15 +107,122 @@ pub struct ProjectField {
 pub struct CommentList {
     pub comments: Vec<Comment>,
     pub total: u32,
+    /// How many of `total` this payload carries. Needed because the `comment`
+    /// block inside a search response starts at the *oldest* comment, so on a
+    /// long-running issue the recent ones are exactly the truncated ones — the
+    /// standup collector compares these to decide whether to page properly.
+    /// `default` because the on-disk source cache holds payloads written before
+    /// these fields were read.
+    #[serde(rename = "maxResults", default)]
+    pub max_results: u32,
+    #[serde(rename = "startAt", default)]
+    pub start_at: u32,
+}
+
+impl CommentList {
+    /// True when this payload is missing comments, so the dedicated endpoint
+    /// must be paged to see recent ones.
+    pub const fn is_truncated(&self) -> bool {
+        self.total > self.max_results && self.max_results > 0
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Comment {
     pub id: String,
     pub author: UserField,
+    /// Who last edited it. Lets "comments I edited" be distinguished from
+    /// "comments I wrote"; absent on older cached payloads.
+    #[serde(rename = "updateAuthor", default)]
+    pub update_author: Option<UserField>,
     pub body: serde_json::Value,
     pub created: String,
     pub updated: String,
+}
+
+/// Envelope of `GET /rest/api/3/issue/{key}/comment`.
+#[derive(Debug, Deserialize)]
+pub struct CommentPage {
+    pub comments: Vec<Comment>,
+}
+
+/// One changegroup: a set of field changes made by one person at one instant.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChangelogEntry {
+    pub id: String,
+    #[serde(default)]
+    pub author: Option<UserField>,
+    pub created: String,
+    #[serde(default)]
+    pub items: Vec<ChangelogItem>,
+}
+
+/// One field's before/after inside a changegroup.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChangelogItem {
+    /// Human field name, e.g. "status", "description", "Story Points".
+    pub field: String,
+    /// Stable field id when Jira supplies one; absent for some synthetic rows.
+    #[serde(rename = "fieldId", default)]
+    pub field_id: Option<String>,
+    #[serde(rename = "fromString", default)]
+    pub from_string: Option<String>,
+    #[serde(rename = "toString", default)]
+    pub to_string_value: Option<String>,
+}
+
+/// The `changelog` object returned by `expand=changelog`, newest changegroup
+/// first — the opposite order to `GET /issue/{key}/changelog`, which is why the
+/// inline form is the one the standup collector wants.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct Changelog {
+    #[serde(default)]
+    pub histories: Vec<ChangelogEntry>,
+    #[serde(rename = "maxResults", default)]
+    pub max_results: u32,
+    #[serde(rename = "startAt", default)]
+    pub start_at: u32,
+    #[serde(default)]
+    pub total: u32,
+}
+
+impl Changelog {
+    /// True when the issue has more changegroups than this payload carries, so
+    /// the standalone (oldest-first) endpoint must be asked for the tail.
+    pub const fn is_truncated(&self) -> bool {
+        self.total > self.max_results && self.max_results > 0
+    }
+}
+
+/// Envelope of `GET /rest/api/3/issue/{key}/changelog` (oldest first).
+#[derive(Debug, Deserialize)]
+pub struct ChangelogPage {
+    #[serde(default)]
+    pub values: Vec<ChangelogEntry>,
+}
+
+/// One logged work entry.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Worklog {
+    pub id: String,
+    #[serde(default)]
+    pub author: Option<UserField>,
+    /// When the work happened — what `worklogDate` filters on, and the day an
+    /// entry is placed under. Distinct from `created`, when it was typed in.
+    pub started: String,
+    #[serde(default)]
+    pub created: Option<String>,
+    #[serde(rename = "timeSpentSeconds", default)]
+    pub time_spent_seconds: i64,
+    #[serde(default)]
+    pub comment: Option<serde_json::Value>,
+}
+
+/// Envelope of `GET /rest/api/3/issue/{key}/worklog`.
+#[derive(Debug, Deserialize)]
+pub struct WorklogPage {
+    #[serde(default)]
+    pub worklogs: Vec<Worklog>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -142,6 +254,26 @@ pub struct SearchResponse {
     pub is_last: bool,
     #[serde(rename = "nextPageToken", default)]
     pub next_page_token: Option<String>,
+}
+
+/// Envelope for searches that request `fields=key`.
+///
+/// Cannot reuse [`SearchResponse`]: with `fields=key` Jira omits the `fields`
+/// object entirely, and `Issue::fields` is mandatory, so deserializing into it
+/// fails with "Failed to parse search response" — which reads as an empty result
+/// to any caller that treats an error as "nothing found".
+#[derive(Debug, Deserialize)]
+pub struct KeysResponse {
+    pub issues: Vec<IssueKey>,
+    #[serde(rename = "isLast", default)]
+    pub is_last: bool,
+    #[serde(rename = "nextPageToken", default)]
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IssueKey {
+    pub key: String,
 }
 
 /// Jira REST API transitions response envelope.

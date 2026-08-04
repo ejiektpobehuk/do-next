@@ -11,8 +11,9 @@ use tokio::sync::RwLock;
 use crate::config::types::GitlabFilters;
 
 use super::types::{
-    ApiApprovals, ApiMergeRequest, ApiMergeRequestDetail, ApiUser, MergeRequest,
-    apply_enriched_fields, build_mr_query, encode_path, needs_current_user, to_display,
+    ApiApprovals, ApiEvent, ApiMergeRequest, ApiMergeRequestDetail, ApiProject, ApiUser,
+    MergeRequest, apply_enriched_fields, build_mr_query, build_standup_mr_query, encode_path,
+    needs_current_user, to_display,
 };
 
 /// Page size for list endpoints (GitLab's maximum).
@@ -233,6 +234,90 @@ impl GitlabClient {
 
         self.enrich(&mut out).await;
         Ok(out)
+    }
+
+    /// Merge requests you authored that changed since `since`.
+    ///
+    /// Deliberately *not* enriched: a standup timeline shows what you did, not
+    /// approval or CI state, so skipping enrichment saves the 2N lookups
+    /// [`Self::enrich`] would cost.
+    ///
+    /// `updated_after` is precise to the second — the events feed, by contrast,
+    /// only takes whole dates — so nothing needs widening and filtering here.
+    pub async fn fetch_my_merge_requests_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        projects: &[String],
+        groups: &[String],
+    ) -> Result<Vec<MergeRequest>> {
+        let me = self.current_username().await?;
+        let query = build_standup_mr_query(&me, since);
+        log::debug!("GitLab standup MR query: {query:?}");
+
+        let mut urls: Vec<String> = Vec::new();
+        for project in projects {
+            urls.push(self.api(&format!(
+                "/projects/{}/merge_requests",
+                encode_path(project)
+            )));
+        }
+        for group in groups {
+            urls.push(self.api(&format!("/groups/{}/merge_requests", encode_path(group))));
+        }
+        if urls.is_empty() {
+            urls.push(self.api("/merge_requests"));
+        }
+
+        let per_endpoint: Vec<Vec<ApiMergeRequest>> = futures::future::try_join_all(
+            urls.iter()
+                .map(|url| self.get_paginated::<ApiMergeRequest>(url, &query)),
+        )
+        .await?;
+
+        let mut seen: HashSet<(u64, u64)> = HashSet::new();
+        let mut out: Vec<MergeRequest> = Vec::new();
+        for batch in per_endpoint {
+            for api_mr in batch {
+                if seen.insert((api_mr.project_id, api_mr.iid)) {
+                    out.push(to_display(api_mr));
+                }
+            }
+        }
+        log::debug!("GitLab standup merge requests: {}", out.len());
+        Ok(out)
+    }
+
+    /// The authenticated user's contribution events between two dates.
+    ///
+    /// `after`/`before` are whole dates and *exclusive*, so callers pass
+    /// day-widened bounds and filter on `created_at` themselves. Opt-in because
+    /// the documented scope is `read_user`/`api` while onboarding only asks for
+    /// `read_api` — a 403 here must degrade, not fail the standup.
+    pub async fn fetch_events_between(
+        &self,
+        after: chrono::NaiveDate,
+        before: chrono::NaiveDate,
+    ) -> Result<Vec<ApiEvent>> {
+        let query = vec![
+            ("after".into(), after.format("%Y-%m-%d").to_string()),
+            ("before".into(), before.format("%Y-%m-%d").to_string()),
+        ];
+        self.get_paginated::<ApiEvent>(&self.api("/events"), &query)
+            .await
+    }
+
+    /// Projects owned by the token's user, newest first. One request; callers
+    /// filter to the window themselves.
+    pub async fn fetch_owned_projects(&self) -> Result<Vec<ApiProject>> {
+        let query = vec![
+            ("owned".into(), "true".into()),
+            ("order_by".into(), "created_at".into()),
+            ("sort".into(), "desc".into()),
+            // Without this GitLab computes counts and permissions we never read.
+            ("simple".into(), "true".into()),
+        ];
+        self.get_paginated::<ApiProject>(&self.api("/projects"), &query)
+            .await
     }
 
     /// Fill in approval state and head-pipeline status, which the list

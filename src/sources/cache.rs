@@ -25,6 +25,15 @@ pub struct SourceCache {
     /// Resolved query swimlanes (board sources with auto/query lanes only).
     #[serde(default)]
     pub lanes: Option<BoardSwimlanes>,
+    /// Collected standup activity (standup sources only).
+    ///
+    /// Unlike every other cached payload this one is window-dependent, so it
+    /// carries its own `coverage` and the reader must check that before using it.
+    /// The window is deliberately *not* part of the cache filename: `cache_file`
+    /// sanitizes ids into filenames, and a window-keyed name would accumulate a
+    /// file per window forever.
+    #[serde(default)]
+    pub standup: Option<crate::standup::types::StandupData>,
 }
 
 fn now_secs() -> u64 {
@@ -71,15 +80,39 @@ pub fn write(
     board_config: Option<&BoardConfiguration>,
     lanes: Option<&BoardSwimlanes>,
 ) {
-    if !cfg.enabled {
-        return;
-    }
     let entry = SourceCache {
         fetched_at: now_secs(),
         items: items.to_vec(),
         board_config: board_config.cloned(),
         lanes: lanes.cloned(),
+        standup: None,
     };
+    write_entry(cfg, source_id, &entry);
+}
+
+/// Persist a standup source's result: the collected activity plus the real
+/// payloads behind it, so a relaunch paints the timeline before the refetch
+/// lands.
+pub fn write_standup(
+    cfg: &CacheConfig,
+    source_id: &str,
+    items: &[WorkItem],
+    standup: &crate::standup::types::StandupData,
+) {
+    let entry = SourceCache {
+        fetched_at: now_secs(),
+        items: items.to_vec(),
+        board_config: None,
+        lanes: None,
+        standup: Some(standup.clone()),
+    };
+    write_entry(cfg, source_id, &entry);
+}
+
+fn write_entry(cfg: &CacheConfig, source_id: &str, entry: &SourceCache) {
+    if !cfg.enabled {
+        return;
+    }
     let path = cache_file(cfg, source_id);
     if let Some(dir) = path.parent()
         && let Err(e) = std::fs::create_dir_all(dir)
@@ -87,7 +120,7 @@ pub fn write(
         log::warn!("cache: create dir {} failed: {e}", dir.display());
         return;
     }
-    match serde_json::to_vec(&entry) {
+    match serde_json::to_vec(entry) {
         Ok(bytes) => {
             if let Err(e) = std::fs::write(&path, bytes) {
                 log::warn!("cache: write {} failed: {e}", path.display());

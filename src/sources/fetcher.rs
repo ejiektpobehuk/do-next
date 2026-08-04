@@ -504,6 +504,274 @@ pub fn spawn_gitlab_fetch(
     });
 }
 
+/// Subsource slot each standup backend reports failures under.
+///
+/// Standup mode reuses the existing subsource-error plumbing rather than
+/// inventing an event: `SubsourceError` already renders as a navigable row that
+/// shows what failed, so a missing GitLab token costs you the GitLab section and
+/// nothing else. `SourceError` is reserved for "the whole collection could not
+/// start".
+const STANDUP_SUBSOURCE_JIRA: usize = 0;
+const STANDUP_SUBSOURCE_GITLAB: usize = 1;
+const STANDUP_SUBSOURCE_CONFLUENCE_TASKS: usize = 2;
+const STANDUP_SUBSOURCE_CONFLUENCE_PAGES: usize = 3;
+
+/// Spawn a background task that collects standup activity across every enabled
+/// backend, then sends `SourceLoaded` (the underlying payloads) followed by
+/// `StandupLoaded` (the timeline).
+///
+/// Coverage is deliberately a full week regardless of the window being displayed,
+/// so stepping the window with `<`/`>`/`d` inside that week is a local filter
+/// rather than a refetch. The discovery queries already over-fetch by two days,
+/// so the extra breadth costs little.
+/// Everything a standup collection needs. Bundled because the alternative is an
+/// eight-argument function, and every field is threaded straight through to the
+/// per-backend collectors.
+pub struct StandupFetch {
+    pub jira: JiraClient,
+    pub confluence: Option<ConfluenceClient>,
+    pub gitlab: Option<GitlabClient>,
+    /// The team's Jira *site* URL, for `/browse/KEY` links.
+    pub jira_site_url: String,
+    pub source_cfg: SourceConfig,
+    pub cache: CacheConfig,
+    /// Earliest instant the caller needs covered. `None` takes the default
+    /// week-wide floor; the screen passes its window's start once the user has
+    /// stepped back beyond what was already fetched.
+    pub coverage_floor: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub fn spawn_standup_fetch(req: StandupFetch, tx: UnboundedSender<AppEvent>) {
+    let source_id = req.source_cfg.id.clone();
+    tokio::spawn(async move {
+        let filters = req.source_cfg.standup.clone().unwrap_or_default();
+        let Ok(schedule) = filters.schedule.resolve() else {
+            // Validation already rejected this at load time; belt and braces.
+            let _ = tx.send(AppEvent::SourceError(
+                source_id,
+                anyhow::anyhow!("invalid standup schedule"),
+            ));
+            return;
+        };
+        let coverage = standup_coverage(&filters, &schedule, req.coverage_floor);
+
+        let me = match req.jira.current_user().await {
+            Ok(me) => me,
+            Err(e) => {
+                let _ = tx.send(AppEvent::SourceError(
+                    source_id,
+                    e.context("standup needs the current Jira user"),
+                ));
+                return;
+            }
+        };
+
+        let mut data = crate::standup::types::StandupData {
+            coverage: Some(coverage),
+            ..crate::standup::types::StandupData::default()
+        };
+        let mut items: Vec<WorkItem> = Vec::new();
+
+        collect_standup_jira(
+            &req, &filters, &coverage, &me, &source_id, &tx, &mut data, &mut items,
+        )
+        .await;
+        collect_standup_gitlab(
+            &req, &filters, &coverage, &source_id, &tx, &mut data, &mut items,
+        )
+        .await;
+        collect_standup_confluence(
+            &req, &filters, &coverage, &source_id, &tx, &mut data, &mut items,
+        )
+        .await;
+
+        data.normalize();
+        for item in &mut items {
+            item.set_source(source_id.clone(), 0);
+        }
+        log::debug!(
+            "Standup '{}' collected: {} entries, {} items",
+            source_id,
+            data.entries.len(),
+            items.len()
+        );
+
+        crate::sources::cache::write_standup(&req.cache, &source_id, &items, &data);
+        // `SourceLoaded` first: the timeline's Enter looks items up in the
+        // list state that this populates.
+        let _ = tx.send(AppEvent::SourceLoaded(source_id.clone(), items));
+        let _ = tx.send(AppEvent::StandupLoaded(source_id, Box::new(data)));
+    });
+}
+
+/// The window to fetch, which is wider than the one displayed.
+///
+/// Always at least a week, so `<`, `>`, `d` and `w` are served by local
+/// filtering rather than a refetch — those are the keys that get hammered — and
+/// never more than [`crate::standup::window::MAX_WINDOW_DAYS`].
+fn standup_coverage(
+    filters: &crate::config::types::StandupFilters,
+    schedule: &crate::standup::window::Schedule,
+    coverage_floor: Option<chrono::DateTime<chrono::Utc>>,
+) -> crate::standup::window::Window {
+    use crate::standup::window::{MAX_WINDOW_DAYS, Shift, Window};
+
+    let tz = crate::datetime::TzSpec::from_config(filters.timezone.as_deref());
+    let now = chrono::Utc::now();
+    let display = Window::resolve(now, tz, schedule, Shift::default());
+    Window {
+        start: display
+            .start
+            .min(now - chrono::Duration::days(7))
+            .min(coverage_floor.unwrap_or(now))
+            .max(now - chrono::Duration::days(MAX_WINDOW_DAYS)),
+        end: now,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_standup_jira(
+    req: &StandupFetch,
+    filters: &crate::config::types::StandupFilters,
+    coverage: &crate::standup::window::Window,
+    me: &str,
+    source_id: &str,
+    tx: &UnboundedSender<AppEvent>,
+    data: &mut crate::standup::types::StandupData,
+    items: &mut Vec<WorkItem>,
+) {
+    if !filters.includes(crate::config::types::StandupBackend::Jira) {
+        return;
+    }
+    // A wrong `updatedBy` literal returns an empty set rather than an error, so
+    // probe before trusting it — otherwise a broken standup reads as an idle day.
+    let updated_by = req.jira.probe_updated_by(me).await.unwrap_or(false);
+    match crate::standup::collect::collect_jira(
+        &req.jira,
+        filters,
+        coverage,
+        me,
+        &req.jira_site_url,
+        updated_by,
+    )
+    .await
+    {
+        Ok(outcome) => absorb(data, items, outcome),
+        Err(e) => {
+            let _ = tx.send(AppEvent::SubsourceError(
+                source_id.to_owned(),
+                STANDUP_SUBSOURCE_JIRA,
+                e,
+            ));
+        }
+    }
+}
+
+async fn collect_standup_gitlab(
+    req: &StandupFetch,
+    filters: &crate::config::types::StandupFilters,
+    coverage: &crate::standup::window::Window,
+    source_id: &str,
+    tx: &UnboundedSender<AppEvent>,
+    data: &mut crate::standup::types::StandupData,
+    items: &mut Vec<WorkItem>,
+) {
+    if !filters.includes(crate::config::types::StandupBackend::Gitlab) {
+        return;
+    }
+    let Some(client) = &req.gitlab else {
+        // Only complain when GitLab was asked for explicitly; the default
+        // "everything" list must not nag teams that do not use it.
+        if filters.include.is_some() {
+            let _ = tx.send(AppEvent::SubsourceError(
+                source_id.to_owned(),
+                STANDUP_SUBSOURCE_GITLAB,
+                anyhow::anyhow!(
+                    "GitLab is not configured for this team \
+                     (run `do-next auth` to store a token)"
+                ),
+            ));
+        }
+        return;
+    };
+    match crate::standup::collect::collect_gitlab(client, filters, coverage).await {
+        Ok(outcome) => absorb(data, items, outcome),
+        Err(e) => {
+            let _ = tx.send(AppEvent::SubsourceError(
+                source_id.to_owned(),
+                STANDUP_SUBSOURCE_GITLAB,
+                e,
+            ));
+        }
+    }
+}
+
+async fn collect_standup_confluence(
+    req: &StandupFetch,
+    filters: &crate::config::types::StandupFilters,
+    coverage: &crate::standup::window::Window,
+    source_id: &str,
+    tx: &UnboundedSender<AppEvent>,
+    data: &mut crate::standup::types::StandupData,
+    items: &mut Vec<WorkItem>,
+) {
+    use crate::config::types::StandupBackend;
+
+    for (backend, slot) in [
+        (
+            StandupBackend::ConfluenceTasks,
+            STANDUP_SUBSOURCE_CONFLUENCE_TASKS,
+        ),
+        (
+            StandupBackend::ConfluencePages,
+            STANDUP_SUBSOURCE_CONFLUENCE_PAGES,
+        ),
+    ] {
+        if !filters.includes(backend) {
+            continue;
+        }
+        let Some(client) = &req.confluence else {
+            if filters.include.is_some() {
+                let _ = tx.send(AppEvent::SubsourceError(
+                    source_id.to_owned(),
+                    slot,
+                    anyhow::anyhow!("Confluence is not configured for this team"),
+                ));
+            }
+            continue;
+        };
+        let site_url = &req.jira_site_url;
+        let result = if backend == StandupBackend::ConfluenceTasks {
+            crate::standup::collect::collect_confluence_tasks(client, coverage, site_url).await
+        } else {
+            crate::standup::collect::collect_confluence_pages(client, filters, coverage, site_url)
+                .await
+        };
+        match result {
+            Ok(outcome) => absorb(data, items, outcome),
+            Err(e) => {
+                let _ = tx.send(AppEvent::SubsourceError(source_id.to_owned(), slot, e));
+            }
+        }
+    }
+}
+
+/// Fold one backend's outcome into the accumulating standup.
+fn absorb(
+    data: &mut crate::standup::types::StandupData,
+    items: &mut Vec<WorkItem>,
+    outcome: crate::standup::collect::Outcome,
+) {
+    if outcome.degraded {
+        // Which backend degraded is recoverable from the entries it produced.
+        if let Some(entry) = outcome.entries.first() {
+            data.degraded.push(entry.item.backend);
+        }
+    }
+    data.entries.extend(outcome.entries);
+    items.extend(outcome.items);
+}
+
 /// Spawn a background task that marks a Confluence inline task complete.
 pub fn spawn_complete_task(
     client: ConfluenceClient,

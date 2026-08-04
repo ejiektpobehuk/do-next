@@ -9,6 +9,7 @@ pub mod onboarding;
 pub mod overlays;
 pub mod render;
 pub mod search;
+pub mod standup;
 pub mod theme;
 pub mod views;
 pub mod widgets;
@@ -112,6 +113,7 @@ async fn run_inner(
                     jira: team_client,
                     confluence: clients_map.confluence.get(&team.confluence.base_url),
                     gitlab: clients_map.gitlab.get(&team.gitlab.base_url),
+                    jira_site_url: &team.jira.base_url,
                 };
                 spawn_fetches(
                     team_clients,
@@ -151,7 +153,14 @@ async fn run_inner(
             h.abort();
         }
 
-        // Resolve the current team's clients for actions
+        // Resolve the current team's clients for actions. The site URL is copied
+        // out rather than borrowed: every other field resolves to a reference
+        // into `clients_map`, so borrowing this one from `app` would keep `app`
+        // immutably borrowed for the rest of the loop body.
+        let active_site_url = app
+            .resolved_teams
+            .get(app.active_team_idx)
+            .map_or_else(String::new, |t| t.jira.base_url.clone());
         let active_team = app.resolved_teams.get(app.active_team_idx);
         let active_clients = TeamClients {
             jira: active_team
@@ -160,6 +169,7 @@ async fn run_inner(
             confluence: active_team
                 .and_then(|t| clients_map.confluence.get(&t.confluence.base_url)),
             gitlab: active_team.and_then(|t| clients_map.gitlab.get(&t.gitlab.base_url)),
+            jira_site_url: &active_site_url,
         };
         let active_client_ref = active_clients.jira;
 
@@ -220,6 +230,7 @@ fn spawn_initial_tasks(
         jira: &active_client,
         confluence: first_team.and_then(|t| clients.confluence.get(&t.confluence.base_url)),
         gitlab: first_team.and_then(|t| clients.gitlab.get(&t.gitlab.base_url)),
+        jira_site_url: first_team.map_or("", |t| t.jira.base_url.as_str()),
     };
 
     // Fetch current user (best-effort; subsource sorting depends on it)
@@ -284,6 +295,21 @@ fn hydrate_from_cache(app: &mut AppState, source_ids: &[String]) {
         if let Some(lanes) = entry.lanes {
             app.board_lanes
                 .insert(id.clone(), crate::tui::app::LanesState::Loaded(lanes));
+        }
+        if let Some(standup) = entry.standup {
+            // Unlike every other cached payload this one is window-dependent, so
+            // it is only usable when its coverage actually spans the window we
+            // are about to display. A narrower cache would silently under-report.
+            let wanted = app.standup_window();
+            if standup
+                .coverage
+                .is_some_and(|coverage| coverage.covers(&wanted))
+            {
+                app.standup_data
+                    .insert(id.clone(), crate::tui::app::CacheState::Loaded(standup));
+            } else {
+                log::debug!("cache: standup {id} coverage does not span the current window");
+            }
         }
         app.sources
             .insert(id, crate::tui::app::SourceState::Loaded(entry.items));
@@ -626,6 +652,31 @@ fn dispatch_background_tasks(
             crate::sources::spawn_source_fetch(clients, &src_cfg, app.detail_load, &app.cache, tx);
         }
         hydrate_from_cache(app, &ids);
+    }
+
+    // The standup window widened past what was fetched, so the coverage has to
+    // grow. Narrowing never lands here — it is served by filtering locally.
+    if let Some(id) = app.pending_standup_refetch.take()
+        && let Some(src_cfg) = crate::tui::app::source_config_for(app.team_config(), &id).cloned()
+    {
+        // Called directly rather than through `spawn_source_fetch` so the
+        // requested coverage floor can be passed; the generic entry point has no
+        // notion of a window.
+        let wanted = app.standup_window();
+        app.standup_data
+            .insert(id, crate::tui::app::CacheState::Loading);
+        crate::sources::fetcher::spawn_standup_fetch(
+            crate::sources::fetcher::StandupFetch {
+                jira: clients.jira.clone(),
+                confluence: clients.confluence.cloned(),
+                gitlab: clients.gitlab.cloned(),
+                jira_site_url: clients.jira_site_url.to_owned(),
+                source_cfg: src_cfg,
+                cache: app.cache.clone(),
+                coverage_floor: Some(wanted.start),
+            },
+            tx.clone(),
+        );
     }
 
     // Single-issue refresh requested via `r` (detail focus).

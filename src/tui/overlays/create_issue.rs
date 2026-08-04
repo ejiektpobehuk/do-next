@@ -1687,6 +1687,7 @@ mod tests {
                 source_id: None,
                 subsource_idx: 0,
                 partial: false,
+                changelog: None,
             })
         };
         let issues = vec![mk("AAA"), mk("BBB"), mk("AAA")];

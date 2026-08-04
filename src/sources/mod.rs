@@ -11,7 +11,8 @@ use crate::events::AppEvent;
 use crate::gitlab::GitlabClient;
 use crate::jira::JiraClient;
 use fetcher::{
-    spawn_backlog_fetch, spawn_board_fetch, spawn_confluence_fetch, spawn_fetch, spawn_gitlab_fetch,
+    spawn_backlog_fetch, spawn_board_fetch, spawn_confluence_fetch, spawn_fetch,
+    spawn_gitlab_fetch, spawn_standup_fetch,
 };
 
 /// Per-backend HTTP clients, keyed by base URL.
@@ -29,6 +30,10 @@ pub struct TeamClients<'a> {
     pub jira: &'a JiraClient,
     pub confluence: Option<&'a ConfluenceClient>,
     pub gitlab: Option<&'a GitlabClient>,
+    /// The team's Jira *site* URL, for building `/browse/KEY` links. Distinct
+    /// from `JiraClient::base_url()`, which under OAuth points at
+    /// `api.atlassian.com` and so is useless to a human.
+    pub jira_site_url: &'a str,
 }
 
 /// Spawn one background fetch task per configured source in a team.
@@ -129,6 +134,25 @@ pub fn spawn_source_fetch(
                 source_cfg.clone(),
                 detail_load,
                 cache.clone(),
+                tx.clone(),
+            );
+        }
+        // The only kind that reaches every backend at once: it collects your
+        // activity wherever it happened, so it takes all three clients and
+        // reports each backend's failure independently.
+        SourceKind::Standup => {
+            spawn_standup_fetch(
+                fetcher::StandupFetch {
+                    jira: clients.jira.clone(),
+                    confluence: clients.confluence.cloned(),
+                    gitlab: clients.gitlab.cloned(),
+                    jira_site_url: clients.jira_site_url.to_owned(),
+                    source_cfg: source_cfg.clone(),
+                    cache: cache.clone(),
+                    // Default coverage; the screen refetches with a wider floor
+                    // once the user steps past it.
+                    coverage_floor: None,
+                },
                 tx.clone(),
             );
         }

@@ -8,9 +8,21 @@ All notable changes to `do-next` are documented here.
 
 ### New features
 
+- Daily standup mode (`kind: "standup"`) — a dedicated tab showing what you did
+  since the previous scheduled standup, as a day-by-day timeline across Jira,
+  GitLab and Confluence. "Done" means any trace you left: transitions, comments,
+  field edits, logged work, issues filed, merge requests opened/merged/closed,
+  pages created/edited and tasks ticked off. `<`/`>`/`w`/`d` move the window,
+  `y` writes a markdown digest to a file.
 - GitLab merge requests as a source kind (`kind: "gitlab"`) — read-only rows
   with approval and CI state, sorted, badged, cached and searched like every
   other source
+
+### Fixes
+
+- Config timezone offsets with a colon (`"+05:45"`) parsed as whole hours,
+  silently dropping the minutes
+- HTTP 429 responses now retry once or twice, honouring `Retry-After`
 
 ## v0.0.0-2026.7.14 — 2026-07-14
 

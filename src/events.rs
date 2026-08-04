@@ -46,6 +46,11 @@ pub enum AppEvent {
         source_id: String,
         result: Result<(), anyhow::Error>,
     },
+    /// A standup source finished collecting. Sent alongside that source's
+    /// `SourceLoaded` (which carries the underlying payloads so the timeline's
+    /// Enter can open the normal detail view). Boxed because the payload is much
+    /// larger than any other variant.
+    StandupLoaded(String, Box<crate::standup::types::StandupData>),
     /// A single-issue background refresh completed successfully.
     IssueRefreshed(Box<WorkItem>),
     /// A single-issue background refresh failed.

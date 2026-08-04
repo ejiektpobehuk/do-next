@@ -298,6 +298,9 @@ pub enum SourceKind {
     Backlog,
     /// GitLab merge requests from `/api/v4/`, rendered as read-only list rows.
     Gitlab,
+    /// What you did since the previous standup, collected across every
+    /// configured backend and rendered as a day-by-day timeline in its own tab.
+    Standup,
 }
 
 /// Which issues a board source shows: the active sprint (default), all board
@@ -550,6 +553,139 @@ pub struct ConfluenceFilters {
     /// (the page it lives on) or "both" (default, "content · page").
     #[serde(default)]
     pub label: ConfluenceLabel,
+}
+
+/// Which backend a standup source collects activity from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StandupBackend {
+    Jira,
+    Gitlab,
+    ConfluenceTasks,
+    ConfluencePages,
+}
+
+/// When the standup happens. Drives the default window: the previous scheduled
+/// occurrence through now.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StandupSchedule {
+    /// Weekday names, three-letter or full, any case.
+    #[serde(default = "default_standup_days")]
+    pub days: Vec<String>,
+    /// Local wall-clock time, "HH:MM".
+    #[serde(default = "default_standup_time")]
+    pub time: String,
+    /// How long an occurrence still counts as "happening now" and is skipped
+    /// when looking back. Without it, opening the screen at 10:01 with a 10:00
+    /// standup yields a one-minute window — exactly when you want yesterday's.
+    #[serde(default = "default_standup_grace_hours")]
+    pub grace_hours: u32,
+}
+
+fn default_standup_days() -> Vec<String> {
+    ["mon", "tue", "wed", "thu", "fri"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+}
+
+fn default_standup_time() -> String {
+    "10:00".to_owned()
+}
+
+const fn default_standup_grace_hours() -> u32 {
+    4
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+impl Default for StandupSchedule {
+    fn default() -> Self {
+        Self {
+            days: default_standup_days(),
+            time: default_standup_time(),
+            grace_hours: default_standup_grace_hours(),
+        }
+    }
+}
+
+impl StandupSchedule {
+    /// Parse into the domain type the window arithmetic uses.
+    pub fn resolve(&self) -> anyhow::Result<crate::standup::window::Schedule> {
+        crate::standup::window::Schedule::from_parts(&self.days, &self.time, self.grace_hours)
+    }
+}
+
+/// Jira-specific standup knobs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StandupJira {
+    /// AND-ed onto the discovery query, e.g. "project in (PROJ, OPS)".
+    pub extra_jql: Option<String>,
+    /// Collect logged work. Costs one extra discovery search plus one call per
+    /// issue that matched it.
+    #[serde(default = "default_true")]
+    pub worklogs: bool,
+}
+
+impl Default for StandupJira {
+    fn default() -> Self {
+        Self {
+            extra_jql: None,
+            worklogs: true,
+        }
+    }
+}
+
+/// Confluence-specific standup knobs.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct StandupConfluence {
+    /// Space keys scoping the page search. Required by the reduced-accuracy
+    /// fallback, which is unaffordable across a whole site.
+    #[serde(default)]
+    pub spaces: Vec<String>,
+}
+
+/// GitLab-specific standup knobs.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct StandupGitlab {
+    /// Also read the user contribution events feed. Picks up merge requests you
+    /// closed but did not author, plus comments and pushes. Day-granular and
+    /// needs a broader token scope than `read_api`, so off by default.
+    #[serde(default)]
+    pub events: bool,
+    /// List projects you created inside the window.
+    #[serde(default)]
+    pub projects_created: bool,
+}
+
+/// Per-source standup settings. Required when `kind` is `standup`.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct StandupFilters {
+    #[serde(default)]
+    pub schedule: StandupSchedule,
+    /// Fixed offset for window arithmetic and display, e.g. "+03". Absent means
+    /// the system timezone, which is DST-correct — a fixed offset is not, so
+    /// only set this if the machine's clock is in the wrong zone.
+    pub timezone: Option<String>,
+    /// Backends to collect from. Absent = every backend the team configures.
+    pub include: Option<Vec<StandupBackend>>,
+    #[serde(default)]
+    pub jira: StandupJira,
+    #[serde(default)]
+    pub confluence: StandupConfluence,
+    #[serde(default)]
+    pub gitlab: StandupGitlab,
+}
+
+impl StandupFilters {
+    /// Is `backend` enabled? An absent `include` list enables everything.
+    pub fn includes(&self, backend: StandupBackend) -> bool {
+        self.include
+            .as_ref()
+            .is_none_or(|list| list.contains(&backend))
+    }
 }
 
 /// Partial Confluence connection overrides. All fields optional — anything
@@ -888,6 +1024,10 @@ pub struct SourceConfig {
     /// GitLab merge-request filters; only meaningful when `kind` is `gitlab`.
     #[serde(default)]
     pub gitlab: Option<GitlabFilters>,
+    /// Standup schedule and per-backend settings; only meaningful when `kind`
+    /// is `standup`.
+    #[serde(default)]
+    pub standup: Option<StandupFilters>,
     /// Project key for wrong-project detection (e.g. incidents).
     pub expected_project: Option<String>,
     /// Sort order within source: "updated", "created", "priority".

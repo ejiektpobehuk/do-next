@@ -42,6 +42,14 @@ pub struct ApiTask {
     pub created_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub due_at: Option<DateTime<Utc>>,
+    /// When the task was ticked off, used by standup mode. `null` on tasks
+    /// completed before Atlassian began recording it — those simply never match a
+    /// window, which is the correct outcome.
+    ///
+    /// There is deliberately no `completed_by` here: the standup query filters on
+    /// it server-side, so a local copy would never be read.
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 /// Task body container; we always request `atlas_doc_format`.
@@ -138,6 +146,10 @@ pub struct Task {
     pub page_url: Option<String>,
     pub due_at: Option<DateTime<Utc>>,
     pub created_at: Option<DateTime<Utc>>,
+    /// When it was ticked off, for standup mode. `default` because the on-disk
+    /// source cache holds payloads written before this was read.
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
     /// Which source this task was fetched from (set after fetch).
     pub source_id: Option<String>,
     /// Field map rendered by the default/custom views, keyed by `conf.*` ids.
@@ -254,6 +266,7 @@ pub fn to_display(
         page_url,
         due_at: task.due_at,
         created_at: task.created_at,
+        completed_at: task.completed_at,
         source_id: None,
         extra,
     }
@@ -319,6 +332,127 @@ pub fn build_task_query(
     }
 
     Ok(q)
+}
+
+/// Query for standup mode's "tasks I completed in the window" fetch.
+///
+/// Filtered entirely server-side, so nothing needs discarding afterwards.
+///
+/// It cannot reuse [`build_task_query`]: that forces `assigned-to` to the
+/// current user whenever the filter is unset, which would silently drop every
+/// task you ticked off that was assigned to someone else or to nobody. `status`
+/// is likewise omitted — `completed-by` already implies completion.
+pub fn build_completed_task_query(me: &str, from_ms: i64, to_ms: i64) -> Vec<(String, String)> {
+    vec![
+        ("body-format".into(), "atlas_doc_format".into()),
+        ("limit".into(), "250".into()),
+        ("completed-by".into(), me.into()),
+        ("completed-at-from".into(), from_ms.to_string()),
+        ("completed-at-to".into(), to_ms.to_string()),
+    ]
+}
+
+/// CQL for "pages I contributed to, modified on or after `from`".
+///
+/// `contributor` accepts `currentUser()`, so no account id is needed here.
+/// `lastmodified` is day-granular in practice — reports of the time component
+/// being ignored are long-standing, and the day boundary resolves in the
+/// querying user's Confluence profile timezone, not ours — so callers pass a
+/// day-widened `from` and verify precisely against page versions afterwards.
+pub fn build_page_contributor_cql(from: chrono::NaiveDate) -> String {
+    format!(
+        "type = page AND contributor = currentUser() AND lastmodified >= \"{}\"",
+        from.format("%Y/%m/%d")
+    )
+}
+
+/// Result row of the v1 `/rest/api/search` CQL endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchResultRow {
+    #[serde(default)]
+    pub content: Option<SearchContent>,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Site-relative page URL.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchContent {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// Envelope of `GET /rest/api/search`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchPage {
+    #[serde(default)]
+    pub results: Vec<SearchResultRow>,
+    #[serde(rename = "_links", default)]
+    pub links: PageLinks,
+}
+
+/// One version of a page, from `GET /api/v2/pages/{id}/versions`.
+///
+/// This is what makes page activity precise: `author_id` plus `created_at`
+/// attribute an edit to a person at an instant, which the day-granular CQL
+/// search cannot.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPageVersion {
+    #[serde(default)]
+    pub number: u32,
+    #[serde(default, deserialize_with = "de_opt_id")]
+    pub author_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Typo fixes and the like. Suppressed so a standup is not padded out with
+    /// them.
+    #[serde(default)]
+    pub minor_edit: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PageVersionsPage {
+    #[serde(default)]
+    pub results: Vec<ApiPageVersion>,
+}
+
+/// A page as returned by `GET /api/v2/pages`, carrying enough to attribute both
+/// creation (`author_id`/`created_at`) and the latest edit (`version`) without a
+/// per-page lookup. Backs the reduced-accuracy fallback used when the CQL search
+/// is not permitted.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPageSummary {
+    #[serde(deserialize_with = "de_id")]
+    pub id: String,
+    pub title: String,
+    #[serde(default, deserialize_with = "de_opt_id")]
+    pub author_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub version: Option<ApiPageVersion>,
+    #[serde(rename = "_links", default)]
+    pub links: PageLinksSelf,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PageLinksSelf {
+    #[serde(default)]
+    pub webui: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PageSummariesPage {
+    #[serde(default)]
+    pub results: Vec<ApiPageSummary>,
+    #[serde(rename = "_links", default)]
+    pub links: PageLinks,
 }
 
 /// Epoch milliseconds for the start (or end) of a `YYYY-MM-DD` day in UTC.

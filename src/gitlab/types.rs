@@ -61,6 +61,13 @@ pub struct ApiMergeRequest {
     pub created_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
+    /// Set only on merged/closed merge requests. These are what make a standup
+    /// entry high-confidence: `updated_at` moves when anyone touches the MR,
+    /// but these two only move when it was merged or closed.
+    #[serde(default)]
+    pub merged_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub closed_at: Option<DateTime<Utc>>,
     /// `null` on endpoints/instances that don't compute it — treated as "no
     /// known conflict", never as a conflict.
     #[serde(default)]
@@ -79,6 +86,39 @@ pub struct ApiMergeRequest {
 pub struct ApiReferences {
     #[serde(default)]
     pub full: Option<String>,
+}
+
+/// One entry of `GET /events` (the authenticated user's contribution feed).
+///
+/// Only read when a standup source opts into `gitlab.events`. It is the sole way
+/// to see a merge request you closed but did not author — there is no
+/// `closed_by` filter on the merge-requests endpoint — at the cost of
+/// day-granular bounds and a broader token scope.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiEvent {
+    #[serde(default)]
+    pub action_name: Option<String>,
+    #[serde(default)]
+    pub target_type: Option<String>,
+    #[serde(default)]
+    pub target_iid: Option<u64>,
+    #[serde(default)]
+    pub target_title: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<u64>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Subset of `GET /projects` used for "repositories I created".
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiProject {
+    pub id: u64,
+    #[serde(default)]
+    pub path_with_namespace: Option<String>,
+    pub name: String,
+    pub web_url: String,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 /// `GET /projects/{id}/merge_requests/{iid}/approvals`.
@@ -144,6 +184,12 @@ pub struct MergeRequest {
     pub labels: Vec<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
+    /// Merge/close instants. `default` because the on-disk source cache holds
+    /// payloads written before these were read.
+    #[serde(default)]
+    pub merged_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub closed_at: Option<DateTime<Utc>>,
     pub user_notes_count: u64,
     pub threads_resolved: Option<bool>,
     /// Approval state, filled in by enrichment (`None` when it failed).
@@ -285,6 +331,8 @@ pub fn to_display(mr: ApiMergeRequest) -> MergeRequest {
         labels: mr.labels,
         created_at: mr.created_at,
         updated_at: mr.updated_at,
+        merged_at: mr.merged_at,
+        closed_at: mr.closed_at,
         user_notes_count: mr.user_notes_count.unwrap_or(0),
         threads_resolved: mr.blocking_discussions_resolved,
         approvals_required: None,
@@ -422,6 +470,30 @@ pub fn build_mr_query(filters: &GitlabFilters, me: Option<&str>) -> Vec<(String,
     }
 
     q
+}
+
+/// Query for the standup's merge-request discovery.
+///
+/// `updated_after` takes a full ISO-8601 instant, so unlike every other date
+/// filter in a standup this one is precise to the second and needs no
+/// day-widening. `state=all` is deliberate: a merge request merged inside the
+/// window is the most interesting thing a standup can report.
+pub fn build_standup_mr_query(me: &str, since: DateTime<Utc>) -> Vec<(String, String)> {
+    vec![
+        // The unscoped endpoint defaults to `created_by_me`, which would drop
+        // merge requests in projects you only contribute to.
+        ("scope".into(), "all".into()),
+        ("state".into(), "all".into()),
+        ("author_username".into(), me.into()),
+        // `Z` rather than `+00:00`: this is the form GitLab documents, and the
+        // offset form has to survive query-string escaping of `+`.
+        (
+            "updated_after".into(),
+            since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+        ("order_by".into(), "updated_at".into()),
+        ("sort".into(), "desc".into()),
+    ]
 }
 
 /// True when the source needs the token's own username resolved before it can

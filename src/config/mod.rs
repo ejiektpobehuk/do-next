@@ -1577,6 +1577,14 @@ fn validate_source_config(source: &types::SourceConfig) -> Result<()> {
     if source.kind != SourceKind::Gitlab && source.gitlab.is_some() {
         return Err(gitlab_block_not_allowed(&source.id));
     }
+    // Same for `standup`: a block on the wrong kind is silently ignored
+    // otherwise, and a standup schedule that never runs is hard to notice.
+    if source.kind != SourceKind::Standup && source.standup.is_some() {
+        return Err(anyhow!(
+            "source '{}': `standup` settings are only valid with `kind: \"standup\"`",
+            source.id
+        ));
+    }
     match source.kind {
         SourceKind::Jira => {
             if source.confluence.is_some() {
@@ -1624,6 +1632,62 @@ fn validate_source_config(source: &types::SourceConfig) -> Result<()> {
         }
         SourceKind::Board => validate_board_source(source)?,
         SourceKind::Backlog => validate_backlog_source(source)?,
+        SourceKind::Standup => validate_standup_source(source)?,
+    }
+    Ok(())
+}
+
+/// A standup source selects nothing itself — it derives its items from your
+/// activity — so every selection knob is rejected.
+fn validate_standup_source(source: &types::SourceConfig) -> Result<()> {
+    for (label, present) in [
+        ("jql", !source.jql.is_empty()),
+        ("subsources", !source.subsources.is_empty()),
+        ("expected_project", source.expected_project.is_some()),
+    ] {
+        if present {
+            return Err(anyhow!(
+                "source '{}': `{label}` is not valid for a standup source",
+                source.id
+            ));
+        }
+    }
+    if source.board.is_some() {
+        return Err(anyhow!(
+            "source '{}': `board` filters are only valid with `kind: \"board\"` or `kind: \"backlog\"`",
+            source.id
+        ));
+    }
+    if source.confluence.is_some() {
+        return Err(anyhow!(
+            "source '{}': `confluence` filters are only valid with `kind: \"confluence\"` \
+             (a standup source configures Confluence under `standup.confluence`)",
+            source.id
+        ));
+    }
+    if let Some(filters) = &source.standup {
+        // Parse the schedule now so a typo is a load-time error rather than a
+        // standup that silently finds nothing.
+        filters
+            .schedule
+            .resolve()
+            .map_err(|e| anyhow!("source '{}': {e}", source.id))?;
+        if let Some(tz) = filters.timezone.as_deref()
+            && crate::datetime::parse_tz_offset(tz).is_none()
+        {
+            return Err(anyhow!(
+                "source '{}': `standup.timezone` must be an offset like \"+03\" (got \"{tz}\")",
+                source.id
+            ));
+        }
+        if let Some(include) = &filters.include
+            && include.is_empty()
+        {
+            return Err(anyhow!(
+                "source '{}': `standup.include` must list at least one backend",
+                source.id
+            ));
+        }
     }
     Ok(())
 }
@@ -1985,6 +2049,17 @@ pub fn extra_scopes_for<'a>(
             match source.kind {
                 SourceKind::Confluence => extra.confluence = true,
                 SourceKind::Board | SourceKind::Backlog => extra.board = true,
+                // A standup reads Confluence tasks and page versions, both
+                // covered by the existing granular Confluence scope set — no
+                // new scope, so no risk to the existing consent screen.
+                SourceKind::Standup => {
+                    let filters = source.standup.clone().unwrap_or_default();
+                    if filters.includes(types::StandupBackend::ConfluenceTasks)
+                        || filters.includes(types::StandupBackend::ConfluencePages)
+                    {
+                        extra.confluence = true;
+                    }
+                }
                 // GitLab authenticates with its own personal access token, not
                 // Atlassian OAuth.
                 SourceKind::Jira | SourceKind::Gitlab => {}

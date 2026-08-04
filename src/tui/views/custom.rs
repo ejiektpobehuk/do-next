@@ -23,6 +23,7 @@ const CORNERS_ONLY: BorderSet = BorderSet {
 };
 
 use crate::config::types::{CustomViewConfig, CustomViewFieldConfig, FieldType};
+use crate::datetime::{local_tz, parse_dt, parse_tz_offset};
 use crate::items::WorkItem;
 use crate::jira::types::Issue;
 use crate::tui::app::{ActionState, AppState, DetailFocus};
@@ -881,31 +882,10 @@ pub fn resolve_tz(cfg: Option<&CustomViewConfig>) -> FixedOffset {
         .unwrap_or_else(local_tz)
 }
 
-fn local_tz() -> FixedOffset {
-    let secs = chrono::Local::now().offset().local_minus_utc();
-    FixedOffset::east_opt(secs)
-        .unwrap_or_else(|| FixedOffset::east_opt(0).expect("UTC offset 0 is always valid"))
-}
-
-fn parse_tz_offset(s: &str) -> Option<FixedOffset> {
-    let s = s.trim();
-    let sign: i32 = if s.starts_with('-') { -1 } else { 1 };
-    let digits = s.trim_start_matches(['+', '-']);
-    let h: i32 = digits.get(..2)?.parse().ok()?;
-    let m: i32 = digits.get(2..).and_then(|x| x.parse().ok()).unwrap_or(0);
-    FixedOffset::east_opt(sign * (h * 3600 + m * 60))
-}
-
 // ── Formatting ───────────────────────────────────────────────────────────────
 
 fn fmt_dt(dt: &DateTime<FixedOffset>, tz: FixedOffset) -> String {
     dt.with_timezone(&tz).format("%Y-%m-%d  %H:%M").to_string()
-}
-
-fn parse_dt(s: &str) -> Option<DateTime<FixedOffset>> {
-    DateTime::parse_from_rfc3339(s)
-        .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3f%z"))
-        .ok()
 }
 
 fn fmt_duration(total_mins: i64) -> String {

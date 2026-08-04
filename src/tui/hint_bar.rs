@@ -140,6 +140,50 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
         return;
     }
 
+    if dedicated_kind == Some(crate::config::types::SourceKind::Standup) && !app.fullscreen_detail {
+        let mut spans = vec![
+            Span::raw("┤ "),
+            Span::styled("<", Style::default().fg(Color::Blue)),
+            Span::styled(">", Style::default().fg(Color::Blue)),
+            Span::raw(" window | ("),
+            Span::styled("w", Style::default().fg(Color::Blue)),
+            Span::raw(")eek | ("),
+            Span::styled("d", Style::default().fg(Color::Blue)),
+            Span::raw(")ay | "),
+        ];
+        // The digest path replaces the copy hint once written, so pressing `y`
+        // tells you where the file went without an extra overlay.
+        if let Some(path) = &app.standup_digest_path {
+            spans.push(Span::styled("saved ", Style::default().fg(Color::Green)));
+            spans.push(Span::raw(format!("{path} | ")));
+        } else {
+            spans.push(Span::raw("("));
+            spans.push(Span::styled("y", Style::default().fg(Color::Blue)));
+            spans.push(Span::raw(") digest | "));
+        }
+        spans.push(Span::styled("↕", Style::default().fg(nav_color(true))));
+        spans.push(Span::raw(" | "));
+        if show_tab_hint {
+            spans.push(Span::styled("Tab", Style::default().fg(Color::Blue)));
+            spans.push(Span::raw(" | "));
+        }
+        spans.push(Span::styled("?", Style::default().fg(Color::Blue)));
+        spans.push(Span::raw(" | ("));
+        spans.push(Span::styled("q", Style::default().fg(Color::Red)));
+        spans.push(Span::raw(")uit ├──"));
+        let title = Line::from(spans)
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(theme::MUTED));
+        f.render_widget(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(theme::MUTED))
+                .title_bottom(title),
+            area,
+        );
+        return;
+    }
+
     let list_focused = app.focused_panel == FocusedPanel::List;
     let can_move_vertical = if list_focused {
         !app.nav_items.is_empty()

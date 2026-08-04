@@ -22,6 +22,8 @@ pub struct ViewStates {
     pub search_results: ratatui::widgets::ListState,
     /// Kanban board scroll offsets.
     pub board: crate::tui::board::BoardScroll,
+    /// Standup timeline scroll offset.
+    pub standup: crate::tui::standup::StandupScroll,
 }
 
 /// Side-channel data written during a render pass, consumed by the event loop.
@@ -90,6 +92,10 @@ pub fn render(f: &mut Frame, app: &AppState, views: &mut ViewStates, render_out:
         render_detail(f, main_area, app, !popup, render_out);
     } else if app.active_tab_source_kind() == Some(crate::config::types::SourceKind::Board) {
         crate::tui::board::render_board(f, main_area, app, &mut views.board, !popup);
+    } else if app.active_tab_source_kind() == Some(crate::config::types::SourceKind::Standup) {
+        // A timeline, not a list of items, so it takes the full width like a
+        // board rather than sharing with the detail panel.
+        crate::tui::standup::render_standup(f, main_area, app, &mut views.standup, !popup);
     } else {
         // List tabs and backlog tabs share the list+detail layout — a backlog
         // is just a rank-ordered list of one source.

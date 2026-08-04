@@ -7,11 +7,12 @@ use serde_json::json;
 use tokio::sync::RwLock;
 
 use crate::jira::auth::Auth;
+use crate::jira::jql::escape_string as escape_jql_string;
 use crate::jira::types::{
-    AgileIssuesResponse, AgilePage, Attachment, BoardConfiguration, Comment, FieldMeta,
-    FieldSchema, GreenHopperBoardData, GreenHopperSwimlane, Issue, IssueTypeField, ProjectInfo,
-    RankAnchor, SearchResponse, Sprint, StatusCategory, StatusInfo, Transition,
-    TransitionsResponse,
+    AgileIssuesResponse, AgilePage, Attachment, BoardConfiguration, ChangelogEntry, ChangelogPage,
+    Comment, CommentPage, FieldMeta, FieldSchema, GreenHopperBoardData, GreenHopperSwimlane, Issue,
+    IssueTypeField, KeysResponse, ProjectInfo, RankAnchor, SearchResponse, Sprint, StatusCategory,
+    StatusInfo, Transition, TransitionsResponse, Worklog, WorklogPage,
 };
 
 const MAX_RESULTS: u32 = 100;
@@ -57,6 +58,26 @@ impl JiraClient {
     /// `/search/jql` is cursor-based: pagination goes by `nextPageToken`
     /// (`startAt` is ignored and would refetch the first page forever).
     pub async fn fetch_jql(&self, jql: &str) -> Result<Vec<Issue>> {
+        self.fetch_jql_with(jql, "*all", None).await
+    }
+
+    /// Like [`Self::fetch_jql`] but with an explicit field list and optional
+    /// `expand`.
+    ///
+    /// Kept separate rather than changing `fetch_jql`'s signature because the
+    /// list and board flows depend on `*all`. The standup collector uses this
+    /// with `expand=changelog`, which returns each issue's changegroups
+    /// newest-first — one call for discovery *and* content.
+    ///
+    /// Note the page size is deliberately left to the server via
+    /// `nextPageToken`: Jira returns fewer items per page when many fields are
+    /// requested, so a computed page count would silently drop issues.
+    pub async fn fetch_jql_with(
+        &self,
+        jql: &str,
+        fields: &str,
+        expand: Option<&str>,
+    ) -> Result<Vec<Issue>> {
         let mut all_issues = Vec::new();
         let mut next_page_token: Option<String> = None;
 
@@ -70,29 +91,27 @@ impl JiraClient {
             let mut query: Vec<(&str, String)> = vec![
                 ("jql", jql.to_string()),
                 ("maxResults", MAX_RESULTS.to_string()),
-                ("fields", "*all".to_string()),
+                ("fields", fields.to_string()),
             ];
+            if let Some(expand) = expand {
+                query.push(("expand", expand.to_string()));
+            }
             if let Some(token) = &next_page_token {
                 query.push(("nextPageToken", token.clone()));
             }
 
             self.maybe_refresh().await?;
-            let resp = self
-                .apply_auth(self.client.get(&url))
-                .await
-                .query(&query)
-                .send()
-                .await
-                .map_err(|e| {
-                    log::error!("JQL send error: {e}");
-                    let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
-                    while let Some(cause) = src {
-                        log::error!("  caused by: {cause}");
-                        src = cause.source();
-                    }
-                    e
-                })
-                .context("Failed to send JQL request")?;
+            let resp = crate::http::send_with_retry(
+                self.apply_auth(self.client.get(&url)).await.query(&query),
+            )
+            .await
+            .inspect_err(|e| {
+                log::error!("JQL send error: {e}");
+                for cause in e.chain().skip(1) {
+                    log::error!("  caused by: {cause}");
+                }
+            })
+            .context("Failed to send JQL request")?;
 
             let status = resp.status();
             log::debug!("JQL response: HTTP {status}");
@@ -151,10 +170,10 @@ impl JiraClient {
                 anyhow::bail!("Jira API error {status}: {body}");
             }
 
-            let page: SearchResponse = resp
+            let page: KeysResponse = resp
                 .json()
                 .await
-                .context("Failed to parse search response")?;
+                .context("Failed to parse search keys response")?;
             let fetched = page.issues.len();
             let is_last = page.is_last;
             next_page_token = page.next_page_token;
@@ -797,6 +816,163 @@ impl JiraClient {
         me.account_id
             .or(me.name)
             .ok_or_else(|| anyhow::anyhow!("Could not determine current user"))
+    }
+
+    /// Does `issuekey IN updatedBy(...)` work with this user literal?
+    ///
+    /// Worth a dedicated probe because a literal Jira does not recognise yields
+    /// an *empty result set rather than an error* — for a standup that reads as
+    /// "you did nothing", the one failure mode a user would not question.
+    /// `updatedBy` also rejects `currentUser()`, so the literal cannot be
+    /// avoided.
+    ///
+    /// `Ok(false)` means "unusable, fall back"; an HTTP failure propagates.
+    pub async fn probe_updated_by(&self, user: &str) -> Result<bool> {
+        let escaped = escape_jql_string(user);
+        let probe = format!("issuekey IN updatedBy(\"{escaped}\", \"-365d\")");
+        match self.fetch_jql_page_keys(&probe, 1).await {
+            Ok(keys) if !keys.is_empty() => Ok(true),
+            Ok(_) => {
+                // Empty could mean a genuinely idle year. Only call the function
+                // broken if a query that must match something also came back
+                // empty.
+                let control = "creator = currentUser() OR assignee = currentUser()";
+                let control_keys = self.fetch_jql_page_keys(control, 1).await?;
+                if control_keys.is_empty() {
+                    // Nothing to compare against; assume the function works.
+                    Ok(true)
+                } else {
+                    log::warn!(
+                        "JQL updatedBy(\"{user}\") matched nothing while the control query \
+                         matched — treating updatedBy as unsupported for this instance"
+                    );
+                    Ok(false)
+                }
+            }
+            Err(e) => {
+                log::warn!("JQL updatedBy probe failed, falling back: {e}");
+                Ok(false)
+            }
+        }
+    }
+
+    /// First page of keys only — for probes and cheap discovery queries where
+    /// paginating the whole result set would be waste.
+    pub async fn fetch_jql_page_keys(&self, jql: &str, max_results: u32) -> Result<Vec<String>> {
+        let url = format!("{}/rest/api/3/search/jql", self.base_url);
+        let query: Vec<(&str, String)> = vec![
+            ("jql", jql.to_string()),
+            ("maxResults", max_results.to_string()),
+            ("fields", "key".to_string()),
+        ];
+        self.maybe_refresh().await?;
+        let resp = crate::http::send_with_retry(
+            self.apply_auth(self.client.get(&url)).await.query(&query),
+        )
+        .await
+        .context("Failed to send JQL keys request")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+        let page: KeysResponse = resp
+            .json()
+            .await
+            .context("Failed to parse search keys response")?;
+        Ok(page.issues.into_iter().map(|i| i.key).collect())
+    }
+
+    /// Recent comments, newest first.
+    ///
+    /// `orderBy=-created` is why this exists: the `comment` block inside a
+    /// search response starts at the oldest comment, so on a busy issue the
+    /// recent ones are precisely the ones truncated away.
+    pub async fn get_recent_comments(&self, key: &str, max_results: u32) -> Result<Vec<Comment>> {
+        let url = format!("{}/rest/api/3/issue/{key}/comment", self.base_url);
+        let query: Vec<(&str, String)> = vec![
+            ("orderBy", "-created".to_string()),
+            ("maxResults", max_results.to_string()),
+        ];
+        self.maybe_refresh().await?;
+        let resp = crate::http::send_with_retry(
+            self.apply_auth(self.client.get(&url)).await.query(&query),
+        )
+        .await
+        .context("Failed to fetch comments")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+        let page: CommentPage = resp.json().await.context("Failed to parse comment page")?;
+        Ok(page.comments)
+    }
+
+    /// The tail of an issue's changelog.
+    ///
+    /// This endpoint is oldest-first, unlike `expand=changelog`, so it is only
+    /// useful for reaching the newest changegroups when the inline object was
+    /// truncated — hence `start_at`, which callers compute as
+    /// `total - max_results`.
+    pub async fn get_changelog_tail(
+        &self,
+        key: &str,
+        start_at: u32,
+        max_results: u32,
+    ) -> Result<Vec<ChangelogEntry>> {
+        let url = format!("{}/rest/api/3/issue/{key}/changelog", self.base_url);
+        let query: Vec<(&str, String)> = vec![
+            ("startAt", start_at.to_string()),
+            ("maxResults", max_results.to_string()),
+        ];
+        self.maybe_refresh().await?;
+        let resp = crate::http::send_with_retry(
+            self.apply_auth(self.client.get(&url)).await.query(&query),
+        )
+        .await
+        .context("Failed to fetch changelog")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+        let page: ChangelogPage = resp.json().await.context("Failed to parse changelog")?;
+        Ok(page.values)
+    }
+
+    /// Worklogs whose `started` falls in a range, filtered server-side.
+    ///
+    /// Bounds are epoch milliseconds, which the endpoint takes precisely — no
+    /// day-rounding, unlike the `worklogDate` JQL field used for discovery.
+    pub async fn get_worklogs_between(
+        &self,
+        key: &str,
+        started_after_ms: i64,
+        started_before_ms: i64,
+    ) -> Result<Vec<Worklog>> {
+        let url = format!("{}/rest/api/3/issue/{key}/worklog", self.base_url);
+        let query: Vec<(&str, String)> = vec![
+            ("startedAfter", started_after_ms.to_string()),
+            ("startedBefore", started_before_ms.to_string()),
+        ];
+        self.maybe_refresh().await?;
+        let resp = crate::http::send_with_retry(
+            self.apply_auth(self.client.get(&url)).await.query(&query),
+        )
+        .await
+        .context("Failed to fetch worklogs")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Jira API error {status}: {body}");
+        }
+        let page: WorklogPage = resp.json().await.context("Failed to parse worklogs")?;
+        Ok(page.worklogs)
     }
 
     /// Fetch all field definitions from this Jira instance.

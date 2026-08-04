@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use reqwest::Client;
 use serde_json::json;
 use tokio::sync::RwLock;
@@ -10,8 +11,9 @@ use crate::config::types::ConfluenceFilters;
 use crate::jira::auth::{self, Auth};
 
 use super::types::{
-    ApiTask, PageMeta, PagesPage, SpacesPage, Task, TasksPage, build_task_query, next_cursor,
-    to_display,
+    ApiPageSummary, ApiPageVersion, ApiTask, PageMeta, PageSummariesPage, PageVersionsPage,
+    PagesPage, SearchPage, SpacesPage, Task, TasksPage, build_completed_task_query,
+    build_page_contributor_cql, build_task_query, next_cursor, to_display,
 };
 
 /// Maximum ids per bulk pages/blogposts lookup (API limit is 250).
@@ -184,6 +186,181 @@ impl ConfluenceClient {
             .collect())
     }
 
+    /// Tasks you ticked off inside a window, filtered entirely server-side.
+    pub async fn fetch_completed_tasks(
+        &self,
+        from: chrono::DateTime<Utc>,
+        to: chrono::DateTime<Utc>,
+    ) -> Result<Vec<Task>> {
+        let me = self.current_account_id().await?;
+        let base_query =
+            build_completed_task_query(&me, from.timestamp_millis(), to.timestamp_millis());
+        let base = self.base().await;
+        let url = format!("{base}/api/v2/tasks");
+
+        let mut tasks: Vec<ApiTask> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut query = base_query.clone();
+            if let Some(c) = &cursor {
+                query.push(("cursor".into(), c.clone()));
+            }
+            let page: TasksPage = self.get_json(&url, &query).await?;
+            tasks.extend(page.results);
+            cursor = next_cursor(&page.links);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        log::debug!("Confluence completed tasks fetched: {}", tasks.len());
+
+        let containers = self.resolve_containers(&tasks).await;
+        let space_keys: HashMap<String, String> = self
+            .space_ids
+            .read()
+            .await
+            .iter()
+            .map(|(key, id)| (id.clone(), key.clone()))
+            .collect();
+        Ok(tasks
+            .into_iter()
+            .map(|t| to_display(t, &containers, &space_keys))
+            .collect())
+    }
+
+    /// Page ids you contributed to, modified on or after `from` (day-granular).
+    ///
+    /// Uses the v1 CQL search endpoint, whose granular scope
+    /// (`read:content-details:confluence`) is already in the app's Confluence
+    /// scope set — adding the classic `search:confluence` would mix scope
+    /// families in one authorization, which is the combination Atlassian has not
+    /// been verified to accept.
+    ///
+    /// Returns `(page_id, title, url)`. Precision comes from
+    /// [`Self::fetch_page_versions`] afterwards.
+    pub async fn search_contributed_pages(
+        &self,
+        from: chrono::NaiveDate,
+        space_keys: &[String],
+        limit: u32,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        let mut cql = build_page_contributor_cql(from);
+        if !space_keys.is_empty() {
+            let list = space_keys
+                .iter()
+                .map(|k| format!("\"{}\"", k.replace('"', "")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            cql = format!("{cql} AND space IN ({list})");
+        }
+        let base = self.base().await;
+        let url = format!("{base}/rest/api/search");
+        let query = vec![
+            ("cql".to_owned(), cql.clone()),
+            ("limit".to_owned(), limit.to_string()),
+        ];
+        log::debug!("Confluence CQL search: {cql}");
+        let page: SearchPage = self.get_json(&url, &query).await?;
+        let web_base = page.links.base.clone();
+        Ok(page
+            .results
+            .into_iter()
+            .filter_map(|row| {
+                let content = row.content?;
+                let title = content
+                    .title
+                    .or(row.title)
+                    .unwrap_or_else(|| content.id.clone());
+                let url = match (&web_base, &row.url) {
+                    (Some(b), Some(u)) => Some(format!("{}{u}", b.trim_end_matches('/'))),
+                    _ => None,
+                };
+                Some((content.id, title, url))
+            })
+            .collect())
+    }
+
+    /// Versions of one page, newest first.
+    pub async fn fetch_page_versions(&self, page_id: &str) -> Result<Vec<ApiPageVersion>> {
+        let base = self.base().await;
+        let url = format!("{base}/api/v2/pages/{page_id}/versions");
+        let query = vec![
+            ("limit".to_owned(), "50".to_owned()),
+            ("sort".to_owned(), "-modified-date".to_owned()),
+        ];
+        let page: PageVersionsPage = self.get_json(&url, &query).await?;
+        Ok(page.results)
+    }
+
+    /// Reduced-accuracy page activity: walk pages newest-modified first and stop
+    /// once they predate the window.
+    ///
+    /// The fallback for when the CQL search is not permitted. Each page carries
+    /// its creator and its latest version's author, which covers "I created it"
+    /// and "I last edited it" — but *not* a page you edited that someone else
+    /// edited afterwards. Requires spaces: unscoped this walks every edit on the
+    /// site.
+    pub async fn walk_recent_pages(
+        &self,
+        space_keys: &[String],
+        since: chrono::DateTime<Utc>,
+        max_pages: u32,
+    ) -> Result<Vec<ApiPageSummary>> {
+        if space_keys.is_empty() {
+            anyhow::bail!(
+                "Confluence page activity needs `standup.confluence.spaces` when the CQL \
+                 search is unavailable — an unscoped walk would read every recent edit \
+                 on the site"
+            );
+        }
+        let space_ids = self.resolve_space_ids(space_keys).await?;
+        let base = self.base().await;
+        let url = format!("{base}/api/v2/pages");
+
+        let mut out: Vec<ApiPageSummary> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages_walked = 0;
+        'outer: loop {
+            let mut query: Vec<(String, String)> = vec![
+                ("limit".to_owned(), "250".to_owned()),
+                ("sort".to_owned(), "-modified-date".to_owned()),
+            ];
+            for id in &space_ids {
+                query.push(("space-id".to_owned(), id.clone()));
+            }
+            if let Some(c) = &cursor {
+                query.push(("cursor".into(), c.clone()));
+            }
+            let page: PageSummariesPage = self.get_json(&url, &query).await?;
+            for summary in page.results {
+                // Sorted newest-modified first, so the first page older than the
+                // window ends the walk.
+                let modified = summary
+                    .version
+                    .as_ref()
+                    .map(|v| v.created_at)
+                    .or(summary.created_at);
+                if modified.is_some_and(|m| m < since) {
+                    break 'outer;
+                }
+                out.push(summary);
+            }
+            cursor = next_cursor(&page.links);
+            pages_walked += 1;
+            if cursor.is_none() || pages_walked >= max_pages {
+                if cursor.is_some() {
+                    log::warn!(
+                        "Confluence page walk stopped at the {max_pages}-page cap \
+                         ({} pages seen); narrow `standup.confluence.spaces`",
+                        out.len()
+                    );
+                }
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Mark a task complete (or incomplete).
     pub async fn set_task_status(&self, task_id: &str, complete: bool) -> Result<()> {
         auth::maybe_refresh(&self.auth).await?;
@@ -203,6 +380,12 @@ impl ConfluenceClient {
             anyhow::bail!("Confluence API error {code}: {body}");
         }
         Ok(())
+    }
+
+    /// Current user's Atlassian account id — the attribution key standup mode
+    /// compares page-version and task authors against.
+    pub async fn account_id(&self) -> Result<String> {
+        self.current_account_id().await
     }
 
     /// Current user's Atlassian account id (cached). There is no v2 "myself"
