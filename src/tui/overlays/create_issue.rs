@@ -18,7 +18,7 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 
-use crate::jira::types::{FieldSchema, IssueTypeField, ProjectField, ProjectInfo};
+use crate::jira::types::{FieldSchema, IssueTypeField, ProjectField, ProjectInfo, UserField};
 use crate::tui::app::{ActionState, AppState, CacheState, edit_text};
 use crate::tui::overlays::datetime_picker::{
     self, DatetimePicker, DatetimePickerMode, TimeFocus, handle_date_key, handle_time_key,
@@ -43,6 +43,10 @@ pub enum WidgetKind {
     Select,
     /// Multi-select array from `allowedValues`.
     MultiSelect,
+    /// A single user with no `allowedValues` to pick from. There is no user
+    /// search here yet, so the only value it can take is the current user;
+    /// `reporter` starts prefilled with them.
+    User,
     /// A field type the TUI can't edit; read-only, blocks submit if required.
     Unsupported,
 }
@@ -63,6 +67,8 @@ pub enum FieldValue {
     Date { value: Option<String> },
     SingleOption(Option<usize>),
     MultiOption(HashSet<usize>),
+    /// `None` means "leave to Jira" — for `reporter` that resolves to the creator.
+    User(Option<UserField>),
     Unsupported,
 }
 
@@ -101,6 +107,81 @@ pub enum CreatePicker {
         field_idx: usize,
         picker: DatetimePicker,
     },
+    /// Assignee/reporter chooser. Unlike the project picker its list is not
+    /// local: `query` is sent to Jira and the matches land in
+    /// `CreateForm::user_search`.
+    User {
+        field_idx: usize,
+        query: String,
+        query_cursor: usize,
+        cursor: usize,
+        searching: bool,
+    },
+}
+
+/// A row of the user picker. The list is more than the search results: it
+/// leads with a way to clear the field, and pins the current user while no
+/// query narrows things down.
+#[derive(Debug, Clone)]
+pub enum UserRow {
+    /// Clear the field and let Jira decide — for `reporter`, the creator.
+    Unset,
+    /// The authenticated user, pinned above the results.
+    Me(UserField),
+    Found(UserField),
+}
+
+/// Debounced state of the user search backing the picker. Present only while
+/// a user picker is open; recreated on each open so results never leak from
+/// one field (or project) to the next.
+#[derive(Debug, Clone)]
+pub struct UserSearch {
+    /// Query the picker last settled on, already sent or waiting out the debounce.
+    pub query: String,
+    /// When `query` last changed. The dispatcher waits `USER_SEARCH_DEBOUNCE_MS`
+    /// past this before spending a request on a half-typed name. `None` for the
+    /// opening query: it is empty and nobody is mid-word, so it goes at once.
+    pub changed_at: Option<std::time::Instant>,
+    /// Whether the request for the current `token` has been spawned.
+    pub spawned: bool,
+    /// Bumped on every query change so responses to superseded queries are dropped.
+    pub token: u64,
+    /// Whether a response for the current `token` is still outstanding. Kept
+    /// separate from `results` so the previous matches stay on screen while
+    /// the next ones load, instead of the list blanking on every keystroke.
+    pub pending: bool,
+    pub results: CacheState<Vec<UserField>>,
+}
+
+impl UserSearch {
+    const fn new(token: u64) -> Self {
+        Self {
+            query: String::new(),
+            changed_at: None,
+            spawned: false,
+            token,
+            pending: true,
+            results: CacheState::Loading,
+        }
+    }
+
+    /// Restart the search for a changed query under a fresh token.
+    fn requery(&mut self, query: String) {
+        self.query = query;
+        self.changed_at = Some(std::time::Instant::now());
+        self.spawned = false;
+        self.token += 1;
+        self.pending = true;
+    }
+}
+
+/// Whether the reporter still has to be prefilled with the current user.
+/// `Done` guards against re-filling a reporter the user deliberately cleared
+/// when `/myself` resolves after the field metadata does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prefill {
+    Pending,
+    Done,
 }
 
 /// Form-level interaction mode. `Nav` uses Vim-style keys (j/k/q/Enter to
@@ -121,6 +202,13 @@ pub struct CreateForm {
     pub issuetypes: CacheState<Vec<IssueTypeField>>,
     pub fields: Vec<FormField>,
     pub fields_state: CacheState<()>,
+    /// The authenticated Jira user, once known: the value user fields toggle to
+    /// and what `reporter` is prefilled with. `None` until `/myself` lands.
+    pub current_user: Option<UserField>,
+    /// Whether the reporter prefill has already run for the current field set.
+    pub prefill: Prefill,
+    /// Live state of the assignee/reporter chooser; `None` unless one is open.
+    pub user_search: Option<UserSearch>,
     /// Flat focus index: 0=project, 1=issue type, 2..=fields, last=Create button.
     pub focus: usize,
     pub mode: FormMode,
@@ -146,6 +234,9 @@ impl CreateForm {
             issuetypes: CacheState::Loading,
             fields: Vec::new(),
             fields_state: CacheState::Idle,
+            current_user: None,
+            prefill: Prefill::Pending,
+            user_search: None,
             focus: 1, // start on Issue Type (project is pre-filled)
             mode: FormMode::Nav,
             picker: None,
@@ -174,6 +265,9 @@ impl CreateForm {
         self.issuetypes = CacheState::Loading;
         self.fields.clear();
         self.fields_state = CacheState::Idle;
+        self.prefill = Prefill::Pending;
+        // Assignable users are project-scoped; the old matches no longer apply.
+        self.user_search = None;
         self.focus = 1;
         self.mode = FormMode::Nav;
         self.meta_token += 1;
@@ -186,6 +280,7 @@ impl CreateForm {
         self.issuetype = Some(it);
         self.fields.clear();
         self.fields_state = CacheState::Loading;
+        self.prefill = Prefill::Pending;
         self.meta_token += 1;
         self.needs_field_fetch = true;
         self.error = None;
@@ -256,7 +351,7 @@ pub fn schema_to_widget(schema: &Value, has_options: bool) -> WidgetKind {
             if has_options {
                 WidgetKind::Select
             } else {
-                WidgetKind::Text
+                WidgetKind::User
             }
         }
         "array" => match items {
@@ -294,6 +389,15 @@ fn option_ref(raw: &Value) -> Value {
     raw.clone()
 }
 
+/// How Jira wants a user referenced in a create payload: `accountId` on Cloud,
+/// `name` on the older Server/DC shape. `None` if the user carries neither.
+fn user_ref(user: &UserField) -> Option<Value> {
+    if let Some(id) = &user.account_id {
+        return Some(json!({ "accountId": id }));
+    }
+    user.name.as_ref().map(|n| json!({ "name": n }))
+}
+
 fn initial_value(widget: WidgetKind) -> FieldValue {
     match widget {
         WidgetKind::Text | WidgetKind::RichText => FieldValue::Text {
@@ -307,6 +411,7 @@ fn initial_value(widget: WidgetKind) -> FieldValue {
         WidgetKind::Date | WidgetKind::DateTime => FieldValue::Date { value: None },
         WidgetKind::Select => FieldValue::SingleOption(None),
         WidgetKind::MultiSelect => FieldValue::MultiOption(HashSet::new()),
+        WidgetKind::User => FieldValue::User(None),
         WidgetKind::Unsupported => FieldValue::Unsupported,
     }
 }
@@ -363,6 +468,76 @@ pub fn parse_create_fields(values: &[Value]) -> Vec<FormField> {
     fields
 }
 
+/// Prefill `reporter` with the current user. Runs once per field set (guarded
+/// by `form.prefill`) so a reporter the user cleared is not silently
+/// restored when `/myself` resolves after the field metadata does. A no-op
+/// while either the fields or the current user are still loading, and when the
+/// project's create screen has no reporter field — Jira then defaults it to the
+/// creator, which is the same person.
+pub fn apply_reporter_prefill(form: &mut CreateForm) {
+    if form.prefill == Prefill::Done || !matches!(form.fields_state, CacheState::Loaded(())) {
+        return;
+    }
+    let Some(me) = form.current_user.clone() else {
+        return;
+    };
+    form.prefill = Prefill::Done;
+    if let Some(field) = form
+        .fields
+        .iter_mut()
+        .find(|f| f.field_id == "reporter" && f.widget == WidgetKind::User)
+    {
+        field.value = FieldValue::User(Some(me));
+    }
+}
+
+/// Rows of the user picker for the current search state: the unset row, then
+/// the current user while the query is empty (they are who you pick most, and
+/// an empty search may not even return them first), then the matches — minus
+/// the pinned user, so nobody appears twice.
+pub fn user_picker_rows(
+    current_user: Option<&UserField>,
+    query: &str,
+    results: &[UserField],
+) -> Vec<UserRow> {
+    let mut rows = vec![UserRow::Unset];
+    let pinned = query.trim().is_empty().then_some(current_user).flatten();
+    if let Some(me) = pinned {
+        rows.push(UserRow::Me(me.clone()));
+    }
+    rows.extend(
+        results
+            .iter()
+            .filter(|u| !pinned.is_some_and(|me| same_user(me, u)))
+            .cloned()
+            .map(UserRow::Found),
+    );
+    rows
+}
+
+/// Same person? Account ids identify users on Cloud, usernames on Server/DC.
+fn same_user(a: &UserField, b: &UserField) -> bool {
+    match (&a.account_id, &b.account_id) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.name.is_some() && a.name == b.name,
+    }
+}
+
+fn user_row_label(row: &UserRow) -> String {
+    match row {
+        UserRow::Unset => "—  (leave to Jira)".to_string(),
+        UserRow::Me(u) => format!("{}  (me)", u.display()),
+        UserRow::Found(u) => u.display().to_string(),
+    }
+}
+
+const fn user_row_value(row: &UserRow) -> Option<&UserField> {
+    match row {
+        UserRow::Unset => None,
+        UserRow::Me(u) | UserRow::Found(u) => Some(u),
+    }
+}
+
 /// The JSON value to emit for a field, or `None` if it should be omitted.
 fn field_payload_value(field: &FormField) -> Option<Value> {
     match (&field.widget, &field.value) {
@@ -385,6 +560,7 @@ fn field_payload_value(field: &FormField) -> Option<Value> {
         (WidgetKind::Select, FieldValue::SingleOption(Some(i))) => {
             field.options.get(*i).map(|o| option_ref(&o.raw))
         }
+        (WidgetKind::User, FieldValue::User(Some(user))) => user_ref(user),
         (WidgetKind::MultiSelect, FieldValue::MultiOption(set)) if !set.is_empty() => {
             let mut idxs: Vec<usize> = set.iter().copied().collect();
             idxs.sort_unstable();
@@ -549,6 +725,7 @@ fn activate_field(form: &mut CreateForm) {
         WidgetKind::Select => open_select_picker(form, idx),
         WidgetKind::MultiSelect => open_multiselect_picker(form, idx),
         WidgetKind::Date | WidgetKind::DateTime => open_date_picker(form, idx),
+        WidgetKind::User => open_user_picker(form, idx),
         WidgetKind::Unsupported => {}
     }
 }
@@ -621,7 +798,9 @@ fn form_is_dirty(form: &CreateForm) -> bool {
         FieldValue::Date { value } => value.is_some(),
         FieldValue::SingleOption(opt) => opt.is_some(),
         FieldValue::MultiOption(set) => !set.is_empty(),
-        FieldValue::Unsupported => false,
+        // The prefilled reporter is not something the user typed, so it must
+        // not trigger the discard prompt on an otherwise untouched form.
+        FieldValue::User(_) | FieldValue::Unsupported => false,
     })
 }
 
@@ -664,6 +843,20 @@ fn open_issuetype_picker(form: &mut CreateForm) {
     if form.issuetypes.loaded().is_some() {
         form.picker = Some(CreatePicker::IssueType { cursor: 0 });
     }
+}
+
+/// Open the assignee/reporter chooser on an empty query — the dispatcher turns
+/// that into a request for the project's assignable users.
+fn open_user_picker(form: &mut CreateForm, field_idx: usize) {
+    let token = form.user_search.as_ref().map_or(1, |s| s.token + 1);
+    form.user_search = Some(UserSearch::new(token));
+    form.picker = Some(CreatePicker::User {
+        field_idx,
+        query: String::new(),
+        query_cursor: 0,
+        cursor: 0,
+        searching: false,
+    });
 }
 
 fn open_select_picker(form: &mut CreateForm, field_idx: usize) {
@@ -728,6 +921,82 @@ fn filtered_project_idxs(form: &CreateForm, query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Rows currently shown by the open user picker.
+fn picker_user_rows(form: &CreateForm, query: &str) -> Vec<UserRow> {
+    let results: &[UserField] = form
+        .user_search
+        .as_ref()
+        .and_then(|s| s.results.loaded())
+        .map_or(&[], Vec::as_slice);
+    user_picker_rows(form.current_user.as_ref(), query, results)
+}
+
+/// Key routing for the assignee/reporter chooser. `picker` is the taken
+/// `CreatePicker::User`; leaving it dropped closes the chooser.
+fn handle_user_picker_key(form: &mut CreateForm, code: KeyCode, picker: CreatePicker) {
+    let CreatePicker::User {
+        field_idx,
+        mut query,
+        mut query_cursor,
+        mut cursor,
+        mut searching,
+    } = picker
+    else {
+        return;
+    };
+
+    if searching {
+        match code {
+            // Leave search mode but keep the query (and its matches) applied.
+            KeyCode::Esc | KeyCode::Enter => searching = false,
+            _ => {
+                let before = query.clone();
+                edit_text(&mut query, &mut query_cursor, code);
+                if query != before {
+                    cursor = 0;
+                    if let Some(search) = form.user_search.as_mut() {
+                        search.requery(query.clone());
+                    }
+                }
+            }
+        }
+    } else {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                form.user_search = None;
+                return; // picker already taken → closed
+            }
+            KeyCode::Char('/') => searching = true,
+            KeyCode::Enter => {
+                let chosen = picker_user_rows(form, &query)
+                    .get(cursor)
+                    .map(|row| user_row_value(row).cloned());
+                if let Some(user) = chosen {
+                    if let Some(field) = form.fields.get_mut(field_idx) {
+                        field.value = FieldValue::User(user);
+                    }
+                    form.user_search = None;
+                    return;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let count = picker_user_rows(form, &query).len();
+                cursor = (cursor + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('k') => cursor = cursor.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    form.picker = Some(CreatePicker::User {
+        field_idx,
+        query,
+        query_cursor,
+        cursor,
+        searching,
+    });
+}
+
 #[allow(clippy::too_many_lines)]
 fn handle_picker_input(app: &mut AppState, code: KeyCode, _modifiers: KeyModifiers) {
     let ActionState::CreatingIssue(ref mut form) = app.action_state else {
@@ -738,6 +1007,9 @@ fn handle_picker_input(app: &mut AppState, code: KeyCode, _modifiers: KeyModifie
     };
 
     match picker {
+        // Split out: the user chooser is the only picker whose list comes from
+        // the server, so its keys also drive a search.
+        p @ CreatePicker::User { .. } => handle_user_picker_key(form, code, p),
         CreatePicker::Project {
             mut query,
             mut query_cursor,
@@ -1101,6 +1373,9 @@ fn field_value_display(field: &FormField) -> String {
                 format!("{} selected  ▾", set.len())
             }
         }
+        (WidgetKind::User, FieldValue::User(user)) => user
+            .as_ref()
+            .map_or_else(|| "—".to_string(), |u| u.display().to_string()),
         (WidgetKind::Unsupported, _) => "(set in browser)".to_string(),
         _ => String::new(),
     }
@@ -1133,7 +1408,7 @@ fn render_picker(f: &mut Frame, form: &CreateForm, picker: &CreatePicker, projec
                 &items,
                 *cursor,
                 None,
-                projects_loading,
+                projects_loading.then_some("(loading more…)"),
                 Some(project_picker_hints_line(*searching)),
             );
         }
@@ -1143,19 +1418,26 @@ fn render_picker(f: &mut Frame, form: &CreateForm, picker: &CreatePicker, projec
                 .loaded()
                 .map(|v| v.iter().map(|it| it.name.clone()).collect())
                 .unwrap_or_default();
-            render_list(f, " Issue Type ", &items, *cursor, None, false, None);
+            render_list(f, " Issue Type ", &items, *cursor, None, None, None);
         }
         CreatePicker::Select { field_idx, cursor } => {
             let (title, items) = field_option_items(form, *field_idx);
-            render_list(f, &title, &items, *cursor, None, false, None);
+            render_list(f, &title, &items, *cursor, None, None, None);
         }
+        CreatePicker::User {
+            field_idx,
+            query,
+            cursor,
+            searching,
+            ..
+        } => render_user_picker(f, form, *field_idx, query, *cursor, *searching),
         CreatePicker::MultiSelect { field_idx, cursor } => {
             let (title, items) = field_option_items(form, *field_idx);
             let marks = match form.fields.get(*field_idx).map(|f| &f.value) {
                 Some(FieldValue::MultiOption(set)) => Some(set.clone()),
                 _ => None,
             };
-            render_list(f, &title, &items, *cursor, marks.as_ref(), false, None);
+            render_list(f, &title, &items, *cursor, marks.as_ref(), None, None);
         }
         CreatePicker::Date { field_idx, picker } => {
             let area = crate::tui::render::centered_rect(40, 50, f.area());
@@ -1198,6 +1480,42 @@ pub fn render_created_confirm_overlay(f: &mut Frame, key: &str) {
     );
 }
 
+/// The assignee/reporter chooser. Its list is the search results plus the
+/// unset/me rows, and it reports search progress in the footer.
+fn render_user_picker(
+    f: &mut Frame,
+    form: &CreateForm,
+    field_idx: usize,
+    query: &str,
+    cursor: usize,
+    searching: bool,
+) {
+    let label = form.fields.get(field_idx).map_or("User", |f| f.label.as_str());
+    let title = if searching {
+        format!(" {label} — /{query}\u{258f} ")
+    } else if query.is_empty() {
+        format!(" {label} ")
+    } else {
+        format!(" {label} — /{query} ")
+    };
+    let hints = Some(project_picker_hints_line(searching));
+    let search = form.user_search.as_ref();
+
+    // A failed search would otherwise leave an unexplained one-row list.
+    if let Some(CacheState::Failed(e)) = search.map(|s| &s.results) {
+        let items = [format!("(user search failed: {e})")];
+        render_list(f, &title, &items, 0, None, None, hints);
+        return;
+    }
+
+    let items: Vec<String> = picker_user_rows(form, query)
+        .iter()
+        .map(user_row_label)
+        .collect();
+    let note = search.is_some_and(|s| s.pending).then_some("(searching\u{2026})");
+    render_list(f, &title, &items, cursor, None, note, hints);
+}
+
 fn field_option_items(form: &CreateForm, field_idx: usize) -> (String, Vec<String>) {
     form.fields.get(field_idx).map_or_else(
         || (" Select ".to_string(), Vec::new()),
@@ -1210,13 +1528,15 @@ fn field_option_items(form: &CreateForm, field_idx: usize) -> (String, Vec<Strin
     )
 }
 
+/// Shared picker list. `loading_note` is the footer shown under the list
+/// while more rows are on their way.
 fn render_list(
     f: &mut Frame,
     title: &str,
     items: &[String],
     cursor: usize,
     marks: Option<&HashSet<usize>>,
-    loading_more: bool,
+    loading_note: Option<&str>,
     hints: Option<Line<'static>>,
 ) {
     use ratatui::layout::{Constraint, Direction, Layout};
@@ -1231,7 +1551,7 @@ fn render_list(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let (list_area, hint_area) = if loading_more {
+    let (list_area, hint_area) = if loading_note.is_some() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -1273,10 +1593,10 @@ fn render_list(
         f.render_stateful_widget(list, list_area, &mut state);
     }
 
-    if let Some(area) = hint_area {
+    if let (Some(area), Some(note)) = (hint_area, loading_note) {
         f.render_widget(
             Paragraph::new(Span::styled(
-                "  (loading more…)",
+                format!("  {note}"),
                 Style::default()
                     .fg(theme::MUTED)
                     .add_modifier(Modifier::ITALIC),
@@ -1424,7 +1744,7 @@ mod tests {
             WidgetKind::MultiSelect
         );
         assert_eq!(schema_to_widget(&schema("user"), true), WidgetKind::Select);
-        assert_eq!(schema_to_widget(&schema("user"), false), WidgetKind::Text);
+        assert_eq!(schema_to_widget(&schema("user"), false), WidgetKind::User);
         assert_eq!(
             schema_to_widget(&schema("timetracking"), false),
             WidgetKind::Unsupported
@@ -1608,6 +1928,301 @@ mod tests {
     fn pending_fields_fetch_blocks_submit() {
         let mut form = base_form();
         form.fields_state = CacheState::Loading;
+        assert!(build_create_payload(&form).is_err());
+    }
+
+    fn me() -> UserField {
+        UserField {
+            name: None,
+            display_name: Some("Vlad Petrov".into()),
+            account_id: Some("acct-1".into()),
+        }
+    }
+
+    /// Reporter + assignee as createmeta returns them: `user` schema, no
+    /// `allowedValues` (Jira omits them for user pickers).
+    fn user_form(me: Option<UserField>) -> CreateForm {
+        let mut form = base_form();
+        form.current_user = me;
+        form.fields = parse_create_fields(&[
+            json!({ "fieldId": "reporter", "name": "Reporter", "required": false,
+                    "schema": { "type": "user", "system": "reporter" } }),
+            json!({ "fieldId": "assignee", "name": "Assignee", "required": false,
+                    "schema": { "type": "user", "system": "assignee" } }),
+        ]);
+        form
+    }
+
+    fn reporter_of(form: &CreateForm) -> Option<&UserField> {
+        match &form.fields.iter().find(|f| f.field_id == "reporter")?.value {
+            FieldValue::User(u) => u.as_ref(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn reporter_prefilled_with_current_user() {
+        let mut form = user_form(Some(me()));
+        apply_reporter_prefill(&mut form);
+        assert_eq!(
+            reporter_of(&form).and_then(|u| u.account_id.clone()),
+            Some("acct-1".into())
+        );
+        // Only the reporter: other user fields stay for Jira to default.
+        let assignee = form.fields.iter().find(|f| f.field_id == "assignee");
+        assert!(matches!(
+            assignee.map(|f| &f.value),
+            Some(FieldValue::User(None))
+        ));
+    }
+
+    #[test]
+    fn prefilled_reporter_is_submitted_as_account_id() {
+        let mut form = user_form(Some(me()));
+        apply_reporter_prefill(&mut form);
+        let payload = build_create_payload(&form).expect("valid");
+        assert_eq!(
+            payload["fields"]["reporter"],
+            json!({ "accountId": "acct-1" })
+        );
+        // Unset user fields are omitted so Jira applies its own default.
+        assert!(payload["fields"].get("assignee").is_none());
+    }
+
+    #[test]
+    fn server_user_without_account_id_submits_name() {
+        let mut form = user_form(Some(UserField {
+            name: Some("vpetrov".into()),
+            display_name: Some("Vlad Petrov".into()),
+            account_id: None,
+        }));
+        apply_reporter_prefill(&mut form);
+        let payload = build_create_payload(&form).expect("valid");
+        assert_eq!(payload["fields"]["reporter"], json!({ "name": "vpetrov" }));
+    }
+
+    #[test]
+    fn prefill_waits_for_the_current_user_and_runs_once() {
+        // Fields arrive before /myself does: nothing to fill in yet.
+        let mut form = user_form(None);
+        apply_reporter_prefill(&mut form);
+        assert!(reporter_of(&form).is_none());
+        assert_eq!(
+            form.prefill,
+            Prefill::Pending,
+            "must retry once the user is known"
+        );
+
+        // The user lands and the reporter fills in.
+        form.current_user = Some(me());
+        apply_reporter_prefill(&mut form);
+        assert!(reporter_of(&form).is_some());
+
+        // A reporter the user cleared afterwards stays cleared.
+        if let Some(field) = form.fields.iter_mut().find(|f| f.field_id == "reporter") {
+            field.value = FieldValue::User(None);
+        }
+        apply_reporter_prefill(&mut form);
+        assert!(reporter_of(&form).is_none());
+    }
+
+    #[test]
+    fn prefill_does_not_run_before_fields_load() {
+        let mut form = user_form(Some(me()));
+        form.fields_state = CacheState::Loading;
+        apply_reporter_prefill(&mut form);
+        assert!(reporter_of(&form).is_none());
+        assert_eq!(form.prefill, Prefill::Pending);
+    }
+
+    #[test]
+    fn prefilled_reporter_alone_is_not_dirty() {
+        let mut form = user_form(Some(me()));
+        apply_reporter_prefill(&mut form);
+        assert!(
+            !form_is_dirty(&form),
+            "an untouched form must close without the discard prompt"
+        );
+    }
+
+    fn user(id: &str, display: &str) -> UserField {
+        UserField {
+            name: None,
+            display_name: Some(display.into()),
+            account_id: Some(id.into()),
+        }
+    }
+
+    /// Feed one key to the open user picker, the way `handle_picker_input`
+    /// does: the picker is taken, then handed to the handler.
+    fn press(form: &mut CreateForm, code: KeyCode) {
+        let picker = form.picker.take().expect("picker open");
+        handle_user_picker_key(form, code, picker);
+    }
+
+    fn row_labels(rows: &[UserRow]) -> Vec<String> {
+        rows.iter().map(user_row_label).collect()
+    }
+
+    #[test]
+    fn picker_leads_with_unset_then_pins_me() {
+        let results = vec![user("acct-2", "Ada"), me(), user("acct-3", "Grace")];
+        let rows = user_picker_rows(Some(&me()), "", &results);
+        assert_eq!(
+            row_labels(&rows),
+            vec![
+                "—  (leave to Jira)",
+                "Vlad Petrov  (me)",
+                "Ada",
+                "Grace" // the pinned user is not repeated among the results
+            ]
+        );
+    }
+
+    #[test]
+    fn picker_drops_the_pin_once_a_query_narrows_the_list() {
+        // With a query the server decides who matches — including whether the
+        // current user does, so pinning them would be a lie.
+        let rows = user_picker_rows(Some(&me()), "ada", &[user("acct-2", "Ada")]);
+        assert_eq!(row_labels(&rows), vec!["—  (leave to Jira)", "Ada"]);
+    }
+
+    #[test]
+    fn picker_offers_unset_even_before_results_arrive() {
+        let rows = user_picker_rows(None, "", &[]);
+        assert_eq!(row_labels(&rows), vec!["—  (leave to Jira)"]);
+        assert!(user_row_value(&rows[0]).is_none());
+    }
+
+    /// Server/DC users carry no account id, so identity falls back to username.
+    #[test]
+    fn picker_dedupes_server_users_by_name() {
+        let named = |n: &str| UserField {
+            name: Some(n.into()),
+            display_name: Some(n.into()),
+            account_id: None,
+        };
+        let rows = user_picker_rows(Some(&named("vpetrov")), "", &[named("vpetrov")]);
+        assert_eq!(row_labels(&rows), vec!["—  (leave to Jira)", "vpetrov  (me)"]);
+    }
+
+    /// The picker's cursor indexes the rows, so the row list and the value it
+    /// resolves to must stay in step.
+    #[test]
+    fn picking_a_row_yields_that_user() {
+        let rows = user_picker_rows(Some(&me()), "", &[user("acct-2", "Ada")]);
+        assert!(user_row_value(&rows[0]).is_none());
+        assert_eq!(
+            user_row_value(&rows[1]).and_then(|u| u.account_id.clone()),
+            Some("acct-1".into())
+        );
+        assert_eq!(
+            user_row_value(&rows[2]).and_then(|u| u.account_id.clone()),
+            Some("acct-2".into())
+        );
+    }
+
+    #[test]
+    fn typing_in_the_picker_restarts_the_search_under_a_new_token() {
+        let mut form = user_form(Some(me()));
+        let idx = form
+            .fields
+            .iter()
+            .position(|f| f.field_id == "assignee")
+            .expect("assignee field");
+        open_user_picker(&mut form, idx);
+        let first = form.user_search.as_ref().expect("search started").token;
+
+        // Results for the empty query land, then the user starts typing.
+        if let Some(search) = form.user_search.as_mut() {
+            search.spawned = true;
+            search.pending = false;
+            search.results = CacheState::Loaded(vec![user("acct-2", "Ada")]);
+        }
+        if let Some(CreatePicker::User { searching, .. }) = form.picker.as_mut() {
+            *searching = true;
+        }
+        press(&mut form, KeyCode::Char('a'));
+
+        let search = form.user_search.as_ref().expect("search still open");
+        assert_eq!(search.query, "a");
+        assert!(search.token > first, "stale responses must be droppable");
+        assert!(!search.spawned, "the new query still has to be dispatched");
+        assert!(
+            search.results.loaded().is_some(),
+            "previous matches stay on screen while the next ones load"
+        );
+    }
+
+    #[test]
+    fn choosing_a_user_sets_the_field_and_closes_the_picker() {
+        let mut form = user_form(Some(me()));
+        let idx = form
+            .fields
+            .iter()
+            .position(|f| f.field_id == "assignee")
+            .expect("assignee field");
+        open_user_picker(&mut form, idx);
+        if let Some(search) = form.user_search.as_mut() {
+            search.results = CacheState::Loaded(vec![user("acct-2", "Ada")]);
+        }
+
+        // Rows are [unset, me, Ada]; move to Ada and take her.
+        for _ in 0..2 {
+            press(&mut form, KeyCode::Char('j'));
+        }
+        press(&mut form, KeyCode::Enter);
+
+        assert!(form.picker.is_none(), "choosing closes the picker");
+        assert!(form.user_search.is_none(), "and drops the search state");
+        let payload = build_create_payload(&form).expect("valid");
+        assert_eq!(
+            payload["fields"]["assignee"],
+            json!({ "accountId": "acct-2" })
+        );
+    }
+
+    #[test]
+    fn choosing_unset_clears_a_prefilled_reporter() {
+        let mut form = user_form(Some(me()));
+        apply_reporter_prefill(&mut form);
+        let idx = form
+            .fields
+            .iter()
+            .position(|f| f.field_id == "reporter")
+            .expect("reporter field");
+        open_user_picker(&mut form, idx);
+
+        // Cursor starts on the unset row.
+        press(&mut form, KeyCode::Enter);
+        assert!(reporter_of(&form).is_none());
+        let payload = build_create_payload(&form).expect("valid");
+        assert!(payload["fields"].get("reporter").is_none());
+    }
+
+    #[test]
+    fn leaving_the_picker_keeps_the_field_as_it_was() {
+        let mut form = user_form(Some(me()));
+        apply_reporter_prefill(&mut form);
+        let idx = form
+            .fields
+            .iter()
+            .position(|f| f.field_id == "reporter")
+            .expect("reporter field");
+        open_user_picker(&mut form, idx);
+        press(&mut form, KeyCode::Char('q'));
+
+        assert!(form.picker.is_none());
+        assert_eq!(
+            reporter_of(&form).and_then(|u| u.account_id.clone()),
+            Some("acct-1".into())
+        );
+    }
+
+    #[test]
+    fn required_user_field_left_empty_errors() {
+        let mut form = user_form(None);
+        form.fields[0].required = true;
         assert!(build_create_payload(&form).is_err());
     }
 

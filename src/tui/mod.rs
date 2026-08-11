@@ -142,6 +142,7 @@ async fn run_inner(
                 app.action_state,
                 crate::tui::app::ActionState::Searching { .. }
             )
+            || user_search_waiting(&app)
         {
             if tick_handle
                 .as_ref()
@@ -237,7 +238,7 @@ fn spawn_initial_tasks(
     let user_client = active_client.clone();
     let user_tx = tx.clone();
     tokio::spawn(async move {
-        if let Ok(user) = user_client.current_user().await {
+        if let Ok(user) = user_client.myself().await {
             let _ = user_tx.send(AppEvent::CurrentUserResolved(user));
         }
     });
@@ -318,6 +319,14 @@ fn hydrate_from_cache(app: &mut AppState, source_ids: &[String]) {
     if hydrated {
         app.rebuild_issues();
     }
+}
+
+/// Whether the create form's user chooser has a query waiting out its
+/// debounce. Nothing else would wake the loop to dispatch it: the last
+/// keystroke has already been handled.
+fn user_search_waiting(app: &AppState) -> bool {
+    matches!(app.action_state, ActionState::CreatingIssue(ref form)
+        if form.user_search.as_ref().is_some_and(|s| !s.spawned))
 }
 
 fn spawn_tick_task(tx: UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<()> {
@@ -783,12 +792,40 @@ fn dispatch_create_metadata(
             form.needs_projects_fetch = false;
             want_projects = true;
         }
+        dispatch_user_search(form, client, tx);
     }
     if want_projects && app.project_cache.is_idle() {
         app.project_cache = crate::tui::app::CacheState::Loading;
         let team_idx = app.active_team_idx;
         spawn_projects_fetch(client.clone(), team_idx, tx.clone());
     }
+}
+
+/// Send the create form's user-picker query once it has stopped changing, so
+/// a name typed at speed costs one request instead of one per keystroke.
+fn dispatch_user_search(
+    form: &mut crate::tui::overlays::create_issue::CreateForm,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let project = form.project.key.clone();
+    let Some(search) = form.user_search.as_mut() else {
+        return;
+    };
+    let still_typing = search
+        .changed_at
+        .is_some_and(|t| t.elapsed().as_millis() < USER_SEARCH_DEBOUNCE_MS);
+    if search.spawned || still_typing {
+        return;
+    }
+    search.spawned = true;
+    let (query, token) = (search.query.clone(), search.token);
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = client.search_assignable_users(&project, &query).await;
+        let _ = tx.send(AppEvent::CreateUsersLoaded { token, result });
+    });
 }
 
 fn spawn_create_issuetypes(
@@ -834,6 +871,9 @@ fn spawn_create_issue(
 }
 
 const SEARCH_DEBOUNCE_MS: u128 = 250;
+
+/// Same idea for the create form's assignee/reporter chooser.
+const USER_SEARCH_DEBOUNCE_MS: u128 = 250;
 
 /// How long a backlog rank move sits before dispatching to Jira, so rapid
 /// repeated moves of one issue collapse into a single API call.
@@ -997,7 +1037,8 @@ fn dispatch_pending_assign(
     };
     let username = app
         .current_user
-        .clone()
+        .as_ref()
+        .and_then(|u| u.account_id.clone().or_else(|| u.name.clone()))
         .unwrap_or_else(|| "currentUser()".into());
     spawn_assign(issue_key, username, client.clone(), tx.clone());
 }

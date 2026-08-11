@@ -517,7 +517,10 @@ pub struct AppState {
     pub flags: AppFlags,
     /// Spinner frame counter (incremented on each Tick).
     pub tick_count: u64,
-    pub current_user: Option<String>,
+    /// The authenticated Jira user, resolved once at startup. Used to address
+    /// them in payloads (assign-to-me, the create form's `reporter` prefill)
+    /// and to show them in the UI.
+    pub current_user: Option<crate::jira::types::UserField>,
     /// Scroll offset for the detail panel (rows).
     pub detail_scroll: usize,
     /// Which panel currently has keyboard focus.
@@ -1211,23 +1214,7 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
             app.tick_count = app.tick_count.wrapping_add(1);
         }
 
-        AppEvent::SourceLoaded(source_id, items) => {
-            // A fetch spawned before a duty toggle (or team switch) changed
-            // the source set may still deliver: ids outside the current set
-            // would render as phantom list rows, so drop them.
-            if source_config_for(app.team_config(), &source_id).is_some() {
-                app.sources.insert(source_id, SourceState::Loaded(items));
-                app.rebuild_issues();
-                // Auto-update view mode for newly selected item
-                if let Some(item) = app.selected_item() {
-                    let item = item.clone();
-                    let mode = auto_view_mode(&item, app.team_config());
-                    if app.view_mode == ViewMode::Default {
-                        app.view_mode = mode;
-                    }
-                }
-            }
-        }
+        AppEvent::SourceLoaded(source_id, items) => apply_source_loaded(app, source_id, items),
 
         AppEvent::StandupLoaded(source_id, data) => apply_standup_loaded(app, source_id, *data),
 
@@ -1261,7 +1248,7 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
         }
 
         AppEvent::CurrentUserResolved(user) => {
-            app.current_user = Some(user);
+            apply_current_user_resolved(app, user);
         }
 
         AppEvent::ActionDone(result) => {
@@ -1332,7 +1319,40 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
         AppEvent::CreateFieldsLoaded { token, result } => {
             apply_create_fields_loaded(app, token, result);
         }
+
+        AppEvent::CreateUsersLoaded { token, result } => {
+            apply_create_users_loaded(app, token, result);
+        }
     }
+}
+
+fn apply_source_loaded(app: &mut AppState, source_id: String, items: Vec<WorkItem>) {
+    // A fetch spawned before a duty toggle (or team switch) changed the source
+    // set may still deliver: ids outside the current set would render as
+    // phantom list rows, so drop them.
+    if source_config_for(app.team_config(), &source_id).is_none() {
+        return;
+    }
+    app.sources.insert(source_id, SourceState::Loaded(items));
+    app.rebuild_issues();
+    // Auto-update view mode for newly selected item
+    if let Some(item) = app.selected_item() {
+        let item = item.clone();
+        let mode = auto_view_mode(&item, app.team_config());
+        if app.view_mode == ViewMode::Default {
+            app.view_mode = mode;
+        }
+    }
+}
+
+fn apply_current_user_resolved(app: &mut AppState, user: crate::jira::types::UserField) {
+    // A create form opened before this landed had no one to prefill its
+    // reporter with; do it now.
+    if let ActionState::CreatingIssue(ref mut form) = app.action_state {
+        form.current_user = Some(user.clone());
+        crate::tui::overlays::create_issue::apply_reporter_prefill(form);
+    }
+    app.current_user = Some(user);
 }
 
 fn apply_create_issuetypes_loaded(
@@ -1377,6 +1397,7 @@ fn apply_create_fields_loaded(
         Ok(values) => {
             form.fields = crate::tui::overlays::create_issue::parse_create_fields(&values);
             form.fields_state = CacheState::Loaded(());
+            crate::tui::overlays::create_issue::apply_reporter_prefill(form);
             // Clamp focus to the new field/button range.
             let max = 2 + form.fields.len();
             if form.focus > max {
@@ -1387,6 +1408,27 @@ fn apply_create_fields_loaded(
             form.fields_state = CacheState::Failed(e.to_string());
         }
     }
+}
+
+fn apply_create_users_loaded(
+    app: &mut AppState,
+    token: u64,
+    result: Result<Vec<crate::jira::types::UserField>, anyhow::Error>,
+) {
+    let ActionState::CreatingIssue(ref mut form) = app.action_state else {
+        return;
+    };
+    let Some(search) = form.user_search.as_mut() else {
+        return;
+    };
+    if token != search.token {
+        return; // the query moved on while this was in flight
+    }
+    search.pending = false;
+    search.results = match result {
+        Ok(users) => CacheState::Loaded(users),
+        Err(e) => CacheState::Failed(e.to_string()),
+    };
 }
 
 fn apply_team_statuses_loaded(
@@ -2090,14 +2132,10 @@ fn apply_field_updated(
 
 fn apply_assigned_to_me(app: &mut AppState, issue_key: &str) {
     // Mark assignee as current user in the list (best-effort display update)
-    if let Some(ref me) = app.current_user.clone()
+    if let Some(me) = app.current_user.clone()
         && let Some(issue) = app.jira_issue_mut(issue_key)
     {
-        issue.fields.assignee = Some(crate::jira::types::UserField {
-            name: None,
-            display_name: Some(me.clone()),
-            account_id: Some(me.clone()),
-        });
+        issue.fields.assignee = Some(me);
     }
 }
 
@@ -3596,7 +3634,9 @@ fn key_open_create(app: &mut AppState) {
         };
         return;
     };
-    app.action_state = ActionState::CreatingIssue(CreateForm::open(project, projects));
+    let mut form = CreateForm::open(project, projects);
+    form.current_user.clone_from(&app.current_user);
+    app.action_state = ActionState::CreatingIssue(form);
 }
 
 fn key_open_search(app: &mut AppState) {

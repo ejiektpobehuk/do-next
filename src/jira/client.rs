@@ -787,13 +787,80 @@ impl JiraClient {
 
     /// Get the currently authenticated user's username/name.
     pub async fn current_user(&self) -> Result<String> {
+        let me = self.myself().await?;
+        me.account_id
+            .or(me.name)
+            .ok_or_else(|| anyhow::anyhow!("Could not determine current user"))
+    }
+
+    /// Users who can be assigned issues in `project`, optionally narrowed by
+    /// `query` (matched against display name and email).
+    ///
+    /// Assignable-user search backs every user field in the create form, not
+    /// just the assignee: it is project-scoped, so it returns the handful of
+    /// people who work here rather than the whole directory, it accepts an
+    /// empty query, and it needs only Browse Projects — where `/user/search`
+    /// needs the global "Browse users" permission that many sites withhold.
+    /// The trade-off is that someone unassignable can't be picked as reporter.
+    ///
+    /// App and deactivated accounts are dropped: they are noise in a picker.
+    pub async fn search_assignable_users(
+        &self,
+        project: &str,
+        query: &str,
+    ) -> Result<Vec<crate::jira::types::UserField>> {
         #[derive(serde::Deserialize)]
-        struct MyselfResponse {
+        struct SearchedUser {
             name: Option<String>,
+            #[serde(rename = "displayName")]
+            display_name: Option<String>,
             #[serde(rename = "accountId")]
             account_id: Option<String>,
+            active: Option<bool>,
+            #[serde(rename = "accountType")]
+            account_type: Option<String>,
         }
 
+        let url = format!("{}/rest/api/3/user/assignable/search", self.base_url);
+        self.maybe_refresh().await?;
+        let resp = self
+            .apply_auth(self.client.get(&url))
+            .await
+            .query(&[
+                ("project", project),
+                ("query", query),
+                ("maxResults", "50"),
+            ])
+            .send()
+            .await
+            .context("Failed to search users")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("User search failed {status}: {body}");
+        }
+
+        let users: Vec<SearchedUser> = resp
+            .json()
+            .await
+            .context("Failed to parse user search response")?;
+        Ok(users
+            .into_iter()
+            .filter(|u| {
+                u.active != Some(false) && u.account_type.as_deref().unwrap_or("atlassian") != "app"
+            })
+            .map(|u| crate::jira::types::UserField {
+                name: u.name,
+                display_name: u.display_name,
+                account_id: u.account_id,
+            })
+            .collect())
+    }
+
+    /// The authenticated user's full identity: account id for payloads,
+    /// display name for the UI.
+    pub async fn myself(&self) -> Result<crate::jira::types::UserField> {
         let url = format!("{}/rest/api/3/myself", self.base_url);
         self.maybe_refresh().await?;
         let resp = self
@@ -809,13 +876,9 @@ impl JiraClient {
             anyhow::bail!("Fetch current user failed {status}: {body}");
         }
 
-        let me: MyselfResponse = resp
-            .json()
+        resp.json()
             .await
-            .context("Failed to parse myself response")?;
-        me.account_id
-            .or(me.name)
-            .ok_or_else(|| anyhow::anyhow!("Could not determine current user"))
+            .context("Failed to parse myself response")
     }
 
     /// Does `issuekey IN updatedBy(...)` work with this user literal?

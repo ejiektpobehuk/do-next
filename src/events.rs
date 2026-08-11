@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::items::WorkItem;
 use crate::jira::types::{
     Attachment, Comment, FieldOption, FieldSchema, Issue, IssueTypeField, ProjectInfo, StatusField,
-    StatusInfo, Transition,
+    StatusInfo, Transition, UserField,
 };
 
 #[derive(Debug)]
@@ -28,8 +28,9 @@ pub enum AppEvent {
     ),
     /// A Jira action (transition, comment, assign, move) completed.
     ActionDone(ActionResult),
-    /// Current user resolved (sent once on startup).
-    CurrentUserResolved(String),
+    /// Current user resolved (sent once on startup). Carries the whole identity:
+    /// the account id addresses them in payloads, the display name shows them.
+    CurrentUserResolved(UserField),
     /// Spinner animation frame — only sent while sources are loading.
     Tick,
     /// Filesystem path completions ready (from debounced async fetch).
@@ -95,6 +96,12 @@ pub enum AppEvent {
     CreateFieldsLoaded {
         token: u64,
         result: Result<Vec<serde_json::Value>, anyhow::Error>,
+    },
+    /// Users matching the create form's assignee/reporter picker query.
+    /// `token` is the search's own counter, bumped on every query change.
+    CreateUsersLoaded {
+        token: u64,
+        result: Result<Vec<UserField>, anyhow::Error>,
     },
 }
 
