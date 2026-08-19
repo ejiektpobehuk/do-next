@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::items::WorkItem;
 use crate::jira::types::{
-    Attachment, Comment, EpicRef, FieldOption, FieldSchema, Issue, IssueTypeField, ProjectInfo,
-    StatusField, StatusInfo, Transition, UserField,
+    Attachment, Comment, FieldOption, FieldSchema, Issue, IssueLinkType, IssueRef, IssueTypeField,
+    ProjectInfo, StatusField, StatusInfo, Transition, UserField,
 };
 
 #[derive(Debug)]
@@ -107,7 +107,18 @@ pub enum AppEvent {
     /// same way as `CreateUsersLoaded`'s.
     CreateEpicsLoaded {
         token: u64,
-        result: Result<Vec<EpicRef>, anyhow::Error>,
+        result: Result<Vec<IssueRef>, anyhow::Error>,
+    },
+    /// The site's issue link types, for the create form's relation chooser.
+    /// Untokened: they are site-wide, so no selection can make them stale.
+    CreateLinkTypesLoaded {
+        result: Result<Vec<IssueLinkType>, anyhow::Error>,
+    },
+    /// Issues matching the create form's linked-issue query. `token` works the
+    /// same way as `CreateUsersLoaded`'s.
+    CreateLinkIssuesLoaded {
+        token: u64,
+        result: Result<Vec<IssueRef>, anyhow::Error>,
     },
 }
 

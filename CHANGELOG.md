@@ -18,6 +18,7 @@ All notable changes to `do-next` are documented here.
   with approval and CI state, sorted, badged, cached and searched like every
   other source
 - `$EDITOR` support for text fields in the new issue form.
+- Linked issues support for the new issue form
 
 ### Fixes
 

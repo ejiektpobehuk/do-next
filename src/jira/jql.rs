@@ -40,6 +40,33 @@ pub fn epic_search_jql(project: &str, query: &str) -> String {
     jql
 }
 
+/// JQL for the create form's linked-issue picker, most-recently-touched first.
+///
+/// Unlike the epic picker this is not confined to one project: a link commonly
+/// crosses projects, and the issue on the other end is usually one the user can
+/// name. So an empty query lists recent issues in `project` — the useful
+/// default when there is nothing to go on — and a typed query searches the
+/// whole site.
+///
+/// `query` is matched against the summary, and additionally taken as an issue
+/// key when it looks like one, so pasting `OPS-42` finds that issue directly.
+pub fn link_search_jql(project: &str, query: &str) -> String {
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(text) = text_query(query) {
+        clauses.push(format!(r#"summary ~ "{text}*""#));
+    }
+    if looks_like_issue_key(query.trim()) {
+        clauses.push(format!(r#"key = "{}""#, escape_string(query.trim())));
+    }
+    let mut jql = if clauses.is_empty() {
+        format!(r#"project = "{}""#, escape_string(project))
+    } else {
+        format!("({})", clauses.join(" OR "))
+    };
+    jql.push_str(" ORDER BY updated DESC");
+    jql
+}
+
 /// Reduce a picker query to something safe on the right of `~`.
 ///
 /// The value reaches Lucene, not just JQL, so its operators (`*?~^:` and
@@ -129,6 +156,35 @@ mod tests {
             epic_search_jql("PROJ", "  ?? "),
             epic_search_jql("PROJ", "")
         );
+    }
+
+    #[test]
+    fn link_jql_without_a_query_lists_the_project() {
+        assert_eq!(
+            link_search_jql("PROJ", ""),
+            r#"project = "PROJ" ORDER BY updated DESC"#
+        );
+    }
+
+    #[test]
+    fn link_jql_with_a_query_searches_every_project() {
+        let jql = link_search_jql("PROJ", "payment");
+        assert_eq!(
+            jql, r#"(summary ~ "payment*") ORDER BY updated DESC"#,
+            "a typed query must not stay inside the form's project"
+        );
+    }
+
+    #[test]
+    fn link_jql_also_tries_a_pasted_key() {
+        let jql = link_search_jql("PROJ", "OPS-42");
+        assert!(jql.contains(r#"summary ~ "OPS 42*""#), "{jql}");
+        assert!(jql.contains(r#"key = "OPS-42""#), "{jql}");
+    }
+
+    #[test]
+    fn link_jql_falls_back_to_the_project_when_nothing_is_searchable() {
+        assert_eq!(link_search_jql("PROJ", " ?? "), link_search_jql("PROJ", ""));
     }
 
     #[test]

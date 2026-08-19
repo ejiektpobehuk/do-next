@@ -101,15 +101,16 @@ pub struct IssueTypeField {
     pub subtask: bool,
 }
 
-/// An epic as the create form's picker needs it: the key is what goes into the
-/// payload, the summary is what identifies it on screen.
+/// An issue as the create form's pickers need it: the key is what goes into the
+/// payload, the summary is what identifies it on screen. Backs both the epic
+/// chooser and the linked-issue chooser — an epic is just an issue there.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EpicRef {
+pub struct IssueRef {
     pub key: String,
     pub summary: String,
 }
 
-impl EpicRef {
+impl IssueRef {
     /// Key first: it is short, unique, and what the payload carries.
     pub fn display(&self) -> String {
         if self.summary.is_empty() {
@@ -117,6 +118,16 @@ impl EpicRef {
         }
         format!("{}  {}", self.key, self.summary)
     }
+}
+
+/// One of the site's issue link types, as `/issueLinkType` returns it. `inward`
+/// and `outward` are the two human-readable halves of the relation ("is blocked
+/// by" / "blocks"); `name` is what a create payload references.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct IssueLinkType {
+    pub name: String,
+    pub inward: String,
+    pub outward: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

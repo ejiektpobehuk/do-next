@@ -322,13 +322,14 @@ fn hydrate_from_cache(app: &mut AppState, source_ids: &[String]) {
     }
 }
 
-/// Whether one of the create form's server-backed choosers (user, epic) has a
-/// query waiting out its debounce. Nothing else would wake the loop to dispatch
-/// it: the last keystroke has already been handled.
+/// Whether one of the create form's server-backed choosers (user, epic, linked
+/// issue) has a query waiting out its debounce. Nothing else would wake the loop
+/// to dispatch it: the last keystroke has already been handled.
 fn create_search_waiting(app: &AppState) -> bool {
     matches!(app.action_state, ActionState::CreatingIssue(ref form)
         if form.user_search.as_ref().is_some_and(|s| !s.spawned)
-            || form.epic_search.as_ref().is_some_and(|s| !s.spawned))
+            || form.epic_search.as_ref().is_some_and(|s| !s.spawned)
+            || form.link_search.as_ref().is_some_and(|s| !s.spawned))
 }
 
 fn spawn_tick_task(tx: UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<()> {
@@ -840,8 +841,13 @@ fn dispatch_create_metadata(
             form.needs_projects_fetch = false;
             want_projects = true;
         }
+        if form.needs_link_types_fetch {
+            form.needs_link_types_fetch = false;
+            spawn_create_link_types(client.clone(), tx.clone());
+        }
         dispatch_user_search(form, client, tx);
         dispatch_epic_search(form, client, tx);
+        dispatch_link_issue_search(form, client, tx);
     }
     if want_projects && app.project_cache.is_idle() {
         app.project_cache = crate::tui::app::CacheState::Loading;
@@ -900,6 +906,31 @@ fn dispatch_epic_search(
     tokio::spawn(async move {
         let result = client.search_epics(&project, &query).await;
         let _ = tx.send(AppEvent::CreateEpicsLoaded { token, result });
+    });
+}
+
+/// Same debounce for the linked-issue picker's query.
+fn dispatch_link_issue_search(
+    form: &mut crate::tui::overlays::create_issue::CreateForm,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let project = form.project.key.clone();
+    let Some((query, token)) = form.link_search.as_mut().and_then(take_due_query) else {
+        return;
+    };
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = client.search_link_issues(&project, &query).await;
+        let _ = tx.send(AppEvent::CreateLinkIssuesLoaded { token, result });
+    });
+}
+
+fn spawn_create_link_types(client: JiraClient, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = client.issue_link_types().await;
+        let _ = tx.send(AppEvent::CreateLinkTypesLoaded { result });
     });
 }
 

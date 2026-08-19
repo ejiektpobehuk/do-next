@@ -19,7 +19,7 @@ use ratatui::{
 use serde_json::{Value, json};
 
 use crate::jira::types::{
-    EpicRef, FieldSchema, IssueTypeField, ProjectField, ProjectInfo, UserField,
+    FieldSchema, IssueLinkType, IssueRef, IssueTypeField, ProjectField, ProjectInfo, UserField,
 };
 use crate::tui::app::{ActionState, AppState, CacheState, edit_text};
 use crate::tui::overlays::datetime_picker::{
@@ -52,6 +52,10 @@ pub enum WidgetKind {
     /// The issue's epic — the system `parent` link or the legacy Epic Link
     /// custom field. Picked from a project-scoped search, like `User`.
     Epic,
+    /// The `issuelinks` field: any number of (relation, issue) pairs. Unlike
+    /// every other widget its value does not go in `fields` — Jira only accepts
+    /// links on create as `update.issuelinks` add operations.
+    IssueLinks,
     /// A field type the TUI can't edit; read-only, blocks submit if required.
     Unsupported,
 }
@@ -83,8 +87,46 @@ pub enum FieldValue {
     /// `None` means "leave to Jira" — for `reporter` that resolves to the creator.
     User(Option<UserField>),
     /// `None` means the issue is created outside any epic.
-    Epic(Option<EpicRef>),
+    Epic(Option<IssueRef>),
+    /// The links to create alongside the issue, in the order they were added.
+    IssueLinks(Vec<IssueLinkDraft>),
     Unsupported,
+}
+
+/// Which half of a link type's relation the new issue is on. Jira stores a link
+/// as an (inward, outward) pair, so the direction decides which side the picked
+/// issue goes on: "blocks" is the outward half of `Blocks`, "is blocked by" the
+/// inward one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkDirection {
+    Outward,
+    Inward,
+}
+
+/// One pickable relation: a link type seen from one end. Every link type yields
+/// two of these, since "blocks" and "is blocked by" are different choices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkTypeChoice {
+    /// The link type's name, which is what the payload references.
+    pub name: String,
+    /// How this end reads ("blocks", "is blocked by") — the picker's label.
+    pub label: String,
+    pub direction: LinkDirection,
+}
+
+/// A link the form will create once the issue exists: a relation plus the issue
+/// on the other end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueLinkDraft {
+    pub link_type: LinkTypeChoice,
+    pub issue: IssueRef,
+}
+
+impl IssueLinkDraft {
+    /// Relation first, then the issue it points at: "blocks  OPS-42  Fix login".
+    fn display(&self) -> String {
+        format!("{}  {}", self.link_type.label, self.issue.display())
+    }
 }
 
 /// One renderable field in the create form.
@@ -141,6 +183,32 @@ pub enum CreatePicker {
         cursor: usize,
         searching: bool,
     },
+    /// The links added so far, where one is removed and another is started.
+    /// Adding walks from here to `LinkType` and then to `LinkIssue`; each step
+    /// back returns to the previous one, so this is the only picker whose
+    /// successors know where they came from.
+    IssueLinks {
+        field_idx: usize,
+        cursor: usize,
+    },
+    /// Relation chooser, opened either for a link being added — the first of the
+    /// two steps — or to change the relation of one already in the list, which
+    /// is what `editing` holds the index of.
+    LinkType {
+        field_idx: usize,
+        editing: Option<usize>,
+        cursor: usize,
+    },
+    /// Issue chooser for a link being added, once `link_type` is settled.
+    /// Server-backed like `Epic`, with its matches in `CreateForm::link_search`.
+    LinkIssue {
+        field_idx: usize,
+        link_type: LinkTypeChoice,
+        query: String,
+        query_cursor: usize,
+        cursor: usize,
+        searching: bool,
+    },
 }
 
 /// A row of the user picker. The list is more than the search results: it
@@ -161,7 +229,17 @@ pub enum UserRow {
 #[derive(Debug, Clone)]
 pub enum EpicRow {
     Unset,
-    Found(EpicRef),
+    Found(IssueRef),
+}
+
+/// A row of the linked-issues list: the links already added, then the way to add
+/// another. "Add" trails because the links are the content and it is the action
+/// under them — and on an empty list it is the only row either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkRow {
+    /// Index into the field's link vector.
+    Existing(usize),
+    Add,
 }
 
 /// Debounced state of a server-backed picker's search (users, epics). Present
@@ -227,6 +305,10 @@ pub enum FormMode {
 }
 
 /// Full state of the create-issue form.
+// The `needs_*_fetch` flags are four independent one-shot requests to the
+// dispatcher, not a state to model: each is set where the thing is first needed
+// and cleared by whoever sends it.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct CreateForm {
     pub project: ProjectField,
@@ -243,7 +325,12 @@ pub struct CreateForm {
     /// Live state of the assignee/reporter chooser; `None` unless one is open.
     pub user_search: Option<PickerSearch<UserField>>,
     /// Live state of the epic chooser; `None` unless it is open.
-    pub epic_search: Option<PickerSearch<EpicRef>>,
+    pub epic_search: Option<PickerSearch<IssueRef>>,
+    /// Live state of the linked-issue chooser; `None` unless it is open.
+    pub link_search: Option<PickerSearch<IssueRef>>,
+    /// The site's link relations, fetched the first time the relation chooser
+    /// opens. Site-wide, so unlike the searches it survives a project change.
+    pub link_types: CacheState<Vec<LinkTypeChoice>>,
     /// Flat focus index: 0=project, 1=issue type, 2..=fields, last=Create button.
     pub focus: usize,
     pub mode: FormMode,
@@ -261,6 +348,7 @@ pub struct CreateForm {
     pub needs_issuetype_fetch: bool,
     pub needs_field_fetch: bool,
     pub needs_projects_fetch: bool,
+    pub needs_link_types_fetch: bool,
     pub error: Option<String>,
 }
 
@@ -278,6 +366,8 @@ impl CreateForm {
             prefill: Prefill::Pending,
             user_search: None,
             epic_search: None,
+            link_search: None,
+            link_types: CacheState::Idle,
             focus: 1, // start on Issue Type (project is pre-filled)
             mode: FormMode::Nav,
             picker: None,
@@ -287,6 +377,7 @@ impl CreateForm {
             needs_issuetype_fetch: true,
             needs_field_fetch: false,
             needs_projects_fetch: false,
+            needs_link_types_fetch: false,
             error: None,
         }
     }
@@ -308,10 +399,12 @@ impl CreateForm {
         self.fields.clear();
         self.fields_state = CacheState::Idle;
         self.prefill = Prefill::Pending;
-        // Assignable users and epics are both project-scoped; the old matches
-        // no longer apply.
+        // Assignable users and epics are both project-scoped, and the link
+        // search falls back to the project when nothing is typed; the old
+        // matches no longer apply. `link_types` is site-wide and stays.
         self.user_search = None;
         self.epic_search = None;
+        self.link_search = None;
         self.focus = 1;
         self.mode = FormMode::Nav;
         self.meta_token += 1;
@@ -413,6 +506,7 @@ pub fn schema_to_widget(schema: &Value, has_options: bool, subtask: bool) -> Wid
         "array" => match items {
             Some("option" | "version" | "component" | "group") => WidgetKind::MultiSelect,
             Some("user") if has_options => WidgetKind::MultiSelect,
+            Some("issuelinks") => WidgetKind::IssueLinks,
             _ => WidgetKind::Unsupported,
         },
         _ => WidgetKind::Unsupported,
@@ -456,7 +550,7 @@ fn user_ref(user: &UserField) -> Option<Value> {
 
 /// How Jira wants an epic referenced. The system `parent` field takes an
 /// issue object; the legacy Epic Link custom field takes the bare key.
-fn epic_ref(field_id: &str, epic: &EpicRef) -> Value {
+fn epic_ref(field_id: &str, epic: &IssueRef) -> Value {
     if field_id == "parent" {
         json!({ "key": epic.key })
     } else {
@@ -479,6 +573,7 @@ fn initial_value(widget: WidgetKind) -> FieldValue {
         WidgetKind::MultiSelect => FieldValue::MultiOption(HashSet::new()),
         WidgetKind::User => FieldValue::User(None),
         WidgetKind::Epic => FieldValue::Epic(None),
+        WidgetKind::IssueLinks => FieldValue::IssueLinks(Vec::new()),
         WidgetKind::Unsupported => FieldValue::Unsupported,
     }
 }
@@ -609,7 +704,7 @@ const fn user_row_value(row: &UserRow) -> Option<&UserField> {
 /// Rows of the epic picker: the unset row, then whatever the search returned.
 /// The server already ordered the matches, so they are passed through as they
 /// came.
-pub fn epic_picker_rows(results: &[EpicRef]) -> Vec<EpicRow> {
+pub fn epic_picker_rows(results: &[IssueRef]) -> Vec<EpicRow> {
     let mut rows = vec![EpicRow::Unset];
     rows.extend(results.iter().cloned().map(EpicRow::Found));
     rows
@@ -622,14 +717,75 @@ fn epic_row_label(row: &EpicRow) -> String {
     }
 }
 
-const fn epic_row_value(row: &EpicRow) -> Option<&EpicRef> {
+const fn epic_row_value(row: &EpicRow) -> Option<&IssueRef> {
     match row {
         EpicRow::Unset => None,
         EpicRow::Found(e) => Some(e),
     }
 }
 
+/// Both ends of every link type, as the relation chooser lists them: for
+/// `Blocks` that is "blocks" (outward) and "is blocked by" (inward). A type
+/// whose two halves read the same ("relates to") is listed once — picking
+/// either direction would create the same link.
+pub fn link_type_choices(types: &[IssueLinkType]) -> Vec<LinkTypeChoice> {
+    let mut out = Vec::new();
+    for ty in types {
+        out.push(LinkTypeChoice {
+            name: ty.name.clone(),
+            label: ty.outward.clone(),
+            direction: LinkDirection::Outward,
+        });
+        if ty.inward != ty.outward {
+            out.push(LinkTypeChoice {
+                name: ty.name.clone(),
+                label: ty.inward.clone(),
+                direction: LinkDirection::Inward,
+            });
+        }
+    }
+    out
+}
+
+/// Rows of the linked-issues list for `count` links already added.
+pub fn link_rows(count: usize) -> Vec<LinkRow> {
+    let mut rows: Vec<LinkRow> = (0..count).map(LinkRow::Existing).collect();
+    rows.push(LinkRow::Add);
+    rows
+}
+
+/// The links held by field `field_idx`, or an empty slice if it holds anything
+/// else.
+fn field_links(form: &CreateForm, field_idx: usize) -> &[IssueLinkDraft] {
+    match form.fields.get(field_idx).map(|f| &f.value) {
+        Some(FieldValue::IssueLinks(links)) => links.as_slice(),
+        _ => &[],
+    }
+}
+
+/// The `update.issuelinks` operation for one drafted link.
+///
+/// Jira stores a link as an (inward, outward) pair, and an issue reads its own
+/// links from the far end: the side named here is the *other* issue, so the
+/// relation the user picked applies from the new issue outwards. Picking
+/// "blocks" therefore puts the target on `outwardIssue`, leaving the new issue
+/// as the inward one — which is exactly how Jira renders "NEW blocks OPS-42".
+fn issue_link_op(link: &IssueLinkDraft) -> Value {
+    let side = match link.link_type.direction {
+        LinkDirection::Outward => "outwardIssue",
+        LinkDirection::Inward => "inwardIssue",
+    };
+    json!({
+        "add": {
+            "type": { "name": link.link_type.name },
+            side: { "key": link.issue.key },
+        }
+    })
+}
+
 /// The JSON value to emit for a field, or `None` if it should be omitted.
+/// `IssueLinks` always falls through to `None` here: links never travel in
+/// `fields` — [`build_create_payload`] puts them in `update` instead.
 fn field_payload_value(field: &FormField) -> Option<Value> {
     match (&field.widget, &field.value) {
         (WidgetKind::Text, FieldValue::Text { input, .. }) if !input.trim().is_empty() => {
@@ -691,6 +847,9 @@ pub fn build_create_payload(form: &CreateForm) -> Result<Value, String> {
     let mut fields = serde_json::Map::new();
     fields.insert("project".into(), json!({ "key": form.project.key }));
     fields.insert("issuetype".into(), json!({ "id": it.id }));
+    // Links are the one field Jira will not take in `fields` on create; they go
+    // in a parallel `update` block as add operations.
+    let mut update = serde_json::Map::new();
 
     for field in &form.fields {
         if field.required && field.widget == WidgetKind::Unsupported {
@@ -698,6 +857,20 @@ pub fn build_create_payload(form: &CreateForm) -> Result<Value, String> {
                 "Required field “{}” can't be set here — create in browser",
                 field.label
             ));
+        }
+        if field.widget == WidgetKind::IssueLinks {
+            let ops: Vec<Value> = match &field.value {
+                FieldValue::IssueLinks(links) => links.iter().map(issue_link_op).collect(),
+                _ => Vec::new(),
+            };
+            if ops.is_empty() {
+                if field.required {
+                    return Err(format!("Required field “{}” is empty", field.label));
+                }
+            } else {
+                update.insert(field.field_id.clone(), Value::Array(ops));
+            }
+            continue;
         }
         match field_payload_value(field) {
             Some(v) => {
@@ -711,7 +884,12 @@ pub fn build_create_payload(form: &CreateForm) -> Result<Value, String> {
         }
     }
 
-    Ok(json!({ "fields": Value::Object(fields) }))
+    let mut payload = serde_json::Map::new();
+    payload.insert("fields".into(), Value::Object(fields));
+    if !update.is_empty() {
+        payload.insert("update".into(), Value::Object(update));
+    }
+    Ok(Value::Object(payload))
 }
 
 // ── Input handling ──────────────────────────────────────────────────────────────
@@ -822,6 +1000,7 @@ fn activate_field(form: &mut CreateForm) {
         WidgetKind::Date | WidgetKind::DateTime => open_date_picker(form, idx),
         WidgetKind::User => open_user_picker(form, idx),
         WidgetKind::Epic => open_epic_picker(form, idx),
+        WidgetKind::IssueLinks => open_links_picker(form, idx, 0),
         WidgetKind::Unsupported => {}
     }
 }
@@ -952,6 +1131,7 @@ fn form_is_dirty(form: &CreateForm) -> bool {
         // An epic, unlike the prefilled reporter, is always something the user
         // went and picked.
         FieldValue::Epic(epic) => epic.is_some(),
+        FieldValue::IssueLinks(links) => !links.is_empty(),
         // The prefilled reporter is not something the user typed, so it must
         // not trigger the discard prompt on an otherwise untouched form.
         FieldValue::User(_) | FieldValue::Unsupported => false,
@@ -1039,6 +1219,56 @@ fn open_epic_picker(form: &mut CreateForm, field_idx: usize) {
     });
 }
 
+/// Open the list of links added so far, with `cursor` on `row`. Nothing is
+/// fetched yet: the relation chooser is one step further in, and an empty list
+/// is a valid thing to see.
+fn open_links_picker(form: &mut CreateForm, field_idx: usize, cursor: usize) {
+    form.link_search = None;
+    form.picker = Some(CreatePicker::IssueLinks { field_idx, cursor });
+}
+
+/// Open the relation chooser, asking for the site's link types the first time.
+/// A failed fetch is retried on the next open — the cache goes back to `Idle`
+/// so the picker is not stuck on an error it cannot clear.
+///
+/// `editing` is the link whose relation is being changed, or `None` when this is
+/// the first step of adding one. Editing starts on the relation the link already
+/// has, so a wrong pick is one keystroke from being right.
+fn open_link_type_picker(form: &mut CreateForm, field_idx: usize, editing: Option<usize>) {
+    if matches!(form.link_types, CacheState::Idle | CacheState::Failed(_)) {
+        form.link_types = CacheState::Loading;
+        form.needs_link_types_fetch = true;
+    }
+    let cursor = editing
+        .and_then(|i| field_links(form, field_idx).get(i))
+        .and_then(|link| {
+            picker_link_type_rows(form)
+                .iter()
+                .position(|c| *c == link.link_type)
+        })
+        .unwrap_or(0);
+    form.picker = Some(CreatePicker::LinkType {
+        field_idx,
+        editing,
+        cursor,
+    });
+}
+
+/// Open the issue chooser for a relation just picked, on an empty query — the
+/// dispatcher turns that into a request for the project's recent issues.
+fn open_link_issue_picker(form: &mut CreateForm, field_idx: usize, link_type: LinkTypeChoice) {
+    let token = form.link_search.as_ref().map_or(1, |s| s.token + 1);
+    form.link_search = Some(PickerSearch::new(token));
+    form.picker = Some(CreatePicker::LinkIssue {
+        field_idx,
+        link_type,
+        query: String::new(),
+        query_cursor: 0,
+        cursor: 0,
+        searching: false,
+    });
+}
+
 fn open_select_picker(form: &mut CreateForm, field_idx: usize) {
     let cursor = match form.fields.get(field_idx).map(|f| &f.value) {
         Some(FieldValue::SingleOption(Some(i))) => *i,
@@ -1113,12 +1343,217 @@ fn picker_user_rows(form: &CreateForm, query: &str) -> Vec<UserRow> {
 
 /// Rows currently shown by the open epic picker.
 fn picker_epic_rows(form: &CreateForm) -> Vec<EpicRow> {
-    let results: &[EpicRef] = form
+    let results: &[IssueRef] = form
         .epic_search
         .as_ref()
         .and_then(|s| s.results.loaded())
         .map_or(&[], Vec::as_slice);
     epic_picker_rows(results)
+}
+
+/// Rows currently shown by the open linked-issue chooser.
+fn picker_link_issue_rows(form: &CreateForm) -> &[IssueRef] {
+    form.link_search
+        .as_ref()
+        .and_then(|s| s.results.loaded())
+        .map_or(&[], Vec::as_slice)
+}
+
+/// Relations currently shown by the open relation chooser.
+fn picker_link_type_rows(form: &CreateForm) -> &[LinkTypeChoice] {
+    form.link_types.loaded().map_or(&[], Vec::as_slice)
+}
+
+/// Key routing for the linked-issues list: edit a link's relation, remove one,
+/// start another, or leave. Takes the picker's fields rather than the picker:
+/// unlike the searching ones it owns nothing, and leaving without re-setting
+/// `form.picker` closes it.
+fn handle_links_picker_key(
+    form: &mut CreateForm,
+    code: KeyCode,
+    field_idx: usize,
+    mut cursor: usize,
+) {
+    let rows = link_rows(field_links(form, field_idx).len());
+
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => return, // picker already taken → closed
+        KeyCode::Down | KeyCode::Char('j') => {
+            cursor = (cursor + 1).min(rows.len().saturating_sub(1));
+        }
+        KeyCode::Up | KeyCode::Char('k') => cursor = cursor.saturating_sub(1),
+        // Enter follows the highlighted row: on a link it reopens the relation
+        // chooser for it, on the trailing row it starts a new one. `n` starts a
+        // new one from anywhere, so a full list needs no walk to the bottom.
+        KeyCode::Enter => {
+            let editing = match rows.get(cursor) {
+                Some(LinkRow::Existing(i)) => Some(*i),
+                _ => None,
+            };
+            open_link_type_picker(form, field_idx, editing);
+            return;
+        }
+        KeyCode::Char('n') => {
+            open_link_type_picker(form, field_idx, None);
+            return;
+        }
+        KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+            if let Some(LinkRow::Existing(i)) = rows.get(cursor).cloned()
+                && let Some(FieldValue::IssueLinks(links)) =
+                    form.fields.get_mut(field_idx).map(|f| &mut f.value)
+            {
+                links.remove(i);
+                // The list just got shorter; keep the cursor on a row.
+                cursor = cursor.min(links.len());
+            }
+        }
+        _ => {}
+    }
+
+    form.picker = Some(CreatePicker::IssueLinks { field_idx, cursor });
+}
+
+/// Key routing for the relation chooser. Its list is site-wide metadata, not a
+/// search, so it navigates like the issue-type picker. Leaving goes back to the
+/// list of links rather than to the form: this is the middle of editing one.
+fn handle_link_type_picker_key(
+    form: &mut CreateForm,
+    code: KeyCode,
+    field_idx: usize,
+    editing: Option<usize>,
+    mut cursor: usize,
+) {
+    let count = picker_link_type_rows(form).len();
+    // Where the walk started: the link being edited, or the row that adds one.
+    let came_from = editing.unwrap_or_else(|| field_links(form, field_idx).len());
+
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            open_links_picker(form, field_idx, came_from);
+            return;
+        }
+        KeyCode::Down | KeyCode::Char('j') => cursor = (cursor + 1).min(count.saturating_sub(1)),
+        KeyCode::Up | KeyCode::Char('k') => cursor = cursor.saturating_sub(1),
+        KeyCode::Enter => {
+            if let Some(choice) = picker_link_type_rows(form).get(cursor).cloned() {
+                match editing {
+                    // Editing changes the relation in place; the issue stays put.
+                    Some(i) => {
+                        if let Some(FieldValue::IssueLinks(links)) =
+                            form.fields.get_mut(field_idx).map(|f| &mut f.value)
+                            && let Some(link) = links.get_mut(i)
+                        {
+                            link.link_type = choice;
+                        }
+                        open_links_picker(form, field_idx, i);
+                    }
+                    None => open_link_issue_picker(form, field_idx, choice),
+                }
+                return;
+            }
+        }
+        _ => {}
+    }
+
+    form.picker = Some(CreatePicker::LinkType {
+        field_idx,
+        editing,
+        cursor,
+    });
+}
+
+/// Key routing for the linked-issue chooser. Searches like the epic chooser;
+/// picking appends the link and returns to the list, where another can be added
+/// straight away. There is no unset row — a link with no issue is not a link,
+/// and `q` backs out to the relation chooser instead.
+fn handle_link_issue_picker_key(form: &mut CreateForm, code: KeyCode, picker: CreatePicker) {
+    let CreatePicker::LinkIssue {
+        field_idx,
+        link_type,
+        mut query,
+        mut query_cursor,
+        mut cursor,
+        mut searching,
+    } = picker
+    else {
+        return;
+    };
+
+    if searching {
+        match code {
+            // Leave search mode but keep the query (and its matches) applied.
+            KeyCode::Esc | KeyCode::Enter => searching = false,
+            _ => {
+                let before = query.clone();
+                edit_text(&mut query, &mut query_cursor, code);
+                if query != before {
+                    cursor = 0;
+                    if let Some(search) = form.link_search.as_mut() {
+                        search.requery(query.clone());
+                    }
+                }
+            }
+        }
+    } else {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                form.link_search = None;
+                // Back to the relation that was picked, not to the top of the
+                // list: backing out is usually "wrong issue", not "wrong verb".
+                let cursor = picker_link_type_rows(form)
+                    .iter()
+                    .position(|c| *c == link_type)
+                    .unwrap_or(0);
+                form.picker = Some(CreatePicker::LinkType {
+                    field_idx,
+                    editing: None,
+                    cursor,
+                });
+                return;
+            }
+            KeyCode::Char('/') => searching = true,
+            KeyCode::Enter => {
+                let chosen = picker_link_issue_rows(form).get(cursor).cloned();
+                if let Some(issue) = chosen {
+                    add_link(form, field_idx, link_type, issue);
+                    return;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let count = picker_link_issue_rows(form).len();
+                cursor = (cursor + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('k') => cursor = cursor.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    form.picker = Some(CreatePicker::LinkIssue {
+        field_idx,
+        link_type,
+        query,
+        query_cursor,
+        cursor,
+        searching,
+    });
+}
+
+/// Append a link and return to the list with the cursor on it. A repeat of one
+/// already added is dropped: Jira would reject the duplicate operation, and the
+/// second row would read identically to the first.
+fn add_link(form: &mut CreateForm, field_idx: usize, link_type: LinkTypeChoice, issue: IssueRef) {
+    let draft = IssueLinkDraft { link_type, issue };
+    let at = if let Some(FieldValue::IssueLinks(links)) =
+        form.fields.get_mut(field_idx).map(|f| &mut f.value)
+    {
+        links.iter().position(|l| *l == draft).unwrap_or_else(|| {
+            links.push(draft);
+            links.len() - 1
+        })
+    } else {
+        0
+    };
+    open_links_picker(form, field_idx, at);
 }
 
 /// Key routing for the epic chooser. Mirrors the user chooser: `/` types a
@@ -1267,6 +1702,16 @@ fn handle_picker_input(app: &mut AppState, code: KeyCode, _modifiers: KeyModifie
         // server, so their keys also drive a search.
         p @ CreatePicker::User { .. } => handle_user_picker_key(form, code, p),
         p @ CreatePicker::Epic { .. } => handle_epic_picker_key(form, code, p),
+        // The three steps of adding a link; each hands back to the previous.
+        CreatePicker::IssueLinks { field_idx, cursor } => {
+            handle_links_picker_key(form, code, field_idx, cursor);
+        }
+        CreatePicker::LinkType {
+            field_idx,
+            editing,
+            cursor,
+        } => handle_link_type_picker_key(form, code, field_idx, editing, cursor),
+        p @ CreatePicker::LinkIssue { .. } => handle_link_issue_picker_key(form, code, p),
         CreatePicker::Project {
             mut query,
             mut query_cursor,
@@ -1910,6 +2355,12 @@ fn field_value_display(field: &FormField) -> String {
             || "(none)  ▾".to_string(),
             |e| format!("{}  ▾", e.display()),
         ),
+        (WidgetKind::IssueLinks, FieldValue::IssueLinks(links)) => match links.len() {
+            0 => "(none)  ▾".to_string(),
+            // One link fits, and reading "blocks OPS-42" beats reading "1 link".
+            1 => format!("{}  ▾", links[0].display()),
+            n => format!("{n} links  ▾"),
+        },
         (WidgetKind::Unsupported, _) => "(set in browser)".to_string(),
         _ => String::new(),
     }
@@ -1986,6 +2437,21 @@ fn render_picker(f: &mut Frame, form: &CreateForm, picker: &CreatePicker, projec
             searching,
             ..
         } => render_epic_picker(f, form, *field_idx, query, *cursor, *searching),
+        CreatePicker::IssueLinks { field_idx, cursor } => {
+            render_links_picker(f, form, *field_idx, *cursor);
+        }
+        CreatePicker::LinkType {
+            field_idx,
+            editing,
+            cursor,
+        } => render_link_type_picker(f, form, *field_idx, *editing, *cursor),
+        CreatePicker::LinkIssue {
+            link_type,
+            query,
+            cursor,
+            searching,
+            ..
+        } => render_link_issue_picker(f, form, link_type, query, *cursor, *searching),
         CreatePicker::MultiSelect { field_idx, cursor } => {
             let (title, items) = field_option_items(form, *field_idx);
             let marks = match form.fields.get(*field_idx).map(|f| &f.value) {
@@ -2141,6 +2607,98 @@ fn render_epic_picker(
     render_list(f, &title, &items, cursor, None, note, hints);
 }
 
+/// The links added so far, with the row that starts another one on top.
+fn render_links_picker(f: &mut Frame, form: &CreateForm, field_idx: usize, cursor: usize) {
+    let label = form
+        .fields
+        .get(field_idx)
+        .map_or("Linked Issues", |f| f.label.as_str());
+    let links = field_links(form, field_idx);
+    let items: Vec<String> = link_rows(links.len())
+        .iter()
+        .map(|row| match row {
+            LinkRow::Existing(i) => links[*i].display(),
+            LinkRow::Add => "+  Add link…".to_string(),
+        })
+        .collect();
+    render_list(
+        f,
+        &format!(" {label} "),
+        &items,
+        cursor,
+        None,
+        None,
+        Some(links_picker_hints_line()),
+    );
+}
+
+/// The relation chooser: both ends of every link type the site defines.
+fn render_link_type_picker(
+    f: &mut Frame,
+    form: &CreateForm,
+    field_idx: usize,
+    editing: Option<usize>,
+    cursor: usize,
+) {
+    let label = form
+        .fields
+        .get(field_idx)
+        .map_or("Linked Issues", |f| f.label.as_str());
+    // Editing names the issue on the other end, so it is clear the pick applies
+    // to that link rather than starting another.
+    let title = editing
+        .and_then(|i| field_links(form, field_idx).get(i))
+        .map_or_else(
+            || format!(" {label} — relation "),
+            |link| format!(" {} — relation ", link.issue.key),
+        );
+
+    // A failed or pending fetch would otherwise show as an empty list with no
+    // explanation of which it was.
+    let items: Vec<String> = match &form.link_types {
+        CacheState::Failed(e) => vec![format!("(link types failed: {e} — q, then retry)")],
+        CacheState::Idle | CacheState::Loading => vec!["(loading link types…)".to_string()],
+        CacheState::Loaded(choices) => choices.iter().map(|c| c.label.clone()).collect(),
+    };
+    render_list(f, &title, &items, cursor, None, None, None);
+}
+
+/// The issue chooser for a link being added. Server-backed like the epic
+/// chooser, and titled with the relation so it is clear what is being linked.
+fn render_link_issue_picker(
+    f: &mut Frame,
+    form: &CreateForm,
+    link_type: &LinkTypeChoice,
+    query: &str,
+    cursor: usize,
+    searching: bool,
+) {
+    let title = if searching {
+        format!(" {} — /{query}\u{258f} ", link_type.label)
+    } else if query.is_empty() {
+        format!(" {} … ", link_type.label)
+    } else {
+        format!(" {} — /{query} ", link_type.label)
+    };
+    let hints = Some(project_picker_hints_line(searching));
+    let search = form.link_search.as_ref();
+
+    if let Some(CacheState::Failed(e)) = search.map(|s| &s.results) {
+        let items = [format!("(issue search failed: {e})")];
+        render_list(f, &title, &items, 0, None, None, hints);
+        return;
+    }
+
+    let items: Vec<String> = picker_link_issue_rows(form)
+        .iter()
+        .map(IssueRef::display)
+        .collect();
+    let note = search
+        .is_some_and(|s| s.pending)
+        .then_some("(searching\u{2026})");
+    render_list(f, &title, &items, cursor, None, note, hints);
+}
+
 fn field_option_items(form: &CreateForm, field_idx: usize) -> (String, Vec<String>) {
     form.fields.get(field_idx).map_or_else(
         || (" Select ".to_string(), Vec::new()),
@@ -2288,6 +2846,25 @@ fn picker_hints_line(multi: bool) -> Line<'static> {
     spans.push(Span::styled("q", Style::default().fg(Color::Magenta)));
     spans.push(Span::raw(" back ├──"));
     Line::from(spans).alignment(Alignment::Right)
+}
+
+/// Footer of the linked-issues list. `d` removes rather than Space toggling:
+/// the rows are links already made, not options to check off.
+fn links_picker_hints_line() -> Line<'static> {
+    Line::from(vec![
+        Span::raw("┤ "),
+        Span::styled("j/k", Style::default().fg(Color::Blue)),
+        Span::raw(" nav | "),
+        Span::styled("↵", Style::default().fg(Color::Blue)),
+        Span::raw(" relation | "),
+        Span::styled("n", Style::default().fg(Color::Green)),
+        Span::raw(" new | "),
+        Span::styled("d", Style::default().fg(Color::Red)),
+        Span::raw(" remove | "),
+        Span::styled("q", Style::default().fg(Color::Magenta)),
+        Span::raw(" back ├──"),
+    ])
+    .alignment(Alignment::Right)
 }
 
 fn project_picker_hints_line(searching: bool) -> Line<'static> {
@@ -3047,8 +3624,8 @@ mod tests {
         json!({ "type": "any", "custom": "com.pyxis.greenhopper.jira:gh-epic-link" })
     }
 
-    fn epic(key: &str) -> EpicRef {
-        EpicRef {
+    fn epic(key: &str) -> IssueRef {
+        IssueRef {
             key: key.into(),
             summary: format!("{key} epic"),
         }
@@ -3142,6 +3719,425 @@ mod tests {
         let picker = form.picker.take().expect("open");
         handle_epic_picker_key(&mut form, KeyCode::Enter, picker);
         assert!(matches!(form.fields[0].value, FieldValue::Epic(None)));
+    }
+
+    // ── Linked issues ──────────────────────────────────────────────────────
+
+    fn link_types() -> Vec<IssueLinkType> {
+        vec![
+            IssueLinkType {
+                name: "Blocks".into(),
+                inward: "is blocked by".into(),
+                outward: "blocks".into(),
+            },
+            IssueLinkType {
+                name: "Relates".into(),
+                inward: "relates to".into(),
+                outward: "relates to".into(),
+            },
+        ]
+    }
+
+    fn issue(key: &str) -> IssueRef {
+        IssueRef {
+            key: key.into(),
+            summary: format!("{key} summary"),
+        }
+    }
+
+    /// A form whose one field is `issuelinks`, as createmeta describes it.
+    fn links_form() -> CreateForm {
+        let mut form = base_form();
+        form.fields = parse_create_fields(
+            &[json!({
+                "fieldId": "issuelinks", "name": "Linked Issues", "required": false,
+                "schema": { "type": "array", "items": "issuelinks", "system": "issuelinks" }
+            })],
+            false,
+        );
+        form.link_types = CacheState::Loaded(link_type_choices(&link_types()));
+        form
+    }
+
+    /// Route `code` through the open linked-issues list, as
+    /// `handle_picker_input` does: take the picker, then hand on its fields.
+    fn press_links(form: &mut CreateForm, code: KeyCode) {
+        let Some(CreatePicker::IssueLinks { field_idx, cursor }) = form.picker.take() else {
+            panic!("the links list is not open");
+        };
+        handle_links_picker_key(form, code, field_idx, cursor);
+    }
+
+    /// Same for the relation chooser.
+    fn press_link_type(form: &mut CreateForm, code: KeyCode) {
+        let Some(CreatePicker::LinkType {
+            field_idx,
+            editing,
+            cursor,
+        }) = form.picker.take()
+        else {
+            panic!("the relation chooser is not open");
+        };
+        handle_link_type_picker_key(form, code, field_idx, editing, cursor);
+    }
+
+    #[test]
+    fn issuelinks_field_is_a_link_widget_starting_empty() {
+        let form = links_form();
+        assert_eq!(form.fields[0].widget, WidgetKind::IssueLinks);
+        assert!(matches!(
+            form.fields[0].value,
+            FieldValue::IssueLinks(ref l) if l.is_empty()
+        ));
+        // Nothing added → no `update` block at all, not an empty one.
+        let payload = build_create_payload(&form).expect("valid");
+        assert!(payload.get("update").is_none());
+        assert!(payload["fields"].get("issuelinks").is_none());
+        assert!(!form_is_dirty(&form));
+    }
+
+    #[test]
+    fn link_type_choices_expand_both_ends_and_collapse_symmetric_ones() {
+        let choices = link_type_choices(&link_types());
+        // Blocks gives two readings, "relates to" only one.
+        assert_eq!(choices.len(), 3);
+        assert_eq!(choices[0].label, "blocks");
+        assert_eq!(choices[0].direction, LinkDirection::Outward);
+        assert_eq!(choices[1].label, "is blocked by");
+        assert_eq!(choices[1].direction, LinkDirection::Inward);
+        assert_eq!(choices[2].label, "relates to");
+        assert_eq!(choices[2].name, "Relates");
+    }
+
+    /// The picked relation reads from the new issue outwards, so the target sits
+    /// on the opposite side: "blocks" puts it on `outwardIssue`.
+    #[test]
+    fn links_travel_in_update_with_the_target_on_the_far_side() {
+        let mut form = links_form();
+        let choices = link_type_choices(&link_types());
+        form.fields[0].value = FieldValue::IssueLinks(vec![
+            IssueLinkDraft {
+                link_type: choices[0].clone(), // blocks (outward)
+                issue: issue("OPS-42"),
+            },
+            IssueLinkDraft {
+                link_type: choices[1].clone(), // is blocked by (inward)
+                issue: issue("OPS-9"),
+            },
+        ]);
+        let payload = build_create_payload(&form).expect("valid");
+        assert!(
+            payload["fields"].get("issuelinks").is_none(),
+            "Jira rejects issuelinks in `fields` on create"
+        );
+        assert_eq!(
+            payload["update"]["issuelinks"],
+            json!([
+                { "add": { "type": { "name": "Blocks" }, "outwardIssue": { "key": "OPS-42" } } },
+                { "add": { "type": { "name": "Blocks" }, "inwardIssue": { "key": "OPS-9" } } },
+            ])
+        );
+    }
+
+    #[test]
+    fn required_links_field_with_nothing_added_errors() {
+        let mut form = links_form();
+        form.fields[0].required = true;
+        let err = build_create_payload(&form).expect_err("must not submit");
+        assert!(err.contains("Linked Issues"), "{err}");
+    }
+
+    #[test]
+    fn link_rows_end_with_the_add_row() {
+        assert_eq!(link_rows(0), vec![LinkRow::Add]);
+        assert_eq!(
+            link_rows(2),
+            vec![LinkRow::Existing(0), LinkRow::Existing(1), LinkRow::Add]
+        );
+    }
+
+    /// The full add walk: list → relation → issue, and back to the list with
+    /// the new link under the cursor.
+    #[test]
+    fn adding_a_link_walks_both_pickers_and_returns_to_the_list() {
+        let mut form = links_form();
+        form.focus = 2;
+        activate_field(&mut form);
+        assert!(matches!(form.picker, Some(CreatePicker::IssueLinks { .. })));
+
+        // Enter on the list opens the relation chooser.
+        press_links(&mut form, KeyCode::Enter);
+        assert!(matches!(form.picker, Some(CreatePicker::LinkType { .. })));
+        assert!(
+            !form.needs_link_types_fetch,
+            "already-loaded relations are not refetched"
+        );
+
+        // Second relation ("is blocked by") opens the issue chooser.
+        press_link_type(&mut form, KeyCode::Char('j'));
+        press_link_type(&mut form, KeyCode::Enter);
+        assert!(matches!(
+            form.picker,
+            Some(CreatePicker::LinkIssue { ref link_type, .. }) if link_type.label == "is blocked by"
+        ));
+        assert!(form.link_search.is_some(), "opening asks for candidates");
+
+        // The search lands and its first match is taken.
+        if let Some(search) = form.link_search.as_mut() {
+            search.pending = false;
+            search.results = CacheState::Loaded(vec![issue("OPS-9")]);
+        }
+        let picker = form.picker.take().expect("open");
+        handle_link_issue_picker_key(&mut form, KeyCode::Enter, picker);
+
+        assert!(
+            matches!(
+                form.picker,
+                Some(CreatePicker::IssueLinks { cursor: 0, .. })
+            ),
+            "back on the list, cursor on the new link: {:?}",
+            form.picker
+        );
+        assert!(
+            form.link_search.is_none(),
+            "matches do not outlive the picker"
+        );
+        let FieldValue::IssueLinks(ref links) = form.fields[0].value else {
+            panic!("still a links field");
+        };
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].issue.key, "OPS-9");
+        assert_eq!(links[0].link_type.direction, LinkDirection::Inward);
+        assert!(form_is_dirty(&form), "an added link is unsaved work");
+    }
+
+    #[test]
+    fn the_same_link_twice_is_not_added_twice() {
+        let mut form = links_form();
+        let choice = link_type_choices(&link_types())[0].clone();
+        add_link(&mut form, 0, choice.clone(), issue("OPS-42"));
+        add_link(&mut form, 0, choice, issue("OPS-42"));
+        let FieldValue::IssueLinks(ref links) = form.fields[0].value else {
+            panic!("still a links field");
+        };
+        assert_eq!(links.len(), 1, "Jira would reject the duplicate operation");
+        assert!(
+            matches!(
+                form.picker,
+                Some(CreatePicker::IssueLinks { cursor: 0, .. })
+            ),
+            "the cursor lands on the existing row: {:?}",
+            form.picker
+        );
+    }
+
+    #[test]
+    fn d_removes_the_highlighted_link_and_keeps_the_cursor_on_a_row() {
+        let mut form = links_form();
+        let choices = link_type_choices(&link_types());
+        add_link(&mut form, 0, choices[0].clone(), issue("OPS-1"));
+        add_link(&mut form, 0, choices[0].clone(), issue("OPS-2"));
+
+        // Cursor sits on the second link (row 1); remove it.
+        press_links(&mut form, KeyCode::Char('d'));
+        let FieldValue::IssueLinks(ref links) = form.fields[0].value else {
+            panic!("still a links field");
+        };
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].issue.key, "OPS-1");
+        assert!(
+            matches!(
+                form.picker,
+                Some(CreatePicker::IssueLinks { cursor: 1, .. })
+            ),
+            "cursor clamps to a row that still exists — here the add row: {:?}",
+            form.picker
+        );
+
+        // `d` on the add row removes nothing.
+        press_links(&mut form, KeyCode::Char('d'));
+        assert_eq!(field_links(&form, 0).len(), 1);
+
+        // Back onto the remaining link, which `d` does remove.
+        press_links(&mut form, KeyCode::Char('k'));
+        press_links(&mut form, KeyCode::Char('d'));
+        assert!(field_links(&form, 0).is_empty());
+    }
+
+    #[test]
+    fn n_starts_a_new_link_from_a_row_that_already_has_one() {
+        let mut form = links_form();
+        let choices = link_type_choices(&link_types());
+        add_link(&mut form, 0, choices[0].clone(), issue("OPS-1"));
+
+        // Cursor is on the existing link, where Enter would edit it.
+        press_links(&mut form, KeyCode::Char('n'));
+        assert!(
+            matches!(
+                form.picker,
+                Some(CreatePicker::LinkType { editing: None, .. })
+            ),
+            "n adds rather than edits: {:?}",
+            form.picker
+        );
+    }
+
+    /// Enter on a link reopens the relation chooser for it, starting on the
+    /// relation it has; picking another swaps it and leaves the issue alone.
+    #[test]
+    fn enter_on_a_link_edits_its_relation_in_place() {
+        let mut form = links_form();
+        let choices = link_type_choices(&link_types());
+        add_link(&mut form, 0, choices[1].clone(), issue("OPS-1")); // is blocked by
+
+        press_links(&mut form, KeyCode::Enter);
+        assert!(
+            matches!(
+                form.picker,
+                Some(CreatePicker::LinkType {
+                    editing: Some(0),
+                    cursor: 1,
+                    ..
+                })
+            ),
+            "starts on the relation the link already has: {:?}",
+            form.picker
+        );
+
+        // Up one row: "blocks".
+        press_link_type(&mut form, KeyCode::Char('k'));
+        press_link_type(&mut form, KeyCode::Enter);
+
+        let links = field_links(&form, 0);
+        assert_eq!(links.len(), 1, "editing must not add a second link");
+        assert_eq!(links[0].link_type.label, "blocks");
+        assert_eq!(links[0].link_type.direction, LinkDirection::Outward);
+        assert_eq!(links[0].issue.key, "OPS-1", "the issue is untouched");
+        assert!(
+            matches!(
+                form.picker,
+                Some(CreatePicker::IssueLinks { cursor: 0, .. })
+            ),
+            "back on the list, on the link just edited: {:?}",
+            form.picker
+        );
+    }
+
+    /// Backing out of a step lands on the previous one, not on the form.
+    #[test]
+    fn backing_out_of_the_add_walk_retreats_one_step_at_a_time() {
+        let mut form = links_form();
+        form.focus = 2;
+        activate_field(&mut form);
+        press_links(&mut form, KeyCode::Enter);
+        press_link_type(&mut form, KeyCode::Enter);
+
+        // Issue chooser → relation chooser → list → form.
+        let picker = form.picker.take().expect("open");
+        handle_link_issue_picker_key(&mut form, KeyCode::Char('q'), picker);
+        assert!(matches!(form.picker, Some(CreatePicker::LinkType { .. })));
+        assert!(form.link_search.is_none(), "the search is abandoned too");
+
+        press_link_type(&mut form, KeyCode::Char('q'));
+        assert!(
+            matches!(
+                form.picker,
+                Some(CreatePicker::IssueLinks { cursor: 0, .. })
+            ),
+            "back on the add row the walk started from: {:?}",
+            form.picker
+        );
+
+        press_links(&mut form, KeyCode::Char('q'));
+        assert!(
+            form.picker.is_none(),
+            "leaving the list returns to the form"
+        );
+    }
+
+    #[test]
+    fn leaving_the_issue_chooser_returns_to_the_relation_that_was_picked() {
+        let mut form = links_form();
+        form.focus = 2;
+        activate_field(&mut form);
+        press_links(&mut form, KeyCode::Enter);
+        // Third relation ("relates to").
+        press_link_type(&mut form, KeyCode::Char('j'));
+        press_link_type(&mut form, KeyCode::Char('j'));
+        press_link_type(&mut form, KeyCode::Enter);
+
+        let picker = form.picker.take().expect("open");
+        handle_link_issue_picker_key(&mut form, KeyCode::Char('q'), picker);
+        assert!(
+            matches!(
+                form.picker,
+                Some(CreatePicker::LinkType {
+                    editing: None,
+                    cursor: 2,
+                    ..
+                })
+            ),
+            "{:?}",
+            form.picker
+        );
+    }
+
+    #[test]
+    fn opening_the_relation_chooser_asks_for_the_link_types_once() {
+        let mut form = links_form();
+        form.link_types = CacheState::Idle;
+        open_link_type_picker(&mut form, 0, None);
+        assert!(form.needs_link_types_fetch);
+        assert!(matches!(form.link_types, CacheState::Loading));
+
+        // The dispatcher takes the flag; reopening while loading must not refetch.
+        form.needs_link_types_fetch = false;
+        open_link_type_picker(&mut form, 0, None);
+        assert!(!form.needs_link_types_fetch);
+
+        // A failure is retried on the next open, though.
+        form.link_types = CacheState::Failed("HTTP 500".into());
+        open_link_type_picker(&mut form, 0, None);
+        assert!(form.needs_link_types_fetch);
+    }
+
+    #[test]
+    fn typing_in_the_link_picker_requeries_under_a_fresh_token() {
+        let mut form = links_form();
+        let choice = link_type_choices(&link_types())[0].clone();
+        open_link_issue_picker(&mut form, 0, choice);
+        let first_token = form.link_search.as_ref().expect("open").token;
+
+        let picker = form.picker.take().expect("open");
+        handle_link_issue_picker_key(&mut form, KeyCode::Char('/'), picker);
+        let picker = form.picker.take().expect("open");
+        handle_link_issue_picker_key(&mut form, KeyCode::Char('o'), picker);
+
+        let search = form.link_search.as_ref().expect("open");
+        assert_eq!(search.query, "o");
+        assert!(
+            search.token > first_token,
+            "stale responses must be droppable"
+        );
+        assert!(!search.spawned, "the dispatcher has yet to send it");
+        assert!(
+            search.changed_at.is_some(),
+            "a typed query waits out the debounce"
+        );
+    }
+
+    #[test]
+    fn the_field_row_shows_one_link_in_full_and_counts_the_rest() {
+        let mut form = links_form();
+        assert_eq!(field_value_display(&form.fields[0]), "(none)  ▾");
+        let choices = link_type_choices(&link_types());
+        add_link(&mut form, 0, choices[0].clone(), issue("OPS-1"));
+        assert_eq!(
+            field_value_display(&form.fields[0]),
+            "blocks  OPS-1  OPS-1 summary  ▾"
+        );
+        add_link(&mut form, 0, choices[0].clone(), issue("OPS-2"));
+        assert_eq!(field_value_display(&form.fields[0]), "2 links  ▾");
     }
 
     #[test]

@@ -1327,6 +1327,14 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
         AppEvent::CreateEpicsLoaded { token, result } => {
             apply_create_epics_loaded(app, token, result);
         }
+
+        AppEvent::CreateLinkTypesLoaded { result } => {
+            apply_create_link_types_loaded(app, result);
+        }
+
+        AppEvent::CreateLinkIssuesLoaded { token, result } => {
+            apply_create_link_issues_loaded(app, token, result);
+        }
     }
 }
 
@@ -1439,7 +1447,7 @@ fn apply_create_users_loaded(
 fn apply_create_epics_loaded(
     app: &mut AppState,
     token: u64,
-    result: Result<Vec<crate::jira::types::EpicRef>, anyhow::Error>,
+    result: Result<Vec<crate::jira::types::IssueRef>, anyhow::Error>,
 ) {
     let ActionState::CreatingIssue(ref mut form) = app.action_state else {
         return;
@@ -1453,6 +1461,42 @@ fn apply_create_epics_loaded(
     search.pending = false;
     search.results = match result {
         Ok(epics) => CacheState::Loaded(epics),
+        Err(e) => CacheState::Failed(e.to_string()),
+    };
+}
+
+fn apply_create_link_types_loaded(
+    app: &mut AppState,
+    result: Result<Vec<crate::jira::types::IssueLinkType>, anyhow::Error>,
+) {
+    let ActionState::CreatingIssue(ref mut form) = app.action_state else {
+        return;
+    };
+    form.link_types = match result {
+        Ok(types) => CacheState::Loaded(crate::tui::overlays::create_issue::link_type_choices(
+            &types,
+        )),
+        Err(e) => CacheState::Failed(e.to_string()),
+    };
+}
+
+fn apply_create_link_issues_loaded(
+    app: &mut AppState,
+    token: u64,
+    result: Result<Vec<crate::jira::types::IssueRef>, anyhow::Error>,
+) {
+    let ActionState::CreatingIssue(ref mut form) = app.action_state else {
+        return;
+    };
+    let Some(search) = form.link_search.as_mut() else {
+        return;
+    };
+    if token != search.token {
+        return; // the query moved on while this was in flight
+    }
+    search.pending = false;
+    search.results = match result {
+        Ok(issues) => CacheState::Loaded(issues),
         Err(e) => CacheState::Failed(e.to_string()),
     };
 }

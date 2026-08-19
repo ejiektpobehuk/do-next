@@ -860,62 +860,113 @@ impl JiraClient {
 
     /// Open epics in `project`, most-recently-touched first, optionally
     /// narrowed by `query` (see [`crate::jira::jql::epic_search_jql`]).
-    ///
-    /// One page only: this backs a picker, where fifty candidates are already
-    /// more than anyone scrolls, and paginating a project's whole epic history
-    /// on every keystroke would be waste.
     pub async fn search_epics(
         &self,
         project: &str,
         query: &str,
-    ) -> Result<Vec<crate::jira::types::EpicRef>> {
+    ) -> Result<Vec<crate::jira::types::IssueRef>> {
+        let jql = crate::jira::jql::epic_search_jql(project, query);
+        self.search_issue_refs(&jql, "Epic search").await
+    }
+
+    /// Candidates for the create form's linked-issue picker
+    /// (see [`crate::jira::jql::link_search_jql`]).
+    pub async fn search_link_issues(
+        &self,
+        project: &str,
+        query: &str,
+    ) -> Result<Vec<crate::jira::types::IssueRef>> {
+        let jql = crate::jira::jql::link_search_jql(project, query);
+        self.search_issue_refs(&jql, "Issue search").await
+    }
+
+    /// Run `jql` and keep only what a picker shows: the key and the summary.
+    /// `what` names the search in error messages.
+    ///
+    /// One page only: this backs a picker, where fifty candidates are already
+    /// more than anyone scrolls, and paginating a project's whole history on
+    /// every keystroke would be waste.
+    async fn search_issue_refs(
+        &self,
+        jql: &str,
+        what: &str,
+    ) -> Result<Vec<crate::jira::types::IssueRef>> {
         /// Just the two fields the picker shows; `Issue` would not deserialize
         /// from a `fields=summary` response.
         #[derive(serde::Deserialize)]
-        struct EpicIssue {
+        struct RefIssue {
             key: String,
-            fields: Option<EpicFields>,
+            fields: Option<RefFields>,
         }
         #[derive(serde::Deserialize)]
-        struct EpicFields {
+        struct RefFields {
             summary: Option<String>,
         }
         #[derive(serde::Deserialize)]
-        struct EpicPage {
+        struct RefPage {
             #[serde(default)]
-            issues: Vec<EpicIssue>,
+            issues: Vec<RefIssue>,
         }
 
-        let jql = crate::jira::jql::epic_search_jql(project, query);
         let url = format!("{}/rest/api/3/search/jql", self.base_url);
         self.maybe_refresh().await?;
         let resp =
             crate::http::send_with_retry(self.apply_auth(self.client.get(&url)).await.query(&[
-                ("jql", jql.as_str()),
+                ("jql", jql),
                 ("maxResults", "50"),
                 ("fields", "summary"),
             ]))
             .await
-            .context("Failed to search epics")?;
+            .with_context(|| format!("Failed to run {}", what.to_lowercase()))?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Epic search failed {status}: {body}");
+            anyhow::bail!("{what} failed {status}: {body}");
         }
 
-        let page: EpicPage = resp
+        let page: RefPage = resp
             .json()
             .await
-            .context("Failed to parse epic search response")?;
+            .with_context(|| format!("Failed to parse {} response", what.to_lowercase()))?;
         Ok(page
             .issues
             .into_iter()
-            .map(|i| crate::jira::types::EpicRef {
+            .map(|i| crate::jira::types::IssueRef {
                 key: i.key,
                 summary: i.fields.and_then(|f| f.summary).unwrap_or_default(),
             })
             .collect())
+    }
+
+    /// The site's issue link types, in the order Jira returns them.
+    ///
+    /// Site-wide rather than per-project, so the create form fetches this once
+    /// and keeps it across project changes.
+    pub async fn issue_link_types(&self) -> Result<Vec<crate::jira::types::IssueLinkType>> {
+        #[derive(serde::Deserialize)]
+        struct LinkTypes {
+            #[serde(rename = "issueLinkTypes", default)]
+            issue_link_types: Vec<crate::jira::types::IssueLinkType>,
+        }
+
+        let url = format!("{}/rest/api/3/issueLinkType", self.base_url);
+        self.maybe_refresh().await?;
+        let resp = crate::http::send_with_retry(self.apply_auth(self.client.get(&url)).await)
+            .await
+            .context("Failed to fetch issue link types")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Issue link types failed {status}: {body}");
+        }
+
+        let types: LinkTypes = resp
+            .json()
+            .await
+            .context("Failed to parse issue link types response")?;
+        Ok(types.issue_link_types)
     }
 
     /// The authenticated user's full identity: account id for payloads,
