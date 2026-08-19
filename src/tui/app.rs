@@ -3684,6 +3684,29 @@ const fn search_total_results(local: &[RankedHit], jira: &JiraSearchState) -> us
         }
 }
 
+/// Display order of the merged result list: local hits first, then Jira-only
+/// hits, with team-project ones pulled ahead of the rest. Both the renderer and
+/// the open handler index the list this returns, so `selected` means the same
+/// row in either.
+pub fn ordered_search_hits<'a>(
+    local: &'a [RankedHit],
+    jira: &'a JiraSearchState,
+    team_projects: &[String],
+) -> Vec<&'a RankedHit> {
+    let mut out: Vec<&RankedHit> = local.iter().collect();
+    if let JiraSearchState::Loaded { hits, issues } = jira {
+        let (in_proj, rest): (Vec<&RankedHit>, Vec<&RankedHit>) = hits.iter().partition(|h| {
+            issues
+                .iter()
+                .find(|i| i.key == h.issue_key)
+                .is_some_and(|i| team_projects.iter().any(|p| p == &i.fields.project.key))
+        });
+        out.extend(in_proj);
+        out.extend(rest);
+    }
+    out
+}
+
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn handle_search_input(app: &mut AppState, event: crossterm::event::Event) {
     use crossterm::event::{Event, KeyEvent};
@@ -4122,7 +4145,8 @@ fn cancel_search(app: &mut AppState) {
 }
 
 fn commit_search_selection(app: &mut AppState) {
-    let (key, was_jira) = {
+    let (key, jira_issue) = {
+        let team_projects = crate::tui::team_project_keys(app);
         let ActionState::Searching {
             ref local_results,
             ref jira_state,
@@ -4132,32 +4156,26 @@ fn commit_search_selection(app: &mut AppState) {
         else {
             return;
         };
-        let local_len = local_results.len();
-        if selected < local_len {
-            (local_results[selected].issue_key.clone(), false)
-        } else {
-            let jira_idx = selected - local_len;
-            match jira_state {
-                JiraSearchState::Loaded { hits, issues } => {
-                    let key = hits.get(jira_idx).map(|h| h.issue_key.clone());
-                    let is_in_local = key
-                        .as_deref()
-                        .is_some_and(|k| app.issues.iter().any(|i| i.key() == k));
-                    if let Some(k) = key {
-                        if !is_in_local
-                            && let Some(issue) = issues.iter().find(|i| i.key == k).cloned()
-                        {
-                            inject_jira_search_result(app, issue);
-                        }
-                        (k, true)
-                    } else {
-                        return;
-                    }
-                }
-                _ => return,
+        let ordered = ordered_search_hits(local_results, jira_state, &team_projects);
+        let Some(hit) = ordered.get(selected) else {
+            return;
+        };
+        let key = hit.issue_key.clone();
+        // A Jira-only hit isn't in the local list yet; carry its issue out so it
+        // can be injected once the borrow on `action_state` ends.
+        let jira_issue = match jira_state {
+            JiraSearchState::Loaded { issues, .. }
+                if !app.issues.iter().any(|i| i.key() == key) =>
+            {
+                issues.iter().find(|i| i.key == key).cloned()
             }
-        }
+            _ => None,
+        };
+        (key, jira_issue)
     };
+    if let Some(issue) = jira_issue {
+        inject_jira_search_result(app, issue);
+    }
 
     // Park the search overlay so q/Esc from the issue view can restore it with
     // the same query, filters, results, and selection.
@@ -4175,7 +4193,6 @@ fn commit_search_selection(app: &mut AppState) {
     app.detail_scroll = 0;
     app.fullscreen_detail = true;
     request_detail_load_if_partial(app);
-    let _ = was_jira;
 }
 
 const SEARCH_RESULTS_SOURCE_ID: &str = "_search_results";
@@ -5963,6 +5980,118 @@ mod tests {
             partial: false,
             changelog: None,
         }
+    }
+
+    // ── search result ordering ───────────────────────────────────────────────
+
+    fn ranked_hit(key: &str) -> RankedHit {
+        RankedHit {
+            issue_key: key.into(),
+            score: 100,
+            key_ranges: Vec::new(),
+            summary_ranges: Vec::new(),
+            origin: crate::tui::search::HitOrigin::Jira,
+        }
+    }
+
+    fn issue_in_project(key: &str, project: &str) -> Issue {
+        let mut issue = make_issue(key, "To Do", None);
+        issue.fields.project.key = project.into();
+        issue
+    }
+
+    fn searching_state(
+        local: Vec<RankedHit>,
+        jira: JiraSearchState,
+        selected: usize,
+    ) -> ActionState {
+        ActionState::Searching {
+            query: "q".into(),
+            cursor: 1,
+            filters: SearchFilters::default(),
+            focus: SearchFocus::Result(selected),
+            local_results: local,
+            jira_state: jira,
+            selected,
+            prev_nav_idx: 0,
+            debounce_token: 1,
+            last_change_at: std::time::Instant::now(),
+            jira_spawned_for_token: true,
+            picker: None,
+        }
+    }
+
+    /// A team whose only project is PROJ, with M-1 loaded locally.
+    fn search_app() -> AppState {
+        let teams = vec![resolved_team("platform", vec![jira_source("mine")])];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        app.resolved_teams[0].jira.default_project = "PROJ".into();
+        app.sources.insert(
+            "mine".into(),
+            SourceState::Loaded(vec![make_item("M-1", "To Do", Some("mine"))]),
+        );
+        app.rebuild_issues();
+        app
+    }
+
+    #[test]
+    fn ordered_search_hits_pulls_team_projects_ahead_of_the_rest() {
+        let local = vec![ranked_hit("M-1")];
+        let jira = JiraSearchState::Loaded {
+            hits: vec![ranked_hit("OTHER-1"), ranked_hit("PROJ-9")],
+            issues: vec![
+                issue_in_project("OTHER-1", "OTHER"),
+                issue_in_project("PROJ-9", "PROJ"),
+            ],
+        };
+        let team = vec!["PROJ".to_string()];
+        let ordered = ordered_search_hits(&local, &jira, &team);
+        let keys: Vec<&str> = ordered.iter().map(|h| h.issue_key.as_str()).collect();
+        assert_eq!(keys, vec!["M-1", "PROJ-9", "OTHER-1"]);
+    }
+
+    #[test]
+    fn commit_search_selection_opens_the_row_the_user_sees() {
+        // Jira returned OTHER-1 first, but the overlay renders the team-project
+        // hit ahead of it — so display row 0 is PROJ-9, not hits[0].
+        let mut app = search_app();
+        app.action_state = searching_state(
+            Vec::new(),
+            JiraSearchState::Loaded {
+                hits: vec![ranked_hit("OTHER-1"), ranked_hit("PROJ-9")],
+                issues: vec![
+                    issue_in_project("OTHER-1", "OTHER"),
+                    issue_in_project("PROJ-9", "PROJ"),
+                ],
+            },
+            0,
+        );
+        commit_search_selection(&mut app);
+        assert_eq!(app.selected_issue().map(|i| i.key.as_str()), Some("PROJ-9"));
+    }
+
+    #[test]
+    fn commit_search_selection_opens_local_hit_by_position() {
+        let mut app = search_app();
+        app.action_state = searching_state(
+            vec![ranked_hit("M-1")],
+            JiraSearchState::Loaded {
+                hits: vec![ranked_hit("OTHER-1")],
+                issues: vec![issue_in_project("OTHER-1", "OTHER")],
+            },
+            0,
+        );
+        commit_search_selection(&mut app);
+        assert_eq!(app.selected_issue().map(|i| i.key.as_str()), Some("M-1"));
+    }
+
+    #[test]
+    fn commit_search_selection_ignores_an_out_of_range_selection() {
+        let mut app = search_app();
+        app.action_state = searching_state(vec![ranked_hit("M-1")], JiraSearchState::Idle, 5);
+        commit_search_selection(&mut app);
+        assert!(matches!(app.action_state, ActionState::Searching { .. }));
+        assert!(app.saved_search.is_none());
     }
 
     #[test]

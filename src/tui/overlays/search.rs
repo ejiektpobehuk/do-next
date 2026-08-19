@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::jira::types::Issue;
-use crate::tui::app::{ActionState, AppState, JiraSearchState, SearchFocus};
+use crate::tui::app::{ActionState, AppState, JiraSearchState, SearchFocus, ordered_search_hits};
 use crate::tui::search::{RankedHit, SearchFilters};
 use crate::tui::theme;
 use crate::tui::widgets::scrollbar::render_scrollbar;
@@ -73,7 +73,7 @@ pub fn render_search_overlay(f: &mut Frame, app: &AppState, results_state: &mut 
         .split(left);
 
     let team_projects = crate::tui::team_project_keys(app);
-    let ordered = ordered_hits(local_results, jira_state, &team_projects);
+    let ordered = ordered_search_hits(local_results, jira_state, &team_projects);
 
     render_input(
         f,
@@ -97,25 +97,6 @@ pub fn render_search_overlay(f: &mut Frame, app: &AppState, results_state: &mut 
     render_footer(f, left_chunks[3], jira_state);
 
     render_preview(f, right, app, jira_state, &ordered, selected);
-}
-
-fn ordered_hits<'a>(
-    local: &'a [RankedHit],
-    jira: &'a JiraSearchState,
-    team_projects: &[String],
-) -> Vec<&'a RankedHit> {
-    let mut out: Vec<&RankedHit> = local.iter().collect();
-    if let JiraSearchState::Loaded { hits, issues } = jira {
-        let (in_proj, rest): (Vec<&RankedHit>, Vec<&RankedHit>) = hits.iter().partition(|h| {
-            issues
-                .iter()
-                .find(|i| i.key == h.issue_key)
-                .is_some_and(|i| team_projects.iter().any(|p| p == &i.fields.project.key))
-        });
-        out.extend(in_proj);
-        out.extend(rest);
-    }
-    out
 }
 
 fn render_input(f: &mut Frame, area: Rect, query: &str, cursor: usize, focused: bool) {
