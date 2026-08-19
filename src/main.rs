@@ -9,6 +9,7 @@ mod items;
 mod jira;
 mod sources;
 mod standup;
+mod startup;
 mod subcommands;
 mod tui;
 
@@ -74,6 +75,10 @@ enum CompanyAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Startup progress goes to stderr; shell completions are consumed by the
+    // shell (`eval "$(do-next completions zsh)"`), so they get no decoration.
+    startup::set_enabled(!matches!(cli.command, Some(Commands::Completions { .. })));
+
     if let Some(ref log_path) = cli.log {
         use simplelog::{Config, LevelFilter, WriteLogger};
         let file = std::fs::File::create(log_path)
@@ -83,8 +88,24 @@ async fn main() -> Result<()> {
         log::info!("do-next starting, logging to {}", log_path.display());
     }
 
-    // Load config
+    // Load config. On failure the step is dropped without a verdict, leaving
+    // the error to stand on its own.
+    let step = startup::Step::start("loading config");
     let mut loaded = config::load().context("Failed to load configuration")?;
+    let team_count = loaded.teams.len();
+    if team_count == 0 {
+        if loaded.load_errors.is_empty() {
+            step.skip("no teams configured yet");
+        } else {
+            // The errors themselves are printed by the bail further down.
+            step.warn("config loaded, but no team could be resolved");
+        }
+    } else {
+        step.done(format!(
+            "config loaded ({team_count} team{})",
+            if team_count == 1 { "" } else { "s" }
+        ));
+    }
 
     // Shell completions — no config needed.
     if let Some(Commands::Completions { shell }) = &cli.command {
@@ -161,9 +182,12 @@ async fn main() -> Result<()> {
         && let Some(company) = &loaded.config.company
     {
         let repo = config::expand_tilde(&company.path);
+        let step = startup::Step::start("checking company config for updates (git fetch)");
         let behind = config::updates::fetch_behind_count(&repo).unwrap_or(0);
         if behind > 0 {
             let plural = if behind == 1 { "" } else { "s" };
+            // Report before prompting: the verdict explains the question.
+            step.warn(format!("company config is {behind} commit{plural} behind"));
             let pull = tui::onboarding::prompt_yes_no(
                 &format!("Company config has {behind} update{plural}. Pull now? [Y/n]: "),
                 true,
@@ -172,13 +196,17 @@ async fn main() -> Result<()> {
             if pull {
                 match config::updates::pull_ff_only(&repo) {
                     Ok(()) => {
+                        let step = startup::Step::start("reloading config");
                         loaded = config::load().context("Failed to reload configuration")?;
+                        step.done("config reloaded");
                     }
                     Err(e) => {
                         eprintln!("warning: {e:#}; continuing with the current checkout");
                     }
                 }
             }
+        } else {
+            step.done("company config up to date");
         }
     }
 
@@ -217,7 +245,17 @@ async fn main() -> Result<()> {
         // Teams that want the on-call view but have no token anywhere get an
         // interactive setup offer first (like the Jira auth prompts).
         // Declining skips for this launch only; `do-next auth` works any time.
+        let has_grafana = loaded.teams.iter().any(|t| t.grafana.is_some());
+        let step = has_grafana.then(|| startup::Step::start("reading Grafana OnCall token"));
         let missing = grafana::teams_missing_token(&loaded.teams);
+        if let Some(step) = step {
+            if missing.is_empty() {
+                step.done("Grafana OnCall token found");
+            } else {
+                // Finish the line before the setup offer takes over the screen.
+                step.warn("no Grafana OnCall token stored");
+            }
+        }
         if !missing.is_empty() {
             let mut configured = false;
             for target in &missing {
@@ -230,14 +268,28 @@ async fn main() -> Result<()> {
                 }
             }
             if configured {
+                let step = startup::Step::start("reloading config");
                 loaded = config::load().context("Failed to reload configuration")?;
+                step.done("config reloaded");
             }
         }
 
         // Same offer for teams with GitLab sources and no token anywhere. A
         // declined or failed setup must not block the launch — the GitLab
         // sources report the missing token as their own error rows.
+        let step = loaded
+            .teams
+            .iter()
+            .any(config::types::ResolvedTeam::uses_gitlab)
+            .then(|| startup::Step::start("reading GitLab token"));
         let missing = gitlab::teams_missing_token(&loaded.teams);
+        if let Some(step) = step {
+            if missing.is_empty() {
+                step.done("GitLab token found");
+            } else {
+                step.warn("no GitLab token stored");
+            }
+        }
         if !missing.is_empty() {
             let mut configured = false;
             for target in &missing {
@@ -248,12 +300,30 @@ async fn main() -> Result<()> {
                 }
             }
             if configured {
+                let step = startup::Step::start("reloading config");
                 loaded = config::load().context("Failed to reload configuration")?;
+                step.done("config reloaded");
             }
         }
 
-        let duty_errors = grafana::apply_on_duty_sources(&mut loaded.teams).await;
-        loaded.load_errors.extend(duty_errors);
+        // The on-call query is a network round trip per team; skipped entirely
+        // when no team configures Grafana, which the report says out loud.
+        if has_grafana {
+            let step = startup::Step::start("asking Grafana OnCall who is on duty");
+            let duty_errors = grafana::apply_on_duty_sources(&mut loaded.teams).await;
+            let on_duty = loaded.teams.iter().filter(|t| t.on_duty).count();
+            if on_duty > 0 {
+                step.done(format!(
+                    "on call — duty sources active for {on_duty} team{}",
+                    if on_duty == 1 { "" } else { "s" }
+                ));
+            } else if duty_errors.is_empty() {
+                step.done("not on call — normal sources");
+            } else {
+                step.warn("on-call check failed — normal sources");
+            }
+            loaded.load_errors.extend(duty_errors);
+        }
     }
 
     // Build one JiraClient per unique base_url across all teams.
@@ -262,6 +332,7 @@ async fn main() -> Result<()> {
         confluence: std::collections::HashMap::new(),
         gitlab: std::collections::HashMap::new(),
     };
+    let step = startup::Step::start("resolving Jira credentials");
     for team in &loaded.teams {
         let url = &team.jira.base_url;
         if !clients.jira.contains_key(url) {
@@ -272,11 +343,17 @@ async fn main() -> Result<()> {
             clients.jira.insert(url.clone(), client);
         }
     }
+    let jira_count = clients.jira.len();
+    step.done(format!(
+        "Jira ready ({jira_count} instance{})",
+        if jira_count == 1 { "" } else { "s" }
+    ));
 
     // Build one ConfluenceClient per unique Confluence base_url, but only for
     // teams that define confluence sources. When the effective Confluence
     // connection equals the team's Jira one, share the auth handle so OAuth
     // refresh stays coordinated (and no second credential lookup runs).
+    let step = startup::Step::start("resolving Confluence credentials");
     for team in &loaded.teams {
         // Consider normal AND on-duty sources: the duty view can be toggled
         // on at runtime (`D`), so its clients must exist up front.
@@ -314,11 +391,23 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to create Confluence client for team '{}'", team.id))?;
         clients.confluence.insert(url, client);
     }
+    let confluence_count = clients.confluence.len();
+    if confluence_count == 0 {
+        // No team asked for Confluence — nothing happened, say nothing.
+        step.clear();
+    } else {
+        step.done(format!(
+            "Confluence ready ({confluence_count} instance{})",
+            if confluence_count == 1 { "" } else { "s" }
+        ));
+    }
 
     // Build one GitlabClient per unique instance, but only for teams whose
     // normal or on-duty sources include a GitLab source (the `D` toggle can
     // add duty sources at runtime). A missing token is not fatal: the source
     // reports it, so the rest of the list still loads.
+    let step = startup::Step::start("resolving GitLab credentials");
+    let mut gitlab_warnings = Vec::new();
     for team in &loaded.teams {
         if !team.uses_gitlab() {
             continue;
@@ -335,19 +424,33 @@ async fn main() -> Result<()> {
                 clients.gitlab.insert(url, client);
             }
             Ok(None) => {
-                eprintln!(
-                    "warning: team '{}': no GitLab token configured for {url} \
+                gitlab_warnings.push(format!(
+                    "team '{}': no GitLab token configured for {url} \
                      (run `do-next auth` to set it up)",
                     team.id
-                );
+                ));
             }
             Err(e) => {
-                eprintln!(
-                    "warning: team '{}': GitLab token resolution failed: {e:#}",
+                gitlab_warnings.push(format!(
+                    "team '{}': GitLab token resolution failed: {e:#}",
                     team.id
-                );
+                ));
             }
         }
+    }
+    let gitlab_count = clients.gitlab.len();
+    if !gitlab_warnings.is_empty() {
+        step.warn("GitLab credentials incomplete");
+    } else if gitlab_count == 0 {
+        step.clear();
+    } else {
+        step.done(format!(
+            "GitLab ready ({gitlab_count} instance{})",
+            if gitlab_count == 1 { "" } else { "s" }
+        ));
+    }
+    for warning in gitlab_warnings {
+        eprintln!("warning: {warning}");
     }
 
     // For subcommands, use the first team's client (or default jira).
