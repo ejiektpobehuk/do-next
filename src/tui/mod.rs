@@ -186,6 +186,7 @@ async fn run_inner(
         );
         handle_pending_field_edit(terminal, &mut app, &mut rx, &mut input_task, &tx);
         handle_pending_comment_edit(terminal, &mut app, &mut rx, &mut input_task, &tx);
+        handle_pending_create_field_edit(terminal, &mut app, &mut rx, &mut input_task, &tx);
 
         // Dispatch any pending action signals (transition fetch, hide, assign, move)
         dispatch_action(&mut app, active_clients, &tx, &mut hidden, &hidden_file)?;
@@ -441,6 +442,52 @@ fn handle_pending_field_edit(
                 scroll: 0,
             };
         }
+    }
+}
+
+/// Open `$EDITOR` on the create form's focused string field and write the result
+/// back into the form. Unlike the other editor flows this one leaves the overlay
+/// in place: the form is still on screen, with the same focus, when the editor
+/// exits, so a description can be written outside and the rest filled in after.
+fn handle_pending_create_field_edit(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut AppState,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    input_task: &mut tokio::task::JoinHandle<()>,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    use crate::tui::overlays::create_issue::{FieldValue, apply_editor_text};
+
+    let (idx, field_id, current) = {
+        let ActionState::CreatingIssue(ref mut form) = app.action_state else {
+            return;
+        };
+        let Some(idx) = form.pending_editor.take() else {
+            return;
+        };
+        let Some(field) = form.fields.get(idx) else {
+            return;
+        };
+        let FieldValue::Text { ref input, .. } = field.value else {
+            return;
+        };
+        (idx, field.field_id.clone(), input.clone())
+    };
+
+    input_task.abort();
+    let editor_result = open_editor_raw(terminal, &current, &editor_stem(&field_id), "md");
+    *input_task = spawn_input_task(tx.clone());
+    drain_input_events(rx);
+
+    let ActionState::CreatingIssue(ref mut form) = app.action_state else {
+        return;
+    };
+    match editor_result {
+        Ok(Some(text)) => apply_editor_text(form, idx, &text),
+        // Editor never ran or exited non-zero — keep what the form already had.
+        Ok(None) => {}
+        // Reported inline: an error must not cost the user the whole form.
+        Err(e) => form.error = Some(format!("editor failed: {e}")),
     }
 }
 
@@ -1512,39 +1559,65 @@ fn spawn_delete_attachment(
 }
 
 /// Open $EDITOR with optional initial content, then return the edited text.
-/// This suspends the TUI.
+/// Empty output reads as "cancelled" — use `open_editor_raw` where clearing the
+/// value has to be possible. This suspends the TUI.
 fn open_editor_with_content(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     initial_content: &str,
 ) -> Result<Option<String>> {
+    Ok(open_editor_raw(terminal, initial_content, "comment", "md")?.filter(|s| !s.is_empty()))
+}
+
+/// Open the user's editor on a temp file seeded with `initial_content` and
+/// return the trimmed result. `None` means the editor could not be launched or
+/// exited non-zero, i.e. the edit was abandoned; `Some("")` is a deliberate
+/// wipe. `stem`/`ext` name the temp file, so the editor picks its filetype from
+/// the extension. This suspends the TUI.
+fn open_editor_raw(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    initial_content: &str,
+    stem: &str,
+    ext: &str,
+) -> Result<Option<String>> {
+    // Everything fallible happens before the screen is handed over, so an error
+    // can never leave the terminal in raw mode on the alternate screen.
+    let tmp = tempfile_path(stem, ext);
+    std::fs::write(&tmp, initial_content)?;
+    // VISUAL wins over EDITOR by convention; both may carry arguments
+    // (`code -w`), which `Command` needs split out from the program.
+    let spec = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let mut parts = spec.split_whitespace();
+    let Some(program) = parts.next() else {
+        anyhow::bail!("$VISUAL/$EDITOR is empty");
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(parts).arg(&tmp);
+
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-    let tmp = tempfile_path();
-    if !initial_content.is_empty() {
-        std::fs::write(&tmp, initial_content)?;
-    }
-
-    let status = std::process::Command::new(&editor).arg(&tmp).status();
-
+    let status = cmd.status();
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.clear()?;
 
+    let content = std::fs::read_to_string(&tmp).unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp);
     match status {
-        Ok(s) if s.success() => {
-            let content = std::fs::read_to_string(&tmp).unwrap_or_default();
-            let _ = std::fs::remove_file(&tmp);
-            let trimmed = content.trim().to_string();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(trimmed))
-            }
-        }
+        Ok(s) if s.success() => Ok(Some(content.trim().to_string())),
         _ => Ok(None),
     }
+}
+
+/// Temp-file stem for a create-form field: field ids are already tame
+/// (`summary`, `customfield_10014`), but nothing guarantees it.
+fn editor_stem(field_id: &str) -> String {
+    let cleaned: String = field_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("field-{cleaned}")
 }
 
 /// Open $EDITOR for the user to write a comment, then return the text.
@@ -1769,6 +1842,6 @@ mod tests {
 }
 
 #[allow(dead_code)]
-fn tempfile_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("do-next-comment-{}.txt", std::process::id()))
+fn tempfile_path(stem: &str, ext: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("do-next-{stem}-{}.{ext}", std::process::id()))
 }

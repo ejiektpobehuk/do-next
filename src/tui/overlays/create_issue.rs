@@ -14,7 +14,7 @@ use ratatui::{
     layout::Alignment,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use serde_json::{Value, json};
 
@@ -62,9 +62,17 @@ pub struct CreateOption {
 /// The in-progress value of a single form field.
 #[derive(Debug, Clone)]
 pub enum FieldValue {
-    Text { input: String, cursor: usize },
-    Number { input: String, cursor: usize },
-    Date { value: Option<String> },
+    Text {
+        input: String,
+        cursor: usize,
+    },
+    Number {
+        input: String,
+        cursor: usize,
+    },
+    Date {
+        value: Option<String>,
+    },
     SingleOption(Option<usize>),
     MultiOption(HashSet<usize>),
     /// `None` means "leave to Jira" — for `reporter` that resolves to the creator.
@@ -215,6 +223,10 @@ pub struct CreateForm {
     pub picker: Option<CreatePicker>,
     /// `Some(selected)` while the discard-changes prompt is up (0=Discard, 1=Keep editing).
     pub discard_confirm: Option<usize>,
+    /// Index into `fields` of the value waiting for `$EDITOR`. Set by `e`/Ctrl+E
+    /// and cleared by the main loop: it owns the terminal, so it is the only
+    /// place that can suspend the TUI to hand over to an external editor.
+    pub pending_editor: Option<usize>,
     /// Generation guard; bumped on any project/issue-type change so stale
     /// metadata responses are dropped.
     pub meta_token: u64,
@@ -241,6 +253,7 @@ impl CreateForm {
             mode: FormMode::Nav,
             picker: None,
             discard_confirm: None,
+            pending_editor: None,
             meta_token: 1,
             needs_issuetype_fetch: true,
             needs_field_fetch: false,
@@ -667,7 +680,7 @@ pub fn handle_create_input(app: &mut AppState, event: Event) {
         };
 
         if form.mode == FormMode::Edit {
-            handle_edit_mode_key(form, code);
+            handle_edit_mode_key(form, code, modifiers);
         } else {
             match code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -680,6 +693,9 @@ pub fn handle_create_input(app: &mut AppState, event: Event) {
                 KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => {
                     let n = form.focus_count();
                     form.focus = (form.focus + n - 1) % n;
+                }
+                KeyCode::Char('e') => {
+                    request_editor(form);
                 }
                 KeyCode::Enter => {
                     if form.focus == form.button_idx() {
@@ -732,7 +748,14 @@ fn activate_field(form: &mut CreateForm) {
 
 /// Edit-mode key routing. Only Text/Number/RichText rows should be focused
 /// while `mode == Edit`. Esc/Tab return to `Nav`.
-fn handle_edit_mode_key(form: &mut CreateForm, code: KeyCode) {
+fn handle_edit_mode_key(form: &mut CreateForm, code: KeyCode, modifiers: KeyModifiers) {
+    // Ctrl+E hands the value over to `$EDITOR` mid-typing. Leaves Edit mode so
+    // the form is back in Nav when the editor returns.
+    if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('e') {
+        form.mode = FormMode::Nav;
+        request_editor(form);
+        return;
+    }
     match code {
         KeyCode::Esc => {
             form.mode = FormMode::Nav;
@@ -790,6 +813,54 @@ fn handle_edit_mode_key(form: &mut CreateForm, code: KeyCode) {
             form.mode = FormMode::Nav;
         }
     }
+}
+
+/// Write text that came back from `$EDITOR` into field `idx`, leaving the
+/// cursor at the end so returning to Edit mode continues where the editor left
+/// off. Rich text keeps its line breaks; a single-line Jira string would carry
+/// them straight into the payload, so there they collapse to spaces.
+pub fn apply_editor_text(form: &mut CreateForm, idx: usize, text: &str) {
+    let Some(field) = form.fields.get_mut(idx) else {
+        return;
+    };
+    let folded = if field.widget == WidgetKind::RichText {
+        text.to_string()
+    } else {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    if let FieldValue::Text {
+        ref mut input,
+        ref mut cursor,
+    } = field.value
+    {
+        *cursor = folded.chars().count();
+        *input = folded;
+    }
+}
+
+/// Ask the main loop to open `$EDITOR` for the focused field. Only the two
+/// string widgets qualify: everything else is a picker, and a number is not
+/// worth suspending the TUI for.
+fn request_editor(form: &mut CreateForm) {
+    let Some(idx) = form.focus.checked_sub(2) else {
+        return;
+    };
+    if focused_widget_is_text(form, idx) {
+        form.pending_editor = Some(idx);
+    }
+}
+
+fn focused_widget_is_text(form: &CreateForm, idx: usize) -> bool {
+    form.fields
+        .get(idx)
+        .is_some_and(|f| matches!(f.widget, WidgetKind::Text | WidgetKind::RichText))
+}
+
+/// Whether the focused row can be handed to `$EDITOR` (drives the hint bar).
+fn editor_available(form: &CreateForm) -> bool {
+    form.focus
+        .checked_sub(2)
+        .is_some_and(|idx| focused_widget_is_text(form, idx))
 }
 
 fn form_is_dirty(form: &CreateForm) -> bool {
@@ -1199,21 +1270,224 @@ fn handle_picker_input(app: &mut AppState, code: KeyCode, _modifiers: KeyModifie
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
 /// Status row shown under the Type field while its field metadata isn't loaded.
-fn fields_status_line(form: &CreateForm) -> Option<Line<'static>> {
+/// Text and style of the line standing in for the field list while it loads or
+/// after it failed, if either applies.
+fn fields_status_line(form: &CreateForm) -> Option<(String, Style)> {
     form.issuetype.as_ref()?;
     match &form.fields_state {
-        CacheState::Loading | CacheState::Idle => Some(Line::from(Span::styled(
-            "  (loading fields…)",
+        CacheState::Loading | CacheState::Idle => Some((
+            "(loading fields…)".to_string(),
             Style::default()
                 .fg(theme::MUTED)
                 .add_modifier(Modifier::ITALIC),
-        ))),
-        CacheState::Failed(e) => Some(Line::from(Span::styled(
-            format!("  (fields failed: {e} — reselect Type to retry)"),
+        )),
+        CacheState::Failed(e) => Some((
+            format!("(fields failed: {e} — reselect Type to retry)"),
             Style::default().fg(Color::Red),
-        ))),
+        )),
         CacheState::Loaded(()) => None,
     }
+}
+
+/// Word-wrap `text` to `width`, hard-breaking any single word too long to fit.
+/// The form draws unwrapped so that rows and screen lines stay one to one;
+/// prose that has to be read in full is wrapped here instead.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for word in text.split_whitespace() {
+        let len = word.chars().count();
+        let room = width - row.chars().count().min(width);
+        if !row.is_empty() && len + 1 > room {
+            rows.push(std::mem::take(&mut row));
+        }
+        if len > width {
+            // Nothing to break on: fill the row and carry the rest over.
+            for ch in word.chars() {
+                if row.chars().count() == width {
+                    rows.push(std::mem::take(&mut row));
+                }
+                row.push(ch);
+            }
+            continue;
+        }
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        row.push_str(word);
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+/// Push `text` as however many indented rows it takes to read it in full.
+fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, style: Style, inner_width: u16) {
+    let indent = MARKER_COLS;
+    let width = (inner_width as usize).saturating_sub(indent);
+    for row in wrap_words(text, width) {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(indent)),
+            Span::styled(row, style),
+        ]));
+    }
+}
+
+/// Columns the label column occupies. Values line up at `MARKER_COLS + LABEL_COLS`
+/// unless a label is longer than that, in which case its row shifts right.
+const LABEL_COLS: usize = 16;
+/// Width of the `▶ ` focus marker every row is prefixed with.
+const MARKER_COLS: usize = 2;
+/// Ceiling on the rows a rich-text field expands to while being typed into, so a
+/// long description cannot push the Create button off the overlay.
+const MAX_EDIT_ROWS: usize = 8;
+
+fn label_cols(label: &str, required: bool) -> usize {
+    (label.chars().count() + usize::from(required)).max(LABEL_COLS)
+}
+
+/// Screen column a field's value starts at.
+fn value_col(label: &str, required: bool) -> usize {
+    MARKER_COLS + label_cols(label, required)
+}
+
+/// Clip `value` to `cols`, marking the cut with an ellipsis. The form draws
+/// without wrapping — one field, one row — so anything too long is elided here
+/// rather than silently sheared off at the border.
+fn elide(value: &str, cols: usize) -> String {
+    if value.chars().count() <= cols {
+        return value.to_string();
+    }
+    if cols == 0 {
+        return String::new();
+    }
+    let mut out: String = value.chars().take(cols - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Break `input` into the rows the inline editor draws, and locate the caret
+/// among them as `(row, column)`. Wrapping is by cell, not by word: the caret
+/// has to map to an exact position, and word breaks in a column this narrow
+/// would cost more than they buy.
+fn wrap_edit_rows(input: &str, cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    let mut col = 0usize;
+    let mut caret = (0usize, 0usize);
+    // The row the next character would land on is always drawn, so a value that
+    // ends exactly at the edge — or on a newline — still shows where typing
+    // continues.
+    for (idx, ch) in input.chars().enumerate() {
+        if idx == cursor {
+            caret = (rows.len(), col);
+        }
+        if ch == '\n' {
+            rows.push(std::mem::take(&mut row));
+            col = 0;
+        } else {
+            row.push(ch);
+            col += 1;
+            // A row filled to the edge closes here, so the next char — and a
+            // caret sitting on it — lands at the start of the next row.
+            if col == width {
+                rows.push(std::mem::take(&mut row));
+                col = 0;
+            }
+        }
+    }
+    if cursor >= input.chars().count() {
+        caret = (rows.len(), col);
+    }
+    rows.push(row);
+    (rows, caret.0, caret.1)
+}
+
+/// First of `total` rows to draw so that `caret_row` stays visible in a `max`-row
+/// window. Only scrolls once the caret would fall out the bottom.
+fn row_window_offset(total: usize, caret_row: usize, max: usize) -> usize {
+    if total <= max {
+        return 0;
+    }
+    caret_row
+        .saturating_sub(max - 1)
+        .min(total.saturating_sub(max))
+}
+
+/// First char of a single-line value to draw so the caret stays inside `width`.
+/// `len + 1` positions are reachable: the caret also sits one past the last char.
+fn hscroll_offset(len: usize, cursor: usize, width: usize) -> usize {
+    let width = width.max(1);
+    if len < width {
+        return 0;
+    }
+    cursor.saturating_sub(width - 1).min(len + 1 - width)
+}
+
+/// The row(s) of the field currently being typed into, plus the caret's cell
+/// relative to the overlay's inner area. `first_row` is where these rows land.
+///
+/// The value is drawn as an underlined well — an input field you can see the
+/// extent of — with the real terminal cursor inside it, which is what actually
+/// blinks. Rich text expands to as many rows as it needs (capped at
+/// `MAX_EDIT_ROWS`); everything else scrolls horizontally within its one row.
+fn edit_rows(
+    field: &FormField,
+    input: &str,
+    cursor: usize,
+    inner_width: u16,
+    first_row: u16,
+) -> (Vec<Line<'static>>, (u16, u16)) {
+    let col = value_col(&field.label, field.required);
+    let width = (inner_width as usize).saturating_sub(col).max(1);
+    let well = Style::default().add_modifier(Modifier::UNDERLINED);
+    let marker = Span::styled("▶ ", Style::default().fg(Color::Blue));
+    let label = Span::styled(
+        format!(
+            "{:<w$}",
+            format!("{}{}", field.label, if field.required { "*" } else { "" }),
+            w = label_cols(&field.label, field.required)
+        ),
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    if field.widget == WidgetKind::RichText {
+        let (rows, caret_row, caret_col) = wrap_edit_rows(input, cursor, width);
+        let offset = row_window_offset(rows.len(), caret_row, MAX_EDIT_ROWS);
+        let mut lines = Vec::new();
+        for (i, row) in rows.iter().skip(offset).take(MAX_EDIT_ROWS).enumerate() {
+            let text = Span::styled(format!("{row:<width$}"), well);
+            lines.push(if i == 0 {
+                Line::from(vec![marker.clone(), label.clone(), text])
+            } else {
+                Line::from(vec![Span::raw(" ".repeat(col)), text])
+            });
+        }
+        let caret = (
+            u16::try_from(col + caret_col).unwrap_or(u16::MAX),
+            first_row + u16::try_from(caret_row - offset).unwrap_or(0),
+        );
+        return (lines, caret);
+    }
+
+    let len = input.chars().count();
+    let offset = hscroll_offset(len, cursor, width);
+    let shown: String = input.chars().skip(offset).take(width).collect();
+    let line = Line::from(vec![
+        marker,
+        label,
+        Span::styled(format!("{shown:<width$}"), well),
+    ]);
+    let caret = (
+        u16::try_from(col + cursor.saturating_sub(offset)).unwrap_or(u16::MAX),
+        first_row,
+    );
+    (vec![line], caret)
 }
 
 pub fn render_create_issue_overlay(f: &mut Frame, app: &AppState) {
@@ -1225,6 +1499,12 @@ pub fn render_create_issue_overlay(f: &mut Frame, app: &AppState) {
     f.render_widget(Clear, area);
 
     let dim = form.picker.is_some();
+    // Typing into a field is a distinct mode, so it gets a distinct frame:
+    // blue border, and the title says which field has the keystrokes.
+    let editing_label = (!dim && form.mode == FormMode::Edit)
+        .then(|| form.focus.checked_sub(2).and_then(|i| form.fields.get(i)))
+        .flatten()
+        .map(|f| f.label.clone());
     let title_style = if dim {
         Style::default()
             .fg(theme::MUTED)
@@ -1232,78 +1512,44 @@ pub fn render_create_issue_overlay(f: &mut Frame, app: &AppState) {
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
+    let border_color = if dim {
+        theme::MUTED
+    } else if editing_label.is_some() {
+        Color::Blue
+    } else {
+        Color::Reset
+    };
+    let title = editing_label.as_ref().map_or_else(
+        || " New Issue ".to_string(),
+        |label| format!(" New Issue · editing {label} "),
+    );
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if dim { theme::MUTED } else { Color::Reset }))
-        .title(Span::styled(" New Issue ", title_style));
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(title, title_style));
     if !dim {
-        block = block.title_bottom(hints_line(form.mode));
+        block = block.title_bottom(hints_line(form.mode, editor_available(form)));
     }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(field_row(
-        "Project",
-        false,
-        &format!("{}  {}  ▾", form.project.key, form.project.name),
-        form.focus == 0 && !dim,
-        false,
-    ));
+    let (lines, caret) = form_lines(form, inner.width, dim);
 
-    let type_text = match &form.issuetypes {
-        CacheState::Loading | CacheState::Idle => "(loading types…)".to_string(),
-        CacheState::Failed(e) => format!("(failed: {e})"),
-        CacheState::Loaded(_) => form
-            .issuetype
-            .as_ref()
-            .map_or_else(|| "(select)  ▾".to_string(), |it| format!("{}  ▾", it.name)),
-    };
-    lines.push(field_row(
-        "Type",
-        true,
-        &type_text,
-        form.focus == 1 && !dim,
-        false,
-    ));
+    // No wrapping: every line above is exactly one screen row, which is what
+    // lets the caret's row be counted off the `lines` vector.
+    f.render_widget(Paragraph::new(lines), inner);
 
-    if let Some(status) = fields_status_line(form) {
-        lines.push(status);
-    }
-
-    for (i, field) in form.fields.iter().enumerate() {
-        let focused = form.focus == 2 + i && !dim;
-        lines.push(field_row(
-            &field.label,
-            field.required,
-            &field_value_display(field),
-            focused,
-            field.widget == WidgetKind::Unsupported,
+    // The terminal's own cursor is what blinks, so put it where the next
+    // keystroke will land. Suppressed while a picker covers the form.
+    if let Some((col, row)) = caret
+        && !dim
+        && row < inner.height
+    {
+        f.set_cursor_position((
+            inner.x + col.min(inner.width.saturating_sub(1)),
+            inner.y + row,
         ));
     }
-
-    // Spacer + error + Create button.
-    lines.push(Line::from(""));
-    if let Some(err) = &form.error {
-        lines.push(Line::from(Span::styled(
-            format!("  {err}"),
-            Style::default().fg(Color::Red),
-        )));
-    }
-    let btn_focused = form.focus == form.button_idx() && !dim;
-    let btn_style = if btn_focused {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Green)
-    };
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("  Create  ", btn_style),
-    ]));
-
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 
     if let Some(picker) = &form.picker {
         render_picker(f, form, picker, app.project_cache.is_pending());
@@ -1320,12 +1566,111 @@ pub fn render_create_issue_overlay(f: &mut Frame, app: &AppState) {
     }
 }
 
+/// Every row of the form, top to bottom, plus the caret's cell relative to the
+/// overlay's inner area when a field is being typed into. One field is one row
+/// (the form draws unwrapped) except the rich-text field being edited, which
+/// expands — so the caret's row is simply its index in the returned vector.
+fn form_lines(
+    form: &CreateForm,
+    inner_width: u16,
+    dim: bool,
+) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut caret: Option<(u16, u16)> = None;
+    let cols = |label: &str, required: bool| {
+        (inner_width as usize).saturating_sub(value_col(label, required))
+    };
+    lines.push(field_row(
+        "Project",
+        false,
+        &format!("{}  {}  ▾", form.project.key, form.project.name),
+        form.focus == 0 && !dim,
+        false,
+        cols("Project", false),
+    ));
+
+    let type_text = match &form.issuetypes {
+        CacheState::Loading | CacheState::Idle => "(loading types…)".to_string(),
+        CacheState::Failed(e) => format!("(failed: {e})"),
+        CacheState::Loaded(_) => form
+            .issuetype
+            .as_ref()
+            .map_or_else(|| "(select)  ▾".to_string(), |it| format!("{}  ▾", it.name)),
+    };
+    lines.push(field_row(
+        "Type",
+        true,
+        &type_text,
+        form.focus == 1 && !dim,
+        false,
+        cols("Type", true),
+    ));
+
+    if let Some((text, style)) = fields_status_line(form) {
+        push_wrapped(&mut lines, &text, style, inner_width);
+    }
+
+    for (i, field) in form.fields.iter().enumerate() {
+        let focused = form.focus == 2 + i && !dim;
+        let editing = focused && form.mode == FormMode::Edit;
+        let typed = match &field.value {
+            FieldValue::Text { input, cursor } | FieldValue::Number { input, cursor } => {
+                Some((input, *cursor))
+            }
+            _ => None,
+        };
+        // The row being typed into is drawn as a live input well; every other
+        // row is a one-line summary, multi-line bodies collapsed.
+        if let (true, Some((input, cursor))) = (editing, typed) {
+            let first_row = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+            let (rows, at) = edit_rows(field, input, cursor, inner_width, first_row);
+            lines.extend(rows);
+            caret = Some(at);
+        } else {
+            lines.push(field_row(
+                &field.label,
+                field.required,
+                &field_value_display(field),
+                focused,
+                field.widget == WidgetKind::Unsupported,
+                cols(&field.label, field.required),
+            ));
+        }
+    }
+
+    // Spacer + error + Create button.
+    lines.push(Line::from(""));
+    if let Some(err) = &form.error {
+        push_wrapped(
+            &mut lines,
+            err,
+            Style::default().fg(Color::Red),
+            inner_width,
+        );
+    }
+    let btn_focused = form.focus == form.button_idx() && !dim;
+    let btn_style = if btn_focused {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("  Create  ", btn_style),
+    ]));
+
+    (lines, caret)
+}
+
 fn field_row(
     label: &str,
     required: bool,
     value: &str,
     focused: bool,
     unsupported: bool,
+    value_cols: usize,
 ) -> Line<'static> {
     let marker = if focused { "▶ " } else { "  " };
     let label_owned = format!("{label}{}", if required { "*" } else { "" });
@@ -1345,11 +1690,16 @@ fn field_row(
     };
     Line::from(vec![
         Span::raw(marker.to_string()),
-        Span::styled(format!("{label_owned:<16}"), label_style),
-        Span::styled(value.to_string(), value_style),
+        Span::styled(
+            format!("{label_owned:<w$}", w = label_cols(label, required)),
+            label_style,
+        ),
+        Span::styled(elide(value, value_cols), value_style),
     ])
 }
 
+/// One-line summary of a field's value for a row that is not being typed into —
+/// the row being edited is drawn by `edit_rows` instead.
 fn field_value_display(field: &FormField) -> String {
     match (&field.widget, &field.value) {
         (WidgetKind::Text | WidgetKind::RichText, FieldValue::Text { input, .. })
@@ -1357,7 +1707,7 @@ fn field_value_display(field: &FormField) -> String {
             if input.is_empty() {
                 "—".to_string()
             } else {
-                input.replace('\n', "⏎")
+                collapse_lines(input)
             }
         }
         (WidgetKind::Date | WidgetKind::DateTime, FieldValue::Date { value }) => {
@@ -1379,6 +1729,20 @@ fn field_value_display(field: &FormField) -> String {
         (WidgetKind::Unsupported, _) => "(set in browser)".to_string(),
         _ => String::new(),
     }
+}
+
+/// One-line stand-in for a multi-line value: its first line plus a count of
+/// what is hidden, so a description written in `$EDITOR` does not take over the
+/// form.
+fn collapse_lines(input: &str) -> String {
+    let mut lines = input.lines();
+    let first = lines.next().unwrap_or_default();
+    let rest = input.lines().count().saturating_sub(1);
+    if rest == 0 {
+        return first.to_string();
+    }
+    let plural = if rest == 1 { "line" } else { "lines" };
+    format!("{first} … (+{rest} {plural})")
 }
 
 fn render_picker(f: &mut Frame, form: &CreateForm, picker: &CreatePicker, projects_loading: bool) {
@@ -1490,7 +1854,10 @@ fn render_user_picker(
     cursor: usize,
     searching: bool,
 ) {
-    let label = form.fields.get(field_idx).map_or("User", |f| f.label.as_str());
+    let label = form
+        .fields
+        .get(field_idx)
+        .map_or("User", |f| f.label.as_str());
     let title = if searching {
         format!(" {label} — /{query}\u{258f} ")
     } else if query.is_empty() {
@@ -1512,7 +1879,9 @@ fn render_user_picker(
         .iter()
         .map(user_row_label)
         .collect();
-    let note = search.is_some_and(|s| s.pending).then_some("(searching\u{2026})");
+    let note = search
+        .is_some_and(|s| s.pending)
+        .then_some("(searching\u{2026})");
     render_list(f, &title, &items, cursor, None, note, hints);
 }
 
@@ -1606,18 +1975,14 @@ fn render_list(
     }
 }
 
-fn hints_line(mode: FormMode) -> Line<'static> {
-    let spans = match mode {
+fn hints_line(mode: FormMode, editor: bool) -> Line<'static> {
+    let mut spans = match mode {
         FormMode::Nav => vec![
             Span::raw("┤ "),
             Span::styled("j/k", Style::default().fg(Color::Blue)),
             Span::raw(" move | "),
             Span::styled("↵", Style::default().fg(Color::Blue)),
             Span::raw(" edit/pick | "),
-            Span::styled("Alt+↵", Style::default().fg(Color::Green)),
-            Span::raw(" create | "),
-            Span::styled("q", Style::default().fg(Color::Magenta)),
-            Span::raw(" cancel ├──"),
         ],
         FormMode::Edit => vec![
             Span::raw("┤ "),
@@ -1625,12 +1990,30 @@ fn hints_line(mode: FormMode) -> Line<'static> {
             Span::raw(" next | "),
             Span::styled("Tab", Style::default().fg(Color::Blue)),
             Span::raw(" move | "),
-            Span::styled("Alt+↵", Style::default().fg(Color::Green)),
-            Span::raw(" create | "),
-            Span::styled("Esc", Style::default().fg(Color::Magenta)),
-            Span::raw(" done ├──"),
         ],
     };
+    if editor {
+        spans.push(Span::styled(
+            match mode {
+                FormMode::Nav => "e",
+                FormMode::Edit => "Ctrl+e",
+            },
+            Style::default().fg(Color::Blue),
+        ));
+        spans.push(Span::raw(" $EDITOR | "));
+    }
+    spans.push(Span::styled("Alt+↵", Style::default().fg(Color::Green)));
+    spans.push(Span::raw(" create | "));
+    match mode {
+        FormMode::Nav => {
+            spans.push(Span::styled("q", Style::default().fg(Color::Magenta)));
+            spans.push(Span::raw(" cancel ├──"));
+        }
+        FormMode::Edit => {
+            spans.push(Span::styled("Esc", Style::default().fg(Color::Magenta)));
+            spans.push(Span::raw(" done ├──"));
+        }
+    }
     Line::from(spans).alignment(Alignment::Right)
 }
 
@@ -1941,6 +2324,333 @@ mod tests {
 
     /// Reporter + assignee as createmeta returns them: `user` schema, no
     /// `allowedValues` (Jira omits them for user pickers).
+    fn text_form() -> CreateForm {
+        let mut form = base_form();
+        form.fields = vec![
+            FormField {
+                field_id: "summary".into(),
+                label: "Summary".into(),
+                required: true,
+                widget: WidgetKind::Text,
+                value: FieldValue::Text {
+                    input: String::new(),
+                    cursor: 0,
+                },
+                options: Vec::new(),
+            },
+            FormField {
+                field_id: "description".into(),
+                label: "Description".into(),
+                required: false,
+                widget: WidgetKind::RichText,
+                value: FieldValue::Text {
+                    input: String::new(),
+                    cursor: 0,
+                },
+                options: Vec::new(),
+            },
+            FormField {
+                field_id: "priority".into(),
+                label: "Priority".into(),
+                required: false,
+                widget: WidgetKind::Select,
+                value: FieldValue::SingleOption(None),
+                options: Vec::new(),
+            },
+        ];
+        form
+    }
+
+    #[test]
+    fn editor_is_offered_for_string_fields_only() {
+        let mut form = text_form();
+        for (focus, wanted) in [
+            (0, None),                 // project picker
+            (1, None),                 // issue type
+            (2, Some(0)),              // summary — Text
+            (3, Some(1)),              // description — RichText
+            (4, None),                 // priority — Select
+            (form.button_idx(), None), // Create button
+        ] {
+            form.focus = focus;
+            form.pending_editor = None;
+            request_editor(&mut form);
+            assert_eq!(form.pending_editor, wanted, "focus {focus}");
+            assert_eq!(editor_available(&form), wanted.is_some(), "focus {focus}");
+        }
+    }
+
+    #[test]
+    fn ctrl_e_leaves_edit_mode_and_requests_the_editor() {
+        let mut form = text_form();
+        form.focus = 3; // description
+        form.mode = FormMode::Edit;
+        handle_edit_mode_key(&mut form, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(form.mode, FormMode::Nav);
+        assert_eq!(form.pending_editor, Some(1));
+    }
+
+    #[test]
+    fn plain_e_in_edit_mode_is_just_a_character() {
+        let mut form = text_form();
+        form.focus = 3;
+        form.mode = FormMode::Edit;
+        handle_edit_mode_key(&mut form, KeyCode::Char('e'), KeyModifiers::NONE);
+        assert_eq!(form.mode, FormMode::Edit);
+        assert_eq!(form.pending_editor, None);
+        assert_eq!(field_value_display(&form.fields[1]), "e");
+    }
+
+    #[test]
+    fn editor_text_keeps_rich_text_line_breaks() {
+        let mut form = text_form();
+        apply_editor_text(&mut form, 1, "First line\n\n- a bullet");
+        let FieldValue::Text { ref input, cursor } = form.fields[1].value else {
+            panic!("description should stay a text value");
+        };
+        assert_eq!(input, "First line\n\n- a bullet");
+        assert_eq!(cursor, input.chars().count());
+    }
+
+    #[test]
+    fn editor_text_folds_line_breaks_in_single_line_fields() {
+        let mut form = text_form();
+        apply_editor_text(&mut form, 0, "Fix the\n  bug");
+        let FieldValue::Text { ref input, .. } = form.fields[0].value else {
+            panic!("summary should stay a text value");
+        };
+        assert_eq!(input, "Fix the bug");
+    }
+
+    #[test]
+    fn editor_text_can_clear_a_field() {
+        let mut form = text_form();
+        apply_editor_text(&mut form, 1, "written then wiped");
+        apply_editor_text(&mut form, 1, "");
+        let FieldValue::Text { ref input, cursor } = form.fields[1].value else {
+            panic!("description should stay a text value");
+        };
+        assert!(input.is_empty());
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn editor_text_ignores_a_field_that_is_gone() {
+        let mut form = text_form();
+        apply_editor_text(&mut form, 99, "nowhere");
+    }
+
+    #[test]
+    fn multi_line_values_collapse_to_one_row() {
+        let mut form = text_form();
+        apply_editor_text(&mut form, 1, "Steps to reproduce\n\n1. open\n2. crash");
+        assert_eq!(
+            field_value_display(&form.fields[1]),
+            "Steps to reproduce … (+3 lines)"
+        );
+    }
+
+    #[test]
+    fn single_line_values_collapse_to_themselves() {
+        let mut form = text_form();
+        apply_editor_text(&mut form, 0, "Fix the bug");
+        assert_eq!(field_value_display(&form.fields[0]), "Fix the bug");
+    }
+
+    #[test]
+    fn one_hidden_line_reads_singular() {
+        let mut form = text_form();
+        apply_editor_text(&mut form, 1, "first\nsecond");
+        assert_eq!(field_value_display(&form.fields[1]), "first … (+1 line)");
+    }
+
+    #[test]
+    fn caret_sits_after_the_typed_text() {
+        let (rows, row, col) = wrap_edit_rows("abc", 3, 10);
+        assert_eq!(rows, vec!["abc"]);
+        assert_eq!((row, col), (0, 3));
+    }
+
+    #[test]
+    fn caret_can_sit_mid_word() {
+        let (_, row, col) = wrap_edit_rows("abcdef", 2, 10);
+        assert_eq!((row, col), (0, 2));
+    }
+
+    #[test]
+    fn explicit_newlines_start_new_rows() {
+        let (rows, row, col) = wrap_edit_rows("ab\ncd", 4, 10);
+        assert_eq!(rows, vec!["ab", "cd"]);
+        // Cursor 4 is between 'c' and 'd' on the second row.
+        assert_eq!((row, col), (1, 1));
+    }
+
+    #[test]
+    fn a_trailing_newline_leaves_an_empty_row_to_type_into() {
+        let (rows, row, col) = wrap_edit_rows("ab\n", 3, 10);
+        assert_eq!(rows, vec!["ab", ""]);
+        assert_eq!((row, col), (1, 0));
+    }
+
+    #[test]
+    fn long_rows_wrap_at_the_field_width() {
+        let (rows, row, col) = wrap_edit_rows("abcdef", 6, 3);
+        assert_eq!(rows, vec!["abc", "def", ""]);
+        // A row filled to the edge pushes the caret onto the next row.
+        assert_eq!((row, col), (2, 0));
+    }
+
+    #[test]
+    fn caret_lands_on_the_wrapped_row_it_belongs_to() {
+        let (rows, row, col) = wrap_edit_rows("abcdef", 4, 3);
+        // The landing row is always drawn, wherever the caret happens to be.
+        assert_eq!(rows, vec!["abc", "def", ""]);
+        assert_eq!((row, col), (1, 1));
+    }
+
+    #[test]
+    fn an_empty_value_still_has_a_row_and_a_caret() {
+        let (rows, row, col) = wrap_edit_rows("", 0, 10);
+        assert_eq!(rows, vec![""]);
+        assert_eq!((row, col), (0, 0));
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_clamps_to_the_end() {
+        let (_, row, col) = wrap_edit_rows("ab", 99, 10);
+        assert_eq!((row, col), (0, 2));
+    }
+
+    #[test]
+    fn short_bodies_are_not_scrolled() {
+        assert_eq!(row_window_offset(3, 2, 8), 0);
+        assert_eq!(row_window_offset(8, 7, 8), 0);
+    }
+
+    #[test]
+    fn the_row_window_follows_the_caret_down_and_stops_at_the_end() {
+        assert_eq!(row_window_offset(20, 7, 8), 0);
+        assert_eq!(row_window_offset(20, 8, 8), 1);
+        assert_eq!(row_window_offset(20, 19, 8), 12);
+        // Never scrolls past the last row.
+        assert_eq!(row_window_offset(20, 25, 8), 12);
+    }
+
+    #[test]
+    fn single_line_values_scroll_only_once_they_outgrow_the_row() {
+        // 9 chars in a 10-wide row: the caret at the end still fits.
+        assert_eq!(hscroll_offset(9, 9, 10), 0);
+        // 10 chars: the caret one past the end needs a cell, so scroll by one.
+        assert_eq!(hscroll_offset(10, 10, 10), 1);
+        // Caret back at the start scrolls all the way back.
+        assert_eq!(hscroll_offset(30, 0, 10), 0);
+        // Mid-value: the caret sits on the last visible cell.
+        assert_eq!(hscroll_offset(30, 15, 10), 6);
+        // Never scrolls past the reachable end.
+        assert_eq!(hscroll_offset(30, 30, 10), 21);
+    }
+
+    #[test]
+    fn caret_column_accounts_for_the_label_column() {
+        let form = text_form();
+        let (rows, (col, row)) = edit_rows(&form.fields[0], "Fix", 3, 60, 4);
+        assert_eq!(rows.len(), 1);
+        // 2 marker cols + 16 label cols + 3 typed chars.
+        assert_eq!((col, row), (21, 4));
+    }
+
+    #[test]
+    fn a_long_label_pushes_the_value_column_right() {
+        let mut form = text_form();
+        form.fields[0].label = "A rather long field label".into();
+        let (_, (col, _)) = edit_rows(&form.fields[0], "", 0, 60, 0);
+        // 2 marker cols + 25 label chars + the required marker.
+        assert_eq!(col, 28);
+    }
+
+    #[test]
+    fn rich_text_grows_downwards_and_the_caret_follows() {
+        let form = text_form();
+        let (rows, (col, row)) = edit_rows(&form.fields[1], "one\ntwo", 7, 60, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((col, row), (18 + 3, 3));
+    }
+
+    #[test]
+    fn rich_text_never_grows_past_its_cap() {
+        let form = text_form();
+        let body = "x\n".repeat(40);
+        let cursor = body.chars().count();
+        let (rows, (_, row)) = edit_rows(&form.fields[1], &body, cursor, 60, 2);
+        assert_eq!(rows.len(), MAX_EDIT_ROWS);
+        // The caret stays on the last drawn row rather than running off-screen.
+        assert_eq!(row as usize, 2 + MAX_EDIT_ROWS - 1);
+    }
+
+    #[test]
+    fn values_too_wide_for_their_row_are_elided() {
+        assert_eq!(elide("short", 10), "short");
+        assert_eq!(elide("exactly-10", 10), "exactly-10");
+        assert_eq!(elide("far too long to fit", 10), "far too l…");
+        assert_eq!(elide("anything", 0), "");
+    }
+
+    #[test]
+    fn the_caret_row_counts_the_rows_above_it() {
+        let mut form = text_form();
+        form.mode = FormMode::Edit;
+        // Project and Type sit above the first field.
+        form.focus = 2; // Summary
+        assert_eq!(form_lines(&form, 60, false).1, Some((18, 2)));
+        form.focus = 3; // Description
+        assert_eq!(form_lines(&form, 60, false).1, Some((18, 3)));
+    }
+
+    #[test]
+    fn an_expanded_rich_text_field_pushes_the_rows_below_it_down() {
+        let mut form = text_form();
+        form.mode = FormMode::Edit;
+        form.focus = 3;
+        let plain = form_lines(&form, 60, false).0.len();
+
+        apply_editor_text(&mut form, 1, "one\ntwo\nthree");
+        let (lines, caret) = form_lines(&form, 60, false);
+        // Caret left at the end of "three", on the third row of the block.
+        assert_eq!(caret, Some((18 + 5, 5)));
+        // Two extra rows for the body; Priority, spacer and Create moved down.
+        assert_eq!(lines.len(), plain + 2);
+    }
+
+    #[test]
+    fn a_covered_form_draws_no_caret() {
+        let mut form = text_form();
+        form.mode = FormMode::Edit;
+        form.focus = 2;
+        assert!(form_lines(&form, 60, true).1.is_none());
+    }
+
+    #[test]
+    fn nav_mode_draws_no_caret() {
+        let mut form = text_form();
+        form.focus = 2;
+        assert!(form_lines(&form, 60, false).1.is_none());
+    }
+
+    #[test]
+    fn prose_wraps_on_word_boundaries() {
+        assert_eq!(wrap_words("one two three", 20), vec!["one two three"]);
+        assert_eq!(wrap_words("one two three", 7), vec!["one two", "three"]);
+        assert_eq!(wrap_words("", 10), vec![""]);
+    }
+
+    #[test]
+    fn a_word_too_long_to_fit_is_broken() {
+        assert_eq!(
+            wrap_words("ab abcdefghij", 4),
+            vec!["ab", "abcd", "efgh", "ij"]
+        );
+    }
+
     fn user_form(me: Option<UserField>) -> CreateForm {
         let mut form = base_form();
         form.current_user = me;
@@ -2103,7 +2813,10 @@ mod tests {
             account_id: None,
         };
         let rows = user_picker_rows(Some(&named("vpetrov")), "", &[named("vpetrov")]);
-        assert_eq!(row_labels(&rows), vec!["—  (leave to Jira)", "vpetrov  (me)"]);
+        assert_eq!(
+            row_labels(&rows),
+            vec!["—  (leave to Jira)", "vpetrov  (me)"]
+        );
     }
 
     /// The picker's cursor indexes the rows, so the row list and the value it
