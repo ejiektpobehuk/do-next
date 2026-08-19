@@ -1208,6 +1208,9 @@ fn auto_view_mode(item: &WorkItem, team_config: &TeamConfig) -> ViewMode {
     }
 }
 
+// One arm per event and no logic of its own: its length is the number of events,
+// which splitting it would not change.
+#[allow(clippy::too_many_lines)]
 pub fn update_state(app: &mut AppState, event: AppEvent) {
     match event {
         AppEvent::Tick => {
@@ -1334,6 +1337,10 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
 
         AppEvent::CreateLinkIssuesLoaded { token, result } => {
             apply_create_link_issues_loaded(app, token, result);
+        }
+
+        AppEvent::CreateLabelsLoaded { result } => {
+            apply_create_labels_loaded(app, result);
         }
     }
 }
@@ -1497,6 +1504,16 @@ fn apply_create_link_issues_loaded(
     search.pending = false;
     search.results = match result {
         Ok(issues) => CacheState::Loaded(issues),
+        Err(e) => CacheState::Failed(e.to_string()),
+    };
+}
+
+fn apply_create_labels_loaded(app: &mut AppState, result: Result<Vec<String>, anyhow::Error>) {
+    let ActionState::CreatingIssue(ref mut form) = app.action_state else {
+        return;
+    };
+    form.labels = match result {
+        Ok(labels) => CacheState::Loaded(labels),
         Err(e) => CacheState::Failed(e.to_string()),
     };
 }

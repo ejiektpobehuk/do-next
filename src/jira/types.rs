@@ -553,10 +553,22 @@ impl FieldSchema {
     pub fn is_system_parent(&self) -> bool {
         self.system.as_deref() == Some("parent")
     }
+
+    /// Whether this field holds labels: the system `labels` field, or a custom
+    /// field of the same type. Both are arrays of bare strings, which is what
+    /// separates them from the other `array` fields — a label is typed, not
+    /// chosen from `allowedValues`.
+    pub fn is_labels(&self) -> bool {
+        self.system.as_deref() == Some("labels")
+            || self.custom.as_deref() == Some(LABELS_CUSTOM_FIELD_TYPE)
+    }
 }
 
 /// Greenhopper's "Epic Link" custom-field type key.
 const EPIC_LINK_CUSTOM_FIELD_TYPE: &str = "com.pyxis.greenhopper.jira:gh-epic-link";
+
+/// The "Labels" custom-field type key.
+const LABELS_CUSTOM_FIELD_TYPE: &str = "com.atlassian.jira.plugin.system.customfieldtypes:labels";
 
 /// Custom-field type keys whose values are ADF documents.
 ///

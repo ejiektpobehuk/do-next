@@ -120,6 +120,12 @@ pub enum AppEvent {
         token: u64,
         result: Result<Vec<IssueRef>, anyhow::Error>,
     },
+    /// The site's labels, for the create form's labels chooser. Untokened like
+    /// `CreateLinkTypesLoaded`: they are site-wide, so no selection can make
+    /// them stale.
+    CreateLabelsLoaded {
+        result: Result<Vec<String>, anyhow::Error>,
+    },
 }
 
 #[derive(Debug)]

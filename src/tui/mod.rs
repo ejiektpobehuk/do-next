@@ -845,6 +845,10 @@ fn dispatch_create_metadata(
             form.needs_link_types_fetch = false;
             spawn_create_link_types(client.clone(), tx.clone());
         }
+        if form.needs_labels_fetch {
+            form.needs_labels_fetch = false;
+            spawn_create_labels(client.clone(), tx.clone());
+        }
         dispatch_user_search(form, client, tx);
         dispatch_epic_search(form, client, tx);
         dispatch_link_issue_search(form, client, tx);
@@ -931,6 +935,15 @@ fn spawn_create_link_types(client: JiraClient, tx: UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let result = client.issue_link_types().await;
         let _ = tx.send(AppEvent::CreateLinkTypesLoaded { result });
+    });
+}
+
+/// The site's labels, fetched whole the first time the labels chooser opens —
+/// the picker filters them itself, so there is no query to debounce.
+fn spawn_create_labels(client: JiraClient, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = client.all_labels().await;
+        let _ = tx.send(AppEvent::CreateLabelsLoaded { result });
     });
 }
 

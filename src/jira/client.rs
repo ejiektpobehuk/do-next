@@ -939,6 +939,63 @@ impl JiraClient {
             .collect())
     }
 
+    /// Every label in use on the site, as `/label` pages them.
+    ///
+    /// Fetched whole rather than queried per keystroke, because Jira has no
+    /// endpoint that searches labels the way a picker needs: `/label` cannot
+    /// filter at all, and the JQL autocomplete that can only matches a label's
+    /// *start*, so `DRI` would never turn up `Platform-DRI`. With the vocabulary
+    /// in hand the picker matches substrings itself.
+    ///
+    /// Capped at `MAX_PAGES`: past that a list is no longer something to pick
+    /// from, and typing the label out is unaffected either way.
+    pub async fn all_labels(&self) -> Result<Vec<String>> {
+        const PAGE: usize = 1000;
+        const MAX_PAGES: usize = 5;
+
+        #[derive(serde::Deserialize)]
+        struct LabelPage {
+            #[serde(default)]
+            values: Vec<String>,
+            /// Absent on older shapes; an empty page then ends the walk instead.
+            #[serde(rename = "isLast", default)]
+            is_last: bool,
+        }
+
+        let url = format!("{}/rest/api/3/label", self.base_url);
+        let max_results = PAGE.to_string();
+        let mut labels: Vec<String> = Vec::new();
+        for page in 0..MAX_PAGES {
+            let start_at = (page * PAGE).to_string();
+            self.maybe_refresh().await?;
+            let resp = crate::http::send_with_retry(
+                self.apply_auth(self.client.get(&url)).await.query(&[
+                    ("startAt", start_at.as_str()),
+                    ("maxResults", max_results.as_str()),
+                ]),
+            )
+            .await
+            .context("Failed to fetch labels")?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Labels failed {status}: {body}");
+            }
+
+            let body: LabelPage = resp
+                .json()
+                .await
+                .context("Failed to parse labels response")?;
+            let last = body.is_last || body.values.is_empty();
+            labels.extend(body.values.into_iter().filter(|l| !l.is_empty()));
+            if last {
+                break;
+            }
+        }
+        Ok(labels)
+    }
+
     /// The site's issue link types, in the order Jira returns them.
     ///
     /// Site-wide rather than per-project, so the create form fetches this once

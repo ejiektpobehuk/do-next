@@ -56,6 +56,10 @@ pub enum WidgetKind {
     /// every other widget its value does not go in `fields` — Jira only accepts
     /// links on create as `update.issuelinks` add operations.
     IssueLinks,
+    /// A labels field: any number of bare strings. The only multi-value widget
+    /// whose values are not drawn from `allowedValues` — the site's existing
+    /// labels are suggestions, and a new one is made by typing it.
+    Labels,
     /// A field type the TUI can't edit; read-only, blocks submit if required.
     Unsupported,
 }
@@ -90,6 +94,8 @@ pub enum FieldValue {
     Epic(Option<IssueRef>),
     /// The links to create alongside the issue, in the order they were added.
     IssueLinks(Vec<IssueLinkDraft>),
+    /// The labels to put on the issue, in the order they were added.
+    Labels(Vec<String>),
     Unsupported,
 }
 
@@ -156,9 +162,16 @@ pub enum CreatePicker {
         field_idx: usize,
         cursor: usize,
     },
+    /// Multi-value option chooser: components, versions, groups. Narrows its
+    /// options locally on `query` and toggles rows, exactly as the `Labels`
+    /// chooser does — the two are the same widget, differing only in that a
+    /// value the site has never seen can be made in the labels one by typing it.
     MultiSelect {
         field_idx: usize,
+        query: String,
+        query_cursor: usize,
         cursor: usize,
+        searching: bool,
     },
     Date {
         field_idx: usize,
@@ -209,6 +222,17 @@ pub enum CreatePicker {
         cursor: usize,
         searching: bool,
     },
+    /// Labels chooser: the labels on the draft, the site's own labels
+    /// (`CreateForm::labels`) narrowed by `query`, and a way to add `query`
+    /// itself. Shares its keys and its look with `MultiSelect`; the only chooser
+    /// where the query is both a filter and a value.
+    Labels {
+        field_idx: usize,
+        query: String,
+        query_cursor: usize,
+        cursor: usize,
+        searching: bool,
+    },
 }
 
 /// A row of the user picker. The list is more than the search results: it
@@ -240,6 +264,20 @@ pub enum LinkRow {
     /// Index into the field's link vector.
     Existing(usize),
     Add,
+}
+
+/// A row of the labels chooser: what the typed query would add, then the labels
+/// already on the draft, then the site's own. The draft's labels are listed
+/// separately because they need not be labels the site has seen — without that, a
+/// label just typed could never be found again to take off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelRow {
+    /// Add the typed query as a label the site has not seen before.
+    New(String),
+    /// A label already on the draft.
+    Chosen(String),
+    /// A label in use elsewhere on the site, not yet on the draft.
+    Known(String),
 }
 
 /// Debounced state of a server-backed picker's search (users, epics). Present
@@ -328,6 +366,13 @@ pub struct CreateForm {
     pub epic_search: Option<PickerSearch<IssueRef>>,
     /// Live state of the linked-issue chooser; `None` unless it is open.
     pub link_search: Option<PickerSearch<IssueRef>>,
+    /// The site's labels, fetched the first time the labels chooser opens. Like
+    /// `link_types` these are site-wide, so they survive a project change — and
+    /// the whole vocabulary is held because the chooser filters it locally.
+    ///
+    /// A custom labels field is offered this same list: `/label` knows only the
+    /// system field's vocabulary, and typing covers whatever it misses.
+    pub labels: CacheState<Vec<String>>,
     /// The site's link relations, fetched the first time the relation chooser
     /// opens. Site-wide, so unlike the searches it survives a project change.
     pub link_types: CacheState<Vec<LinkTypeChoice>>,
@@ -349,6 +394,7 @@ pub struct CreateForm {
     pub needs_field_fetch: bool,
     pub needs_projects_fetch: bool,
     pub needs_link_types_fetch: bool,
+    pub needs_labels_fetch: bool,
     pub error: Option<String>,
 }
 
@@ -367,6 +413,7 @@ impl CreateForm {
             user_search: None,
             epic_search: None,
             link_search: None,
+            labels: CacheState::Idle,
             link_types: CacheState::Idle,
             focus: 1, // start on Issue Type (project is pre-filled)
             mode: FormMode::Nav,
@@ -378,6 +425,7 @@ impl CreateForm {
             needs_field_fetch: false,
             needs_projects_fetch: false,
             needs_link_types_fetch: false,
+            needs_labels_fetch: false,
             error: None,
         }
     }
@@ -401,7 +449,8 @@ impl CreateForm {
         self.prefill = Prefill::Pending;
         // Assignable users and epics are both project-scoped, and the link
         // search falls back to the project when nothing is typed; the old
-        // matches no longer apply. `link_types` is site-wide and stays.
+        // matches no longer apply. `link_types` and `labels` are site-wide and
+        // stay.
         self.user_search = None;
         self.epic_search = None;
         self.link_search = None;
@@ -507,6 +556,9 @@ pub fn schema_to_widget(schema: &Value, has_options: bool, subtask: bool) -> Wid
             Some("option" | "version" | "component" | "group") => WidgetKind::MultiSelect,
             Some("user") if has_options => WidgetKind::MultiSelect,
             Some("issuelinks") => WidgetKind::IssueLinks,
+            // The only editable array of bare strings: every other one is some
+            // shape this form has no widget for.
+            Some("string") if field_schema.is_labels() => WidgetKind::Labels,
             _ => WidgetKind::Unsupported,
         },
         _ => WidgetKind::Unsupported,
@@ -574,6 +626,7 @@ fn initial_value(widget: WidgetKind) -> FieldValue {
         WidgetKind::User => FieldValue::User(None),
         WidgetKind::Epic => FieldValue::Epic(None),
         WidgetKind::IssueLinks => FieldValue::IssueLinks(Vec::new()),
+        WidgetKind::Labels => FieldValue::Labels(Vec::new()),
         WidgetKind::Unsupported => FieldValue::Unsupported,
     }
 }
@@ -763,6 +816,100 @@ fn field_links(form: &CreateForm, field_idx: usize) -> &[IssueLinkDraft] {
     }
 }
 
+/// The labels held by field `field_idx`, or an empty slice if it holds anything
+/// else.
+fn field_labels(form: &CreateForm, field_idx: usize) -> &[String] {
+    match form.fields.get(field_idx).map(|f| &f.value) {
+        Some(FieldValue::Labels(labels)) => labels.as_slice(),
+        _ => &[],
+    }
+}
+
+/// Rows of the labels chooser: the draft's labels and the site's `known` ones,
+/// both narrowed to those *containing* `query`.
+///
+/// Matching anywhere in the label rather than at its start is the point of
+/// filtering here instead of asking Jira: labels are compounds, so `DRI` has to
+/// find `Platform-DRI`, which no Jira endpoint will do.
+///
+/// The typed label leads, so what was just typed is under the cursor rather than
+/// below however many labels matched it. It is offered only when it is not
+/// already somewhere in the list, and never when it holds whitespace: Jira splits
+/// such a value into several labels, so what would be added is not what was
+/// typed.
+pub fn label_picker_rows(chosen: &[String], query: &str, known: &[String]) -> Vec<LabelRow> {
+    let q = query.trim();
+    let mut rows: Vec<LabelRow> = Vec::new();
+    if !q.is_empty()
+        && !q.contains(char::is_whitespace)
+        && !chosen.iter().any(|l| l == q)
+        && !known.iter().any(|l| l == q)
+    {
+        rows.push(LabelRow::New(q.to_string()));
+    }
+    let needle = q.to_lowercase();
+    let matches = |l: &str| needle.is_empty() || l.to_lowercase().contains(&needle);
+    rows.extend(
+        chosen
+            .iter()
+            .filter(|l| matches(l))
+            .cloned()
+            .map(LabelRow::Chosen),
+    );
+    rows.extend(
+        known
+            .iter()
+            .filter(|l| matches(l) && !chosen.iter().any(|c| c == *l))
+            .cloned()
+            .map(LabelRow::Known),
+    );
+    rows
+}
+
+/// A ticked box for what is on the draft, an empty one for what is not — the same
+/// marks the option chooser uses, since both toggle. The row that would make a
+/// label the site has never seen gets a `+` in the box instead: it is the one row
+/// that is an action rather than a value.
+fn label_row_label(row: &LabelRow) -> String {
+    match row {
+        LabelRow::New(l) => format!("[+] add \u{201c}{l}\u{201d}"),
+        LabelRow::Chosen(l) => format!("[\u{2713}] {l}"),
+        LabelRow::Known(l) => format!("[ ] {l}"),
+    }
+}
+
+fn label_row_value(row: &LabelRow) -> &str {
+    match row {
+        LabelRow::New(l) | LabelRow::Chosen(l) | LabelRow::Known(l) => l,
+    }
+}
+
+/// Rows of the option chooser: the indices of the `options` *containing* `query`,
+/// left in the order the site gave them.
+///
+/// Narrowed locally and by substring for the same reason as the labels chooser —
+/// a component named `api-gateway` has to be findable by `gateway`. What differs
+/// is the order: chosen options stay where they are rather than being gathered at
+/// the top, because every option is in this list already. A label need not be,
+/// which is the whole reason the labels chooser lists the draft's own separately.
+pub fn option_picker_rows(options: &[CreateOption], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    options
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| needle.is_empty() || o.label.to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Whether option `opt_idx` is on field `field_idx`.
+fn option_is_chosen(form: &CreateForm, field_idx: usize, opt_idx: usize) -> bool {
+    matches!(
+        form.fields.get(field_idx).map(|f| &f.value),
+        Some(FieldValue::MultiOption(set)) if set.contains(&opt_idx)
+    )
+}
+
 /// The `update.issuelinks` operation for one drafted link.
 ///
 /// Jira stores a link as an (inward, outward) pair, and an issue reads its own
@@ -809,6 +956,9 @@ fn field_payload_value(field: &FormField) -> Option<Value> {
         }
         (WidgetKind::User, FieldValue::User(Some(user))) => user_ref(user),
         (WidgetKind::Epic, FieldValue::Epic(Some(epic))) => Some(epic_ref(&field.field_id, epic)),
+        (WidgetKind::Labels, FieldValue::Labels(labels)) if !labels.is_empty() => Some(
+            Value::Array(labels.iter().map(|l| Value::String(l.clone())).collect()),
+        ),
         (WidgetKind::MultiSelect, FieldValue::MultiOption(set)) if !set.is_empty() => {
             let mut idxs: Vec<usize> = set.iter().copied().collect();
             idxs.sort_unstable();
@@ -1001,6 +1151,7 @@ fn activate_field(form: &mut CreateForm) {
         WidgetKind::User => open_user_picker(form, idx),
         WidgetKind::Epic => open_epic_picker(form, idx),
         WidgetKind::IssueLinks => open_links_picker(form, idx, 0),
+        WidgetKind::Labels => open_labels_picker(form, idx),
         WidgetKind::Unsupported => {}
     }
 }
@@ -1132,6 +1283,7 @@ fn form_is_dirty(form: &CreateForm) -> bool {
         // went and picked.
         FieldValue::Epic(epic) => epic.is_some(),
         FieldValue::IssueLinks(links) => !links.is_empty(),
+        FieldValue::Labels(labels) => !labels.is_empty(),
         // The prefilled reporter is not something the user typed, so it must
         // not trigger the discard prompt on an otherwise untouched form.
         FieldValue::User(_) | FieldValue::Unsupported => false,
@@ -1269,6 +1421,24 @@ fn open_link_issue_picker(form: &mut CreateForm, field_idx: usize, link_type: Li
     });
 }
 
+/// Open the labels chooser, asking for the site's labels the first time. A failed
+/// fetch is retried on the next open — the cache goes back to `Loading` so the
+/// picker is not stuck on an error it cannot clear. Typing a label works
+/// regardless of how that fetch goes.
+fn open_labels_picker(form: &mut CreateForm, field_idx: usize) {
+    if matches!(form.labels, CacheState::Idle | CacheState::Failed(_)) {
+        form.labels = CacheState::Loading;
+        form.needs_labels_fetch = true;
+    }
+    form.picker = Some(CreatePicker::Labels {
+        field_idx,
+        query: String::new(),
+        query_cursor: 0,
+        cursor: 0,
+        searching: false,
+    });
+}
+
 fn open_select_picker(form: &mut CreateForm, field_idx: usize) {
     let cursor = match form.fields.get(field_idx).map(|f| &f.value) {
         Some(FieldValue::SingleOption(Some(i))) => *i,
@@ -1280,7 +1450,10 @@ fn open_select_picker(form: &mut CreateForm, field_idx: usize) {
 fn open_multiselect_picker(form: &mut CreateForm, field_idx: usize) {
     form.picker = Some(CreatePicker::MultiSelect {
         field_idx,
+        query: String::new(),
+        query_cursor: 0,
         cursor: 0,
+        searching: false,
     });
 }
 
@@ -1362,6 +1535,19 @@ fn picker_link_issue_rows(form: &CreateForm) -> &[IssueRef] {
 /// Relations currently shown by the open relation chooser.
 fn picker_link_type_rows(form: &CreateForm) -> &[LinkTypeChoice] {
     form.link_types.loaded().map_or(&[], Vec::as_slice)
+}
+
+/// Rows currently shown by the open labels chooser.
+fn picker_label_rows(form: &CreateForm, field_idx: usize, query: &str) -> Vec<LabelRow> {
+    let known: &[String] = form.labels.loaded().map_or(&[], Vec::as_slice);
+    label_picker_rows(field_labels(form, field_idx), query, known)
+}
+
+/// Option indices currently shown by the open option chooser.
+fn picker_option_rows(form: &CreateForm, field_idx: usize, query: &str) -> Vec<usize> {
+    form.fields
+        .get(field_idx)
+        .map_or_else(Vec::new, |f| option_picker_rows(&f.options, query))
 }
 
 /// Key routing for the linked-issues list: edit a link's relation, remove one,
@@ -1556,6 +1742,178 @@ fn add_link(form: &mut CreateForm, field_idx: usize, link_type: LinkTypeChoice, 
     open_links_picker(form, field_idx, at);
 }
 
+/// Put `label` on field `field_idx`, or take it off. Insertion order is kept:
+/// it is the order the labels were added in, and Jira imposes its own anyway.
+fn set_label(form: &mut CreateForm, field_idx: usize, label: &str, on: bool) {
+    let Some(FieldValue::Labels(labels)) = form.fields.get_mut(field_idx).map(|f| &mut f.value)
+    else {
+        return;
+    };
+    match (labels.iter().position(|l| l == label), on) {
+        (None, true) => labels.push(label.to_string()),
+        (Some(at), false) => {
+            labels.remove(at);
+        }
+        _ => {}
+    }
+}
+
+/// Key routing for the labels chooser, shared move for move with the option
+/// chooser (`handle_multiselect_picker_key`): `/` filters locally like the project
+/// picker, Space toggles the highlighted row, `d` takes one off outright, and `q`
+/// returns to the form. Picking does not close: a field holding several labels
+/// would otherwise have to be reopened once per label.
+///
+/// What is only here is the top row while a query is typed — the offer to add a
+/// label the site has never seen. `/`, type it, Esc, Enter: the cursor comes back
+/// to row 0 on every keystroke, so that row is already under it.
+fn handle_labels_picker_key(form: &mut CreateForm, code: KeyCode, picker: CreatePicker) {
+    let CreatePicker::Labels {
+        field_idx,
+        mut query,
+        mut query_cursor,
+        mut cursor,
+        mut searching,
+    } = picker
+    else {
+        return;
+    };
+
+    if searching {
+        match code {
+            // Leave search mode but keep the query (and its filter) applied.
+            KeyCode::Esc | KeyCode::Enter => searching = false,
+            _ => {
+                let before = query.clone();
+                edit_text(&mut query, &mut query_cursor, code);
+                if query != before {
+                    cursor = 0;
+                }
+            }
+        }
+    } else {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => return, // picker taken → closed
+            KeyCode::Char('/') => searching = true,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(label) = picker_label_rows(form, field_idx, &query)
+                    .get(cursor)
+                    .map(|row| label_row_value(row).to_string())
+                {
+                    // Toggle, not add: the ticked box says the row is a switch,
+                    // so the key that ticked it has to untick it too. A `New` or
+                    // `Known` row is by definition not on the draft, so for those
+                    // this is the add it always was.
+                    let on = !field_labels(form, field_idx).contains(&label);
+                    set_label(form, field_idx, &label, on);
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                if let Some(label) = picker_label_rows(form, field_idx, &query)
+                    .get(cursor)
+                    .map(|row| label_row_value(row).to_string())
+                {
+                    set_label(form, field_idx, &label, false);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let count = picker_label_rows(form, field_idx, &query).len();
+                cursor = (cursor + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('k') => cursor = cursor.saturating_sub(1),
+            _ => {}
+        }
+        // Adding or removing reshapes the list under the cursor — a new label
+        // moves out of its own row, a removed one may leave the list entirely.
+        let count = picker_label_rows(form, field_idx, &query).len();
+        cursor = cursor.min(count.saturating_sub(1));
+    }
+
+    form.picker = Some(CreatePicker::Labels {
+        field_idx,
+        query,
+        query_cursor,
+        cursor,
+        searching,
+    });
+}
+
+/// Key routing for the option chooser: the labels chooser's keys over a fixed
+/// list of options. The list cannot grow here, so there is no row to add one —
+/// otherwise the two behave alike, down to `d` deselecting outright.
+fn handle_multiselect_picker_key(form: &mut CreateForm, code: KeyCode, picker: CreatePicker) {
+    let CreatePicker::MultiSelect {
+        field_idx,
+        mut query,
+        mut query_cursor,
+        mut cursor,
+        mut searching,
+    } = picker
+    else {
+        return;
+    };
+
+    if searching {
+        match code {
+            // Leave search mode but keep the query (and its filter) applied.
+            KeyCode::Esc | KeyCode::Enter => searching = false,
+            _ => {
+                let before = query.clone();
+                edit_text(&mut query, &mut query_cursor, code);
+                if query != before {
+                    cursor = 0;
+                }
+            }
+        }
+    } else {
+        // Toggling cannot reshape this list the way adding a label can, so the
+        // rows are read once and the cursor only needs clamping to their count.
+        let rows = picker_option_rows(form, field_idx, &query);
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => return, // picker taken → closed
+            KeyCode::Char('/') => searching = true,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(&opt) = rows.get(cursor) {
+                    let on = !option_is_chosen(form, field_idx, opt);
+                    set_option(form, field_idx, opt, on);
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                if let Some(&opt) = rows.get(cursor) {
+                    set_option(form, field_idx, opt, false);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                cursor = (cursor + 1).min(rows.len().saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('k') => cursor = cursor.saturating_sub(1),
+            _ => {}
+        }
+        cursor = cursor.min(rows.len().saturating_sub(1));
+    }
+
+    form.picker = Some(CreatePicker::MultiSelect {
+        field_idx,
+        query,
+        query_cursor,
+        cursor,
+        searching,
+    });
+}
+
+/// Put option `opt_idx` on field `field_idx`, or take it off.
+fn set_option(form: &mut CreateForm, field_idx: usize, opt_idx: usize, on: bool) {
+    let Some(FieldValue::MultiOption(set)) = form.fields.get_mut(field_idx).map(|f| &mut f.value)
+    else {
+        return;
+    };
+    if on {
+        set.insert(opt_idx);
+    } else {
+        set.remove(&opt_idx);
+    }
+}
+
 /// Key routing for the epic chooser. Mirrors the user chooser: `/` types a
 /// query that goes to the server, Enter picks the highlighted row.
 fn handle_epic_picker_key(form: &mut CreateForm, code: KeyCode, picker: CreatePicker) {
@@ -1712,6 +2070,10 @@ fn handle_picker_input(app: &mut AppState, code: KeyCode, _modifiers: KeyModifie
             cursor,
         } => handle_link_type_picker_key(form, code, field_idx, editing, cursor),
         p @ CreatePicker::LinkIssue { .. } => handle_link_issue_picker_key(form, code, p),
+        // The two multi-value choosers: same keys, same look, and a labels
+        // field can grow the vocabulary it chooses from.
+        p @ CreatePicker::Labels { .. } => handle_labels_picker_key(form, code, p),
+        p @ CreatePicker::MultiSelect { .. } => handle_multiselect_picker_key(form, code, p),
         CreatePicker::Project {
             mut query,
             mut query_cursor,
@@ -1835,36 +2197,6 @@ fn handle_picker_input(app: &mut AppState, code: KeyCode, _modifiers: KeyModifie
                     }
                 }
                 _ => form.picker = Some(CreatePicker::Select { field_idx, cursor }),
-            }
-        }
-        CreatePicker::MultiSelect {
-            field_idx,
-            mut cursor,
-        } => {
-            let count = form.fields.get(field_idx).map_or(0, |f| f.options.len());
-            match code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
-                KeyCode::Down | KeyCode::Char('j') => {
-                    cursor = (cursor + 1).min(count.saturating_sub(1));
-                    form.picker = Some(CreatePicker::MultiSelect { field_idx, cursor });
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    cursor = cursor.saturating_sub(1);
-                    form.picker = Some(CreatePicker::MultiSelect { field_idx, cursor });
-                }
-                KeyCode::Char(' ') => {
-                    if let Some(FieldValue::MultiOption(set)) =
-                        form.fields.get_mut(field_idx).map(|f| &mut f.value)
-                    {
-                        if set.contains(&cursor) {
-                            set.remove(&cursor);
-                        } else {
-                            set.insert(cursor);
-                        }
-                    }
-                    form.picker = Some(CreatePicker::MultiSelect { field_idx, cursor });
-                }
-                _ => form.picker = Some(CreatePicker::MultiSelect { field_idx, cursor }),
             }
         }
         CreatePicker::Date {
@@ -2341,11 +2673,20 @@ fn field_value_display(field: &FormField) -> String {
         (WidgetKind::Select, FieldValue::SingleOption(sel)) => sel
             .and_then(|i| field.options.get(i))
             .map_or_else(|| "(select)  ▾".to_string(), |o| format!("{}  ▾", o.label)),
+        // Named rather than counted, like the labels row below: `set` is
+        // unordered, so the site's own option order is what puts them in a row.
         (WidgetKind::MultiSelect, FieldValue::MultiOption(set)) => {
             if set.is_empty() {
-                "(none)  ▾".to_string()
+                "(none)  \u{25be}".to_string()
             } else {
-                format!("{} selected  ▾", set.len())
+                let chosen: Vec<&str> = field
+                    .options
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| set.contains(i))
+                    .map(|(_, o)| o.label.as_str())
+                    .collect();
+                format!("{}  \u{25be}", chosen.join(", "))
             }
         }
         (WidgetKind::User, FieldValue::User(user)) => user
@@ -2355,6 +2696,16 @@ fn field_value_display(field: &FormField) -> String {
             || "(none)  ▾".to_string(),
             |e| format!("{}  ▾", e.display()),
         ),
+        // Spelled out rather than counted, for the same reason as the options
+        // above: labels are short, and which ones they are is the whole content
+        // of the field. Overlong rows are elided.
+        (WidgetKind::Labels, FieldValue::Labels(labels)) => {
+            if labels.is_empty() {
+                "(none)  \u{25be}".to_string()
+            } else {
+                format!("{}  \u{25be}", labels.join(", "))
+            }
+        }
         (WidgetKind::IssueLinks, FieldValue::IssueLinks(links)) => match links.len() {
             0 => "(none)  ▾".to_string(),
             // One link fits, and reading "blocks OPS-42" beats reading "1 link".
@@ -2406,7 +2757,6 @@ fn render_picker(f: &mut Frame, form: &CreateForm, picker: &CreatePicker, projec
                 &title,
                 &items,
                 *cursor,
-                None,
                 projects_loading.then_some("(loading more…)"),
                 Some(project_picker_hints_line(*searching)),
             );
@@ -2417,11 +2767,11 @@ fn render_picker(f: &mut Frame, form: &CreateForm, picker: &CreatePicker, projec
                 .loaded()
                 .map(|v| v.iter().map(|it| it.name.clone()).collect())
                 .unwrap_or_default();
-            render_list(f, " Issue Type ", &items, *cursor, None, None, None);
+            render_list(f, " Issue Type ", &items, *cursor, None, None);
         }
         CreatePicker::Select { field_idx, cursor } => {
             let (title, items) = field_option_items(form, *field_idx);
-            render_list(f, &title, &items, *cursor, None, None, None);
+            render_list(f, &title, &items, *cursor, None, None);
         }
         CreatePicker::User {
             field_idx,
@@ -2452,14 +2802,20 @@ fn render_picker(f: &mut Frame, form: &CreateForm, picker: &CreatePicker, projec
             searching,
             ..
         } => render_link_issue_picker(f, form, link_type, query, *cursor, *searching),
-        CreatePicker::MultiSelect { field_idx, cursor } => {
-            let (title, items) = field_option_items(form, *field_idx);
-            let marks = match form.fields.get(*field_idx).map(|f| &f.value) {
-                Some(FieldValue::MultiOption(set)) => Some(set.clone()),
-                _ => None,
-            };
-            render_list(f, &title, &items, *cursor, marks.as_ref(), None, None);
-        }
+        CreatePicker::Labels {
+            field_idx,
+            query,
+            cursor,
+            searching,
+            ..
+        } => render_labels_picker(f, form, *field_idx, query, *cursor, *searching),
+        CreatePicker::MultiSelect {
+            field_idx,
+            query,
+            cursor,
+            searching,
+            ..
+        } => render_multiselect_picker(f, form, *field_idx, query, *cursor, *searching),
         CreatePicker::Date { field_idx, picker } => {
             let area = crate::tui::render::centered_rect(40, 50, f.area());
             let label = form
@@ -2555,7 +2911,7 @@ fn render_user_picker(
     // A failed search would otherwise leave an unexplained one-row list.
     if let Some(CacheState::Failed(e)) = search.map(|s| &s.results) {
         let items = [format!("(user search failed: {e})")];
-        render_list(f, &title, &items, 0, None, None, hints);
+        render_list(f, &title, &items, 0, None, hints);
         return;
     }
 
@@ -2566,7 +2922,7 @@ fn render_user_picker(
     let note = search
         .is_some_and(|s| s.pending)
         .then_some("(searching\u{2026})");
-    render_list(f, &title, &items, cursor, None, note, hints);
+    render_list(f, &title, &items, cursor, note, hints);
 }
 
 /// The epic chooser. Like the user chooser its list is server-side, so it
@@ -2596,7 +2952,7 @@ fn render_epic_picker(
     // A failed search would otherwise leave an unexplained one-row list.
     if let Some(CacheState::Failed(e)) = search.map(|s| &s.results) {
         let items = [format!("(epic search failed: {e})")];
-        render_list(f, &title, &items, 0, None, None, hints);
+        render_list(f, &title, &items, 0, None, hints);
         return;
     }
 
@@ -2604,7 +2960,7 @@ fn render_epic_picker(
     let note = search
         .is_some_and(|s| s.pending)
         .then_some("(searching\u{2026})");
-    render_list(f, &title, &items, cursor, None, note, hints);
+    render_list(f, &title, &items, cursor, note, hints);
 }
 
 /// The links added so far, with the row that starts another one on top.
@@ -2626,7 +2982,6 @@ fn render_links_picker(f: &mut Frame, form: &CreateForm, field_idx: usize, curso
         &format!(" {label} "),
         &items,
         cursor,
-        None,
         None,
         Some(links_picker_hints_line()),
     );
@@ -2660,7 +3015,7 @@ fn render_link_type_picker(
         CacheState::Idle | CacheState::Loading => vec!["(loading link types…)".to_string()],
         CacheState::Loaded(choices) => choices.iter().map(|c| c.label.clone()).collect(),
     };
-    render_list(f, &title, &items, cursor, None, None, None);
+    render_list(f, &title, &items, cursor, None, None);
 }
 
 /// The issue chooser for a link being added. Server-backed like the epic
@@ -2685,7 +3040,7 @@ fn render_link_issue_picker(
 
     if let Some(CacheState::Failed(e)) = search.map(|s| &s.results) {
         let items = [format!("(issue search failed: {e})")];
-        render_list(f, &title, &items, 0, None, None, hints);
+        render_list(f, &title, &items, 0, None, hints);
         return;
     }
 
@@ -2696,7 +3051,103 @@ fn render_link_issue_picker(
     let note = search
         .is_some_and(|s| s.pending)
         .then_some("(searching\u{2026})");
-    render_list(f, &title, &items, cursor, None, note, hints);
+    render_list(f, &title, &items, cursor, note, hints);
+}
+
+/// The labels chooser. Its list always has rows to show — the draft's own labels
+/// and whatever the query would add — so how the site's labels are doing is
+/// reported in the footer rather than in place of them: a failed fetch leaves the
+/// field perfectly usable, since a label can be typed.
+fn render_labels_picker(
+    f: &mut Frame,
+    form: &CreateForm,
+    field_idx: usize,
+    query: &str,
+    cursor: usize,
+    searching: bool,
+) {
+    let label = form
+        .fields
+        .get(field_idx)
+        .map_or("Labels", |f| f.label.as_str());
+    let title = picker_title(label, query, searching);
+    // Why the typed query is not on offer, if it is not; then how the site's own
+    // labels are doing.
+    let note: Option<String> = if query.trim().contains(char::is_whitespace) {
+        Some("(a label can\u{2019}t contain spaces)".to_string())
+    } else {
+        match &form.labels {
+            CacheState::Failed(e) => Some(format!("(the site\u{2019}s labels failed: {e})")),
+            CacheState::Idle | CacheState::Loading => Some("(loading labels\u{2026})".to_string()),
+            CacheState::Loaded(_) => None,
+        }
+    };
+
+    let items: Vec<String> = picker_label_rows(form, field_idx, query)
+        .iter()
+        .map(label_row_label)
+        .collect();
+    render_list(
+        f,
+        &title,
+        &items,
+        cursor,
+        note.as_deref(),
+        Some(toggle_picker_hints_line(searching, true)),
+    );
+}
+
+/// Title of a locally-filtered chooser: the field, then the query it is narrowed
+/// to, with a caret on it while it is being typed.
+fn picker_title(label: &str, query: &str, searching: bool) -> String {
+    if searching {
+        format!(" {label} — /{query}\u{258f} ")
+    } else if query.is_empty() {
+        format!(" {label} ")
+    } else {
+        format!(" {label} — /{query} ")
+    }
+}
+
+/// The option chooser, drawn like the labels chooser: same title, same ticked
+/// boxes, same footer. Only its rows differ — a fixed list, narrowed by `query`,
+/// with nothing to add.
+fn render_multiselect_picker(
+    f: &mut Frame,
+    form: &CreateForm,
+    field_idx: usize,
+    query: &str,
+    cursor: usize,
+    searching: bool,
+) {
+    let label = form
+        .fields
+        .get(field_idx)
+        .map_or("Options", |f| f.label.as_str());
+    let rows = picker_option_rows(form, field_idx, query);
+    let options = form.fields.get(field_idx).map_or(&[][..], |f| &f.options);
+    let items: Vec<String> = rows
+        .iter()
+        .map(|&i| {
+            let check = if option_is_chosen(form, field_idx, i) {
+                "[\u{2713}] "
+            } else {
+                "[ ] "
+            };
+            format!("{check}{}", options[i].label)
+        })
+        .collect();
+    // A query that matches nothing reads as an empty field unless it says so.
+    let note = (items.is_empty() && !options.is_empty())
+        .then(|| format!("(nothing matches \u{201c}{}\u{201d})", query.trim()));
+    render_list(
+        f,
+        &picker_title(label, query, searching),
+        &items,
+        cursor,
+        note.as_deref(),
+        Some(toggle_picker_hints_line(searching, false)),
+    );
 }
 
 fn field_option_items(form: &CreateForm, field_idx: usize) -> (String, Vec<String>) {
@@ -2712,13 +3163,13 @@ fn field_option_items(form: &CreateForm, field_idx: usize) -> (String, Vec<Strin
 }
 
 /// Shared picker list. `loading_note` is the footer shown under the list
-/// while more rows are on their way.
+/// while more rows are on their way. Rows arrive ready to draw — the choosers
+/// that tick boxes put the box in the row text.
 fn render_list(
     f: &mut Frame,
     title: &str,
     items: &[String],
     cursor: usize,
-    marks: Option<&HashSet<usize>>,
     loading_note: Option<&str>,
     hints: Option<Line<'static>>,
 ) {
@@ -2730,7 +3181,7 @@ fn render_list(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::BORDER_FOCUS))
         .title(title.to_string())
-        .title_bottom(hints.unwrap_or_else(|| picker_hints_line(marks.is_some())));
+        .title_bottom(hints.unwrap_or_else(picker_hints_line));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2757,16 +3208,7 @@ fn render_list(
     } else {
         let list_items: Vec<ListItem> = items
             .iter()
-            .enumerate()
-            .map(|(i, label)| {
-                marks.map_or_else(
-                    || ListItem::new(Line::from(label.clone())),
-                    |set| {
-                        let check = if set.contains(&i) { "[✓] " } else { "[ ] " };
-                        ListItem::new(Line::from(format!("{check}{label}")))
-                    },
-                )
-            })
+            .map(|label| ListItem::new(Line::from(label.clone())))
             .collect();
         let mut state = ListState::default();
         state.select(Some(cursor.min(items.len().saturating_sub(1))));
@@ -2793,8 +3235,8 @@ fn hints_line(mode: FormMode, editor: bool) -> Line<'static> {
     let mut spans = match mode {
         FormMode::Nav => vec![
             Span::raw("┤ "),
-            Span::styled("j/k", Style::default().fg(Color::Blue)),
-            Span::raw(" move | "),
+            Span::styled("↕", Style::default().fg(Color::Blue)),
+            Span::raw(" | "),
             Span::styled("↵", Style::default().fg(Color::Blue)),
             Span::raw(" edit/pick | "),
         ],
@@ -2831,21 +3273,17 @@ fn hints_line(mode: FormMode, editor: bool) -> Line<'static> {
     Line::from(spans).alignment(Alignment::Right)
 }
 
-fn picker_hints_line(multi: bool) -> Line<'static> {
-    let mut spans = vec![
+fn picker_hints_line() -> Line<'static> {
+    Line::from(vec![
         Span::raw("┤ "),
-        Span::styled("j/k", Style::default().fg(Color::Blue)),
-        Span::raw(" nav | "),
-    ];
-    if multi {
-        spans.push(Span::styled("Space", Style::default().fg(Color::Blue)));
-        spans.push(Span::raw(" toggle | "));
-    }
-    spans.push(Span::styled("↵", Style::default().fg(Color::Green)));
-    spans.push(Span::raw(if multi { " done | " } else { " select | " }));
-    spans.push(Span::styled("q", Style::default().fg(Color::Magenta)));
-    spans.push(Span::raw(" back ├──"));
-    Line::from(spans).alignment(Alignment::Right)
+        Span::styled("↕", Style::default().fg(Color::Blue)),
+        Span::raw(" | "),
+        Span::styled("↵", Style::default().fg(Color::Green)),
+        Span::raw(" select | "),
+        Span::styled("q", Style::default().fg(Color::Magenta)),
+        Span::raw(" back ├──"),
+    ])
+    .alignment(Alignment::Right)
 }
 
 /// Footer of the linked-issues list. `d` removes rather than Space toggling:
@@ -2853,8 +3291,8 @@ fn picker_hints_line(multi: bool) -> Line<'static> {
 fn links_picker_hints_line() -> Line<'static> {
     Line::from(vec![
         Span::raw("┤ "),
-        Span::styled("j/k", Style::default().fg(Color::Blue)),
-        Span::raw(" nav | "),
+        Span::styled("↕", Style::default().fg(Color::Blue)),
+        Span::raw(" | "),
         Span::styled("↵", Style::default().fg(Color::Blue)),
         Span::raw(" relation | "),
         Span::styled("n", Style::default().fg(Color::Green)),
@@ -2865,6 +3303,45 @@ fn links_picker_hints_line() -> Line<'static> {
         Span::raw(" back ├──"),
     ])
     .alignment(Alignment::Right)
+}
+
+/// Footer of the two multi-value choosers. Neither closes on a pick, so `q` is
+/// the way out and Space is hinted as the toggle — Enter does the same, and `d`
+/// deselects outright, but one key per action is what keeps this readable.
+///
+/// `creates` is the labels flavour: there, typing is not only a filter but the way
+/// to name a label the site has never seen, and the footer says so.
+fn toggle_picker_hints_line(searching: bool, creates: bool) -> Line<'static> {
+    let spans = if searching {
+        vec![
+            Span::raw("┤ "),
+            Span::styled("type", Style::default().fg(Color::Blue)),
+            Span::raw(if creates {
+                " a label | "
+            } else {
+                " to filter | "
+            }),
+            Span::styled("Esc", Style::default().fg(Color::Magenta)),
+            Span::raw(" to list ├──"),
+        ]
+    } else {
+        vec![
+            Span::raw("┤ "),
+            Span::styled("↕", Style::default().fg(Color::Blue)),
+            Span::raw(" | "),
+            Span::styled("/", Style::default().fg(Color::Blue)),
+            Span::raw(if creates {
+                " search or new | "
+            } else {
+                " search | "
+            }),
+            Span::styled("Space", Style::default().fg(Color::Green)),
+            Span::raw(" toggle | "),
+            Span::styled("q", Style::default().fg(Color::Magenta)),
+            Span::raw(" back ├──"),
+        ]
+    };
+    Line::from(spans).alignment(Alignment::Right)
 }
 
 fn project_picker_hints_line(searching: bool) -> Line<'static> {
@@ -2879,8 +3356,8 @@ fn project_picker_hints_line(searching: bool) -> Line<'static> {
     } else {
         vec![
             Span::raw("┤ "),
-            Span::styled("j/k", Style::default().fg(Color::Blue)),
-            Span::raw(" nav | "),
+            Span::styled("↕", Style::default().fg(Color::Blue)),
+            Span::raw(" | "),
             Span::styled("/", Style::default().fg(Color::Blue)),
             Span::raw(" search | "),
             Span::styled("↵", Style::default().fg(Color::Green)),
@@ -2994,6 +3471,19 @@ mod tests {
         assert_eq!(
             schema_to_widget(&epic_link_schema(), false, true),
             WidgetKind::Epic
+        );
+        assert_eq!(
+            schema_to_widget(&labels_schema(), false, false),
+            WidgetKind::Labels
+        );
+        assert_eq!(
+            schema_to_widget(&custom_labels_schema(), false, false),
+            WidgetKind::Labels
+        );
+        // An array of strings that is not labels is not something to type into.
+        assert_eq!(
+            schema_to_widget(&json!({ "type": "array", "items": "string" }), false, false),
+            WidgetKind::Unsupported
         );
         assert_eq!(
             schema_to_widget(&schema("timetracking"), false, false),
@@ -4479,5 +4969,452 @@ mod tests {
         assert_eq!(projects.len(), 2);
         assert_eq!(projects[0].key, "AAA");
         assert_eq!(projects[1].key, "BBB");
+    }
+
+    // ── Labels ────────────────────────────────────────────────────────────────
+
+    fn labels_schema() -> Value {
+        json!({ "type": "array", "items": "string", "system": "labels" })
+    }
+
+    fn custom_labels_schema() -> Value {
+        json!({
+            "type": "array", "items": "string",
+            "custom": "com.atlassian.jira.plugin.system.customfieldtypes:labels"
+        })
+    }
+
+    /// A form whose one field is `labels`, as createmeta describes it.
+    fn labels_form() -> CreateForm {
+        let mut form = base_form();
+        form.fields = parse_create_fields(
+            &[json!({
+                "fieldId": "labels", "name": "Labels", "required": false,
+                "schema": labels_schema()
+            })],
+            false,
+        );
+        form
+    }
+
+    /// Open the labels chooser with the site's labels already landed, as a form
+    /// whose fetch has come back looks.
+    fn open_labels_form(known: &[&str]) -> CreateForm {
+        let mut form = labels_form();
+        form.focus = 2;
+        activate_field(&mut form);
+        form.labels = CacheState::Loaded(known.iter().map(|s| (*s).to_string()).collect());
+        form.needs_labels_fetch = false;
+        form
+    }
+
+    /// Route `code` through the open labels chooser, as `handle_picker_input`
+    /// does: take the picker, then hand it on.
+    fn press_labels(form: &mut CreateForm, code: KeyCode) {
+        let picker = form.picker.take().expect("the labels chooser is not open");
+        handle_labels_picker_key(form, code, picker);
+    }
+
+    fn labels_of(form: &CreateForm) -> Vec<String> {
+        field_labels(form, 0).to_vec()
+    }
+
+    fn label_cursor(form: &CreateForm) -> usize {
+        match form.picker {
+            Some(CreatePicker::Labels { cursor, .. }) => cursor,
+            ref other => panic!("the labels chooser is not open: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_labels_field_starts_empty_and_is_left_out_of_the_payload() {
+        let form = labels_form();
+        assert_eq!(form.fields[0].widget, WidgetKind::Labels);
+        assert!(labels_of(&form).is_empty());
+        let payload = build_create_payload(&form).expect("valid");
+        assert!(payload["fields"].get("labels").is_none());
+        assert!(!form_is_dirty(&form));
+    }
+
+    #[test]
+    fn labels_submit_as_bare_strings_in_the_order_they_were_added() {
+        let mut form = labels_form();
+        form.fields[0].value = FieldValue::Labels(vec!["backend".into(), "tech-debt".into()]);
+        let payload = build_create_payload(&form).expect("valid");
+        assert_eq!(payload["fields"]["labels"], json!(["backend", "tech-debt"]));
+        assert!(form_is_dirty(&form), "an added label is unsaved work");
+    }
+
+    #[test]
+    fn a_required_labels_field_with_nothing_added_errors() {
+        let mut form = labels_form();
+        form.fields[0].required = true;
+        let err = build_create_payload(&form).expect_err("must not submit");
+        assert!(err.contains("Labels"), "{err}");
+    }
+
+    #[test]
+    fn rows_lead_with_the_typed_label_then_the_draft_then_the_sites_own() {
+        let rows = label_picker_rows(&["backend".into()], "back", &["backlog".into()]);
+        assert_eq!(
+            rows,
+            vec![
+                LabelRow::New("back".into()),
+                LabelRow::Chosen("backend".into()),
+                LabelRow::Known("backlog".into()),
+            ]
+        );
+        // An empty query has nothing to add, and hides nothing.
+        let rows = label_picker_rows(&["backend".into()], "", &["backlog".into()]);
+        assert_eq!(
+            rows,
+            vec![
+                LabelRow::Chosen("backend".into()),
+                LabelRow::Known("backlog".into()),
+            ]
+        );
+    }
+
+    /// The bug that sent this to a local filter: Jira's own label autocomplete
+    /// only matches the start of a label, so `DRI` never turned up `Platform-DRI`.
+    #[test]
+    fn a_query_matches_anywhere_in_a_label_not_just_at_its_start() {
+        let known = vec!["Platform-DRI".to_string(), "unrelated".to_string()];
+        assert_eq!(
+            label_picker_rows(&[], "DRI", &known),
+            vec![
+                LabelRow::New("DRI".into()),
+                LabelRow::Known("Platform-DRI".into()),
+            ]
+        );
+        // And case is no obstacle either.
+        assert_eq!(
+            label_picker_rows(&[], "dri", &known),
+            vec![
+                LabelRow::New("dri".into()),
+                LabelRow::Known("Platform-DRI".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_label_that_is_already_listed_is_not_offered_as_a_new_one() {
+        // Already on the draft.
+        assert_eq!(
+            label_picker_rows(&["backend".into()], "backend", &[]),
+            vec![LabelRow::Chosen("backend".into())]
+        );
+        // Already the site's — and one the draft also has is listed once.
+        assert_eq!(
+            label_picker_rows(&["backend".into()], "backend", &["backend".into()]),
+            vec![LabelRow::Chosen("backend".into())]
+        );
+    }
+
+    #[test]
+    fn a_label_with_a_space_in_it_is_not_offered() {
+        // Jira would split it in two, so what was typed is not what would land.
+        assert!(label_picker_rows(&[], "tech debt", &[]).is_empty());
+        // Surrounding space is just typing, and is trimmed off.
+        assert_eq!(
+            label_picker_rows(&[], "  backend ", &[]),
+            vec![LabelRow::New("backend".into())]
+        );
+    }
+
+    #[test]
+    fn the_query_narrows_the_draft_labels_as_well_as_the_sites_own() {
+        let rows = label_picker_rows(&["backend".into(), "ui".into()], "Back", &[]);
+        assert_eq!(
+            rows,
+            vec![
+                LabelRow::New("Back".into()),
+                LabelRow::Chosen("backend".into()),
+            ],
+            "matched case-insensitively, and `ui` is not a match"
+        );
+    }
+
+    #[test]
+    fn enter_adds_the_highlighted_label_and_the_chooser_stays_open() {
+        let mut form = open_labels_form(&["backend", "ui"]);
+        assert_eq!(labels_of(&form), Vec::<String>::new());
+
+        press_labels(&mut form, KeyCode::Enter);
+        assert_eq!(labels_of(&form), vec!["backend".to_string()]);
+        assert!(
+            form.picker.is_some(),
+            "a field taking several labels does not close on the first"
+        );
+
+        // The added label moved up into the draft's own rows; `ui` follows it.
+        press_labels(&mut form, KeyCode::Char('j'));
+        press_labels(&mut form, KeyCode::Char(' '));
+        assert_eq!(
+            labels_of(&form),
+            vec!["backend".to_string(), "ui".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_typed_label_the_site_has_never_seen_can_be_added() {
+        let mut form = open_labels_form(&["backend"]);
+        press_labels(&mut form, KeyCode::Char('/'));
+        for c in "flaky".chars() {
+            press_labels(&mut form, KeyCode::Char(c));
+        }
+        // Typing refilters the list, so the cursor is back on the top row —
+        // which is now the offer to add what was typed.
+        assert_eq!(label_cursor(&form), 0);
+
+        press_labels(&mut form, KeyCode::Enter); // leaves search mode
+        press_labels(&mut form, KeyCode::Enter); // adds
+        assert_eq!(labels_of(&form), vec!["flaky".to_string()]);
+    }
+
+    #[test]
+    fn d_removes_the_highlighted_label_and_keeps_the_cursor_on_a_row() {
+        let mut form = open_labels_form(&[]);
+        form.fields[0].value = FieldValue::Labels(vec!["backend".into(), "ui".into()]);
+
+        press_labels(&mut form, KeyCode::Char('j'));
+        assert_eq!(label_cursor(&form), 1);
+        press_labels(&mut form, KeyCode::Char('d'));
+        assert_eq!(labels_of(&form), vec!["backend".to_string()]);
+        assert_eq!(
+            label_cursor(&form),
+            0,
+            "the removed row is gone, so the cursor comes back to one that is not"
+        );
+
+        press_labels(&mut form, KeyCode::Char('d'));
+        assert!(labels_of(&form).is_empty());
+        assert_eq!(label_cursor(&form), 0, "an empty list still has a cursor");
+    }
+
+    #[test]
+    fn q_closes_the_chooser_and_keeps_what_was_added() {
+        let mut form = open_labels_form(&["backend"]);
+        press_labels(&mut form, KeyCode::Enter);
+        press_labels(&mut form, KeyCode::Char('q'));
+        assert!(form.picker.is_none());
+        assert_eq!(labels_of(&form), vec!["backend".to_string()]);
+        assert!(
+            form.labels.loaded().is_some(),
+            "the site's labels are site-wide, so they outlive the chooser"
+        );
+    }
+
+    /// The vocabulary is asked for once and kept: reopening the chooser — or
+    /// opening it on another field — must not spend a second fetch on it.
+    #[test]
+    fn the_sites_labels_are_fetched_once_and_reused() {
+        let mut form = labels_form();
+        form.focus = 2;
+        activate_field(&mut form);
+        assert!(form.needs_labels_fetch, "opening asks for the vocabulary");
+        assert!(matches!(form.labels, CacheState::Loading));
+
+        // The dispatcher takes the request, and the fetch lands.
+        form.needs_labels_fetch = false;
+        form.labels = CacheState::Loaded(vec!["backend".into()]);
+        press_labels(&mut form, KeyCode::Char('q'));
+        activate_field(&mut form);
+        assert!(!form.needs_labels_fetch, "already loaded, so not refetched");
+
+        // A failure, though, is worth another try on the next open.
+        press_labels(&mut form, KeyCode::Char('q'));
+        form.labels = CacheState::Failed("boom".into());
+        activate_field(&mut form);
+        assert!(form.needs_labels_fetch);
+    }
+    // ── Components and other multi-value option fields ────────────────────────
+
+    /// A form whose one field is a components-style chooser, with the chooser open.
+    fn open_components_form(options: &[&str]) -> CreateForm {
+        let mut form = base_form();
+        form.fields = vec![FormField {
+            field_id: "components".into(),
+            label: "Components".into(),
+            required: false,
+            widget: WidgetKind::MultiSelect,
+            value: FieldValue::MultiOption(HashSet::new()),
+            options: options
+                .iter()
+                .map(|o| CreateOption {
+                    label: (*o).to_string(),
+                    raw: json!({ "name": o }),
+                })
+                .collect(),
+        }];
+        form.focus = 2;
+        activate_field(&mut form);
+        form
+    }
+
+    fn press_options(form: &mut CreateForm, code: KeyCode) {
+        let picker = form.picker.take().expect("the option chooser is not open");
+        handle_multiselect_picker_key(form, code, picker);
+    }
+
+    /// The options on the field, named and in the site's order.
+    fn chosen_options(form: &CreateForm) -> Vec<String> {
+        match &form.fields[0].value {
+            FieldValue::MultiOption(set) => form.fields[0]
+                .options
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| set.contains(i))
+                .map(|(_, o)| o.label.clone())
+                .collect(),
+            ref other => panic!("not an option field: {other:?}"),
+        }
+    }
+
+    fn option_state(form: &CreateForm) -> (String, usize, bool) {
+        match form.picker {
+            Some(CreatePicker::MultiSelect {
+                ref query,
+                cursor,
+                searching,
+                ..
+            }) => (query.clone(), cursor, searching),
+            ref other => panic!("the option chooser is not open: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn space_toggles_an_option_and_the_chooser_stays_open() {
+        let mut form = open_components_form(&["api", "web"]);
+        press_options(&mut form, KeyCode::Char(' '));
+        assert_eq!(chosen_options(&form), vec!["api".to_string()]);
+        assert!(
+            form.picker.is_some(),
+            "a field taking several options does not close on the first"
+        );
+
+        // The same key takes it back off — that is what the ticked box promises.
+        press_options(&mut form, KeyCode::Char(' '));
+        assert!(chosen_options(&form).is_empty());
+
+        // Enter is the same toggle, so a pick needs no thought about which key.
+        press_options(&mut form, KeyCode::Enter);
+        press_options(&mut form, KeyCode::Char('j'));
+        press_options(&mut form, KeyCode::Enter);
+        assert_eq!(
+            chosen_options(&form),
+            vec!["api".to_string(), "web".to_string()]
+        );
+    }
+
+    #[test]
+    fn d_deselects_the_highlighted_option_outright() {
+        let mut form = open_components_form(&["api", "web"]);
+        press_options(&mut form, KeyCode::Char(' '));
+        press_options(&mut form, KeyCode::Char('d'));
+        assert!(chosen_options(&form).is_empty());
+        // On a row that is already off it is a no-op, not a toggle back on.
+        press_options(&mut form, KeyCode::Char('d'));
+        assert!(chosen_options(&form).is_empty());
+    }
+
+    /// The point of the search: a long component list is reachable by typing,
+    /// matching anywhere in the name as the labels chooser does.
+    #[test]
+    fn a_query_narrows_the_options_and_matches_anywhere_in_one() {
+        let options = vec![
+            CreateOption {
+                label: "api-gateway".into(),
+                raw: json!({}),
+            },
+            CreateOption {
+                label: "web".into(),
+                raw: json!({}),
+            },
+        ];
+        assert_eq!(option_picker_rows(&options, "gateway"), vec![0]);
+        assert_eq!(option_picker_rows(&options, "GATE"), vec![0]);
+        assert_eq!(option_picker_rows(&options, ""), vec![0, 1]);
+        assert!(option_picker_rows(&options, "nope").is_empty());
+    }
+
+    #[test]
+    fn searching_filters_the_rows_the_keys_then_act_on() {
+        let mut form = open_components_form(&["api", "web", "web-admin"]);
+        press_options(&mut form, KeyCode::Char('/'));
+        for c in "web".chars() {
+            press_options(&mut form, KeyCode::Char(c));
+        }
+        assert_eq!(option_state(&form), ("web".to_string(), 0, true));
+
+        // Esc leaves search mode with the query still narrowing the list, so the
+        // toggle lands on the first *match* rather than the first option.
+        press_options(&mut form, KeyCode::Esc);
+        assert_eq!(option_state(&form), ("web".to_string(), 0, false));
+        press_options(&mut form, KeyCode::Char('j'));
+        press_options(&mut form, KeyCode::Char(' '));
+        assert_eq!(chosen_options(&form), vec!["web-admin".to_string()]);
+
+        // And the cursor cannot walk past the matches.
+        press_options(&mut form, KeyCode::Char('j'));
+        assert_eq!(option_state(&form).1, 1);
+    }
+
+    #[test]
+    fn a_query_matching_nothing_leaves_the_keys_harmless() {
+        let mut form = open_components_form(&["api", "web"]);
+        press_options(&mut form, KeyCode::Char('/'));
+        for c in "zzz".chars() {
+            press_options(&mut form, KeyCode::Char(c));
+        }
+        press_options(&mut form, KeyCode::Esc);
+        press_options(&mut form, KeyCode::Char(' '));
+        press_options(&mut form, KeyCode::Char('d'));
+        press_options(&mut form, KeyCode::Char('j'));
+        assert!(chosen_options(&form).is_empty());
+        assert_eq!(option_state(&form).1, 0);
+    }
+
+    #[test]
+    fn q_closes_the_option_chooser_and_keeps_what_was_toggled() {
+        let mut form = open_components_form(&["api"]);
+        press_options(&mut form, KeyCode::Char(' '));
+        press_options(&mut form, KeyCode::Char('q'));
+        assert!(form.picker.is_none());
+        assert_eq!(chosen_options(&form), vec!["api".to_string()]);
+        assert!(form_is_dirty(&form), "a chosen option is unsaved work");
+    }
+
+    /// The two choosers are meant to be the same widget with one difference, so
+    /// the rows read the same: a ticked box for what is on the field.
+    #[test]
+    fn both_choosers_mark_a_chosen_row_the_same_way() {
+        assert_eq!(
+            label_row_label(&LabelRow::Chosen("backend".into())),
+            "[\u{2713}] backend"
+        );
+        assert_eq!(label_row_label(&LabelRow::Known("ui".into())), "[ ] ui");
+        // And only the labels chooser has a row that makes a new value.
+        assert_eq!(
+            label_row_label(&LabelRow::New("flaky".into())),
+            "[+] add \u{201c}flaky\u{201d}"
+        );
+    }
+
+    #[test]
+    fn a_chosen_option_shows_by_name_on_the_form_row() {
+        let mut form = open_components_form(&["api", "web"]);
+        press_options(&mut form, KeyCode::Char(' '));
+        press_options(&mut form, KeyCode::Char('j'));
+        press_options(&mut form, KeyCode::Char(' '));
+        assert_eq!(
+            field_value_display(&form.fields[0]),
+            format!("api, web  {}", '\u{25be}')
+        );
+        let empty = open_components_form(&["api"]);
+        assert_eq!(
+            field_value_display(&empty.fields[0]),
+            format!("(none)  {}", '\u{25be}')
+        );
     }
 }
