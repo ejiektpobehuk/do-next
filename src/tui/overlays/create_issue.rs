@@ -18,7 +18,9 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 
-use crate::jira::types::{FieldSchema, IssueTypeField, ProjectField, ProjectInfo, UserField};
+use crate::jira::types::{
+    EpicRef, FieldSchema, IssueTypeField, ProjectField, ProjectInfo, UserField,
+};
 use crate::tui::app::{ActionState, AppState, CacheState, edit_text};
 use crate::tui::overlays::datetime_picker::{
     self, DatetimePicker, DatetimePickerMode, TimeFocus, handle_date_key, handle_time_key,
@@ -47,6 +49,9 @@ pub enum WidgetKind {
     /// search here yet, so the only value it can take is the current user;
     /// `reporter` starts prefilled with them.
     User,
+    /// The issue's epic — the system `parent` link or the legacy Epic Link
+    /// custom field. Picked from a project-scoped search, like `User`.
+    Epic,
     /// A field type the TUI can't edit; read-only, blocks submit if required.
     Unsupported,
 }
@@ -77,6 +82,8 @@ pub enum FieldValue {
     MultiOption(HashSet<usize>),
     /// `None` means "leave to Jira" — for `reporter` that resolves to the creator.
     User(Option<UserField>),
+    /// `None` means the issue is created outside any epic.
+    Epic(Option<EpicRef>),
     Unsupported,
 }
 
@@ -125,6 +132,15 @@ pub enum CreatePicker {
         cursor: usize,
         searching: bool,
     },
+    /// Epic chooser. Server-backed in the same way as `User`, with its matches
+    /// in `CreateForm::epic_search`.
+    Epic {
+        field_idx: usize,
+        query: String,
+        query_cursor: usize,
+        cursor: usize,
+        searching: bool,
+    },
 }
 
 /// A row of the user picker. The list is more than the search results: it
@@ -139,14 +155,23 @@ pub enum UserRow {
     Found(UserField),
 }
 
-/// Debounced state of the user search backing the picker. Present only while
-/// a user picker is open; recreated on each open so results never leak from
-/// one field (or project) to the next.
+/// A row of the epic picker: the matches, led by a way to create the issue
+/// outside any epic. There is nothing to pin: unlike "me", no one epic is the
+/// likely answer.
 #[derive(Debug, Clone)]
-pub struct UserSearch {
+pub enum EpicRow {
+    Unset,
+    Found(EpicRef),
+}
+
+/// Debounced state of a server-backed picker's search (users, epics). Present
+/// only while such a picker is open; recreated on each open so results never
+/// leak from one field (or project) to the next.
+#[derive(Debug, Clone)]
+pub struct PickerSearch<T> {
     /// Query the picker last settled on, already sent or waiting out the debounce.
     pub query: String,
-    /// When `query` last changed. The dispatcher waits `USER_SEARCH_DEBOUNCE_MS`
+    /// When `query` last changed. The dispatcher waits `PICKER_SEARCH_DEBOUNCE_MS`
     /// past this before spending a request on a half-typed name. `None` for the
     /// opening query: it is empty and nobody is mid-word, so it goes at once.
     pub changed_at: Option<std::time::Instant>,
@@ -158,10 +183,10 @@ pub struct UserSearch {
     /// separate from `results` so the previous matches stay on screen while
     /// the next ones load, instead of the list blanking on every keystroke.
     pub pending: bool,
-    pub results: CacheState<Vec<UserField>>,
+    pub results: CacheState<Vec<T>>,
 }
 
-impl UserSearch {
+impl<T> PickerSearch<T> {
     const fn new(token: u64) -> Self {
         Self {
             query: String::new(),
@@ -216,7 +241,9 @@ pub struct CreateForm {
     /// Whether the reporter prefill has already run for the current field set.
     pub prefill: Prefill,
     /// Live state of the assignee/reporter chooser; `None` unless one is open.
-    pub user_search: Option<UserSearch>,
+    pub user_search: Option<PickerSearch<UserField>>,
+    /// Live state of the epic chooser; `None` unless it is open.
+    pub epic_search: Option<PickerSearch<EpicRef>>,
     /// Flat focus index: 0=project, 1=issue type, 2..=fields, last=Create button.
     pub focus: usize,
     pub mode: FormMode,
@@ -250,6 +277,7 @@ impl CreateForm {
             current_user: None,
             prefill: Prefill::Pending,
             user_search: None,
+            epic_search: None,
             focus: 1, // start on Issue Type (project is pre-filled)
             mode: FormMode::Nav,
             picker: None,
@@ -280,8 +308,10 @@ impl CreateForm {
         self.fields.clear();
         self.fields_state = CacheState::Idle;
         self.prefill = Prefill::Pending;
-        // Assignable users are project-scoped; the old matches no longer apply.
+        // Assignable users and epics are both project-scoped; the old matches
+        // no longer apply.
         self.user_search = None;
+        self.epic_search = None;
         self.focus = 1;
         self.mode = FormMode::Nav;
         self.meta_token += 1;
@@ -333,7 +363,9 @@ pub fn distinct_projects(items: &[crate::items::WorkItem]) -> Vec<ProjectField> 
 
 /// Map a Jira field `schema` object to a widget. `has_options` is whether the
 /// field carries `allowedValues` (decides how `user` fields are handled).
-pub fn schema_to_widget(schema: &Value, has_options: bool) -> WidgetKind {
+/// `subtask` is whether the issue type being created is a sub-task, whose
+/// `parent` is a standard issue and not something the epic picker can find.
+pub fn schema_to_widget(schema: &Value, has_options: bool, subtask: bool) -> WidgetKind {
     let ty = schema.get("type").and_then(Value::as_str).unwrap_or("");
     let items = schema.get("items").and_then(Value::as_str);
     let field_schema = FieldSchema {
@@ -347,6 +379,16 @@ pub fn schema_to_widget(schema: &Value, has_options: bool) -> WidgetKind {
             .and_then(Value::as_str)
             .map(str::to_string),
     };
+    // Checked ahead of `ty`: an epic link is spelled `issuelink` on Cloud and
+    // `any` on sites still carrying the Greenhopper field, and neither type is
+    // otherwise editable here.
+    if field_schema.is_epic_link() {
+        return if subtask && field_schema.is_system_parent() {
+            WidgetKind::Unsupported
+        } else {
+            WidgetKind::Epic
+        };
+    }
     match ty {
         "string" => {
             if field_schema.is_adf() {
@@ -412,6 +454,16 @@ fn user_ref(user: &UserField) -> Option<Value> {
     user.name.as_ref().map(|n| json!({ "name": n }))
 }
 
+/// How Jira wants an epic referenced. The system `parent` field takes an
+/// issue object; the legacy Epic Link custom field takes the bare key.
+fn epic_ref(field_id: &str, epic: &EpicRef) -> Value {
+    if field_id == "parent" {
+        json!({ "key": epic.key })
+    } else {
+        Value::String(epic.key.clone())
+    }
+}
+
 fn initial_value(widget: WidgetKind) -> FieldValue {
     match widget {
         WidgetKind::Text | WidgetKind::RichText => FieldValue::Text {
@@ -426,14 +478,16 @@ fn initial_value(widget: WidgetKind) -> FieldValue {
         WidgetKind::Select => FieldValue::SingleOption(None),
         WidgetKind::MultiSelect => FieldValue::MultiOption(HashSet::new()),
         WidgetKind::User => FieldValue::User(None),
+        WidgetKind::Epic => FieldValue::Epic(None),
         WidgetKind::Unsupported => FieldValue::Unsupported,
     }
 }
 
 /// Parse the raw createmeta field descriptors into renderable form fields.
 /// Required fields come first; `project` and `issuetype` are excluded (handled
-/// by the top-level selectors).
-pub fn parse_create_fields(values: &[Value]) -> Vec<FormField> {
+/// by the top-level selectors). `subtask` is passed through to
+/// [`schema_to_widget`].
+pub fn parse_create_fields(values: &[Value], subtask: bool) -> Vec<FormField> {
     let mut fields: Vec<FormField> = Vec::new();
     for v in values {
         let field_id = v
@@ -466,7 +520,7 @@ pub fn parse_create_fields(values: &[Value]) -> Vec<FormField> {
             })
             .unwrap_or_default();
 
-        let widget = schema_to_widget(&schema, !options.is_empty());
+        let widget = schema_to_widget(&schema, !options.is_empty(), subtask);
 
         fields.push(FormField {
             field_id,
@@ -552,6 +606,29 @@ const fn user_row_value(row: &UserRow) -> Option<&UserField> {
     }
 }
 
+/// Rows of the epic picker: the unset row, then whatever the search returned.
+/// The server already ordered the matches, so they are passed through as they
+/// came.
+pub fn epic_picker_rows(results: &[EpicRef]) -> Vec<EpicRow> {
+    let mut rows = vec![EpicRow::Unset];
+    rows.extend(results.iter().cloned().map(EpicRow::Found));
+    rows
+}
+
+fn epic_row_label(row: &EpicRow) -> String {
+    match row {
+        EpicRow::Unset => "—  (no epic)".to_string(),
+        EpicRow::Found(e) => e.display(),
+    }
+}
+
+const fn epic_row_value(row: &EpicRow) -> Option<&EpicRef> {
+    match row {
+        EpicRow::Unset => None,
+        EpicRow::Found(e) => Some(e),
+    }
+}
+
 /// The JSON value to emit for a field, or `None` if it should be omitted.
 fn field_payload_value(field: &FormField) -> Option<Value> {
     match (&field.widget, &field.value) {
@@ -575,6 +652,7 @@ fn field_payload_value(field: &FormField) -> Option<Value> {
             field.options.get(*i).map(|o| option_ref(&o.raw))
         }
         (WidgetKind::User, FieldValue::User(Some(user))) => user_ref(user),
+        (WidgetKind::Epic, FieldValue::Epic(Some(epic))) => Some(epic_ref(&field.field_id, epic)),
         (WidgetKind::MultiSelect, FieldValue::MultiOption(set)) if !set.is_empty() => {
             let mut idxs: Vec<usize> = set.iter().copied().collect();
             idxs.sort_unstable();
@@ -743,6 +821,7 @@ fn activate_field(form: &mut CreateForm) {
         WidgetKind::MultiSelect => open_multiselect_picker(form, idx),
         WidgetKind::Date | WidgetKind::DateTime => open_date_picker(form, idx),
         WidgetKind::User => open_user_picker(form, idx),
+        WidgetKind::Epic => open_epic_picker(form, idx),
         WidgetKind::Unsupported => {}
     }
 }
@@ -870,6 +949,9 @@ fn form_is_dirty(form: &CreateForm) -> bool {
         FieldValue::Date { value } => value.is_some(),
         FieldValue::SingleOption(opt) => opt.is_some(),
         FieldValue::MultiOption(set) => !set.is_empty(),
+        // An epic, unlike the prefilled reporter, is always something the user
+        // went and picked.
+        FieldValue::Epic(epic) => epic.is_some(),
         // The prefilled reporter is not something the user typed, so it must
         // not trigger the discard prompt on an otherwise untouched form.
         FieldValue::User(_) | FieldValue::Unsupported => false,
@@ -933,8 +1015,22 @@ fn open_issuetype_picker(form: &mut CreateForm) {
 /// that into a request for the project's assignable users.
 fn open_user_picker(form: &mut CreateForm, field_idx: usize) {
     let token = form.user_search.as_ref().map_or(1, |s| s.token + 1);
-    form.user_search = Some(UserSearch::new(token));
+    form.user_search = Some(PickerSearch::new(token));
     form.picker = Some(CreatePicker::User {
+        field_idx,
+        query: String::new(),
+        query_cursor: 0,
+        cursor: 0,
+        searching: false,
+    });
+}
+
+/// Open the epic chooser on an empty query — the dispatcher turns that into a
+/// request for the project's open epics, newest first.
+fn open_epic_picker(form: &mut CreateForm, field_idx: usize) {
+    let token = form.epic_search.as_ref().map_or(1, |s| s.token + 1);
+    form.epic_search = Some(PickerSearch::new(token));
+    form.picker = Some(CreatePicker::Epic {
         field_idx,
         query: String::new(),
         query_cursor: 0,
@@ -1015,6 +1111,82 @@ fn picker_user_rows(form: &CreateForm, query: &str) -> Vec<UserRow> {
     user_picker_rows(form.current_user.as_ref(), query, results)
 }
 
+/// Rows currently shown by the open epic picker.
+fn picker_epic_rows(form: &CreateForm) -> Vec<EpicRow> {
+    let results: &[EpicRef] = form
+        .epic_search
+        .as_ref()
+        .and_then(|s| s.results.loaded())
+        .map_or(&[], Vec::as_slice);
+    epic_picker_rows(results)
+}
+
+/// Key routing for the epic chooser. Mirrors the user chooser: `/` types a
+/// query that goes to the server, Enter picks the highlighted row.
+fn handle_epic_picker_key(form: &mut CreateForm, code: KeyCode, picker: CreatePicker) {
+    let CreatePicker::Epic {
+        field_idx,
+        mut query,
+        mut query_cursor,
+        mut cursor,
+        mut searching,
+    } = picker
+    else {
+        return;
+    };
+
+    if searching {
+        match code {
+            // Leave search mode but keep the query (and its matches) applied.
+            KeyCode::Esc | KeyCode::Enter => searching = false,
+            _ => {
+                let before = query.clone();
+                edit_text(&mut query, &mut query_cursor, code);
+                if query != before {
+                    cursor = 0;
+                    if let Some(search) = form.epic_search.as_mut() {
+                        search.requery(query.clone());
+                    }
+                }
+            }
+        }
+    } else {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                form.epic_search = None;
+                return; // picker already taken → closed
+            }
+            KeyCode::Char('/') => searching = true,
+            KeyCode::Enter => {
+                let chosen = picker_epic_rows(form)
+                    .get(cursor)
+                    .map(|row| epic_row_value(row).cloned());
+                if let Some(epic) = chosen {
+                    if let Some(field) = form.fields.get_mut(field_idx) {
+                        field.value = FieldValue::Epic(epic);
+                    }
+                    form.epic_search = None;
+                    return;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let count = picker_epic_rows(form).len();
+                cursor = (cursor + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('k') => cursor = cursor.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    form.picker = Some(CreatePicker::Epic {
+        field_idx,
+        query,
+        query_cursor,
+        cursor,
+        searching,
+    });
+}
+
 /// Key routing for the assignee/reporter chooser. `picker` is the taken
 /// `CreatePicker::User`; leaving it dropped closes the chooser.
 fn handle_user_picker_key(form: &mut CreateForm, code: KeyCode, picker: CreatePicker) {
@@ -1091,9 +1263,10 @@ fn handle_picker_input(app: &mut AppState, code: KeyCode, _modifiers: KeyModifie
     };
 
     match picker {
-        // Split out: the user chooser is the only picker whose list comes from
-        // the server, so its keys also drive a search.
+        // Split out: these two are the pickers whose lists come from the
+        // server, so their keys also drive a search.
         p @ CreatePicker::User { .. } => handle_user_picker_key(form, code, p),
+        p @ CreatePicker::Epic { .. } => handle_epic_picker_key(form, code, p),
         CreatePicker::Project {
             mut query,
             mut query_cursor,
@@ -1733,6 +1906,10 @@ fn field_value_display(field: &FormField) -> String {
         (WidgetKind::User, FieldValue::User(user)) => user
             .as_ref()
             .map_or_else(|| "—".to_string(), |u| u.display().to_string()),
+        (WidgetKind::Epic, FieldValue::Epic(epic)) => epic.as_ref().map_or_else(
+            || "(none)  ▾".to_string(),
+            |e| format!("{}  ▾", e.display()),
+        ),
         (WidgetKind::Unsupported, _) => "(set in browser)".to_string(),
         _ => String::new(),
     }
@@ -1802,6 +1979,13 @@ fn render_picker(f: &mut Frame, form: &CreateForm, picker: &CreatePicker, projec
             searching,
             ..
         } => render_user_picker(f, form, *field_idx, query, *cursor, *searching),
+        CreatePicker::Epic {
+            field_idx,
+            query,
+            cursor,
+            searching,
+            ..
+        } => render_epic_picker(f, form, *field_idx, query, *cursor, *searching),
         CreatePicker::MultiSelect { field_idx, cursor } => {
             let (title, items) = field_option_items(form, *field_idx);
             let marks = match form.fields.get(*field_idx).map(|f| &f.value) {
@@ -1913,6 +2097,44 @@ fn render_user_picker(
         .iter()
         .map(user_row_label)
         .collect();
+    let note = search
+        .is_some_and(|s| s.pending)
+        .then_some("(searching\u{2026})");
+    render_list(f, &title, &items, cursor, None, note, hints);
+}
+
+/// The epic chooser. Like the user chooser its list is server-side, so it
+/// reports search progress and failure in place of the rows.
+fn render_epic_picker(
+    f: &mut Frame,
+    form: &CreateForm,
+    field_idx: usize,
+    query: &str,
+    cursor: usize,
+    searching: bool,
+) {
+    let label = form
+        .fields
+        .get(field_idx)
+        .map_or("Epic", |f| f.label.as_str());
+    let title = if searching {
+        format!(" {label} — /{query}\u{258f} ")
+    } else if query.is_empty() {
+        format!(" {label} ")
+    } else {
+        format!(" {label} — /{query} ")
+    };
+    let hints = Some(project_picker_hints_line(searching));
+    let search = form.epic_search.as_ref();
+
+    // A failed search would otherwise leave an unexplained one-row list.
+    if let Some(CacheState::Failed(e)) = search.map(|s| &s.results) {
+        let items = [format!("(epic search failed: {e})")];
+        render_list(f, &title, &items, 0, None, None, hints);
+        return;
+    }
+
+    let items: Vec<String> = picker_epic_rows(form).iter().map(epic_row_label).collect();
     let note = search
         .is_some_and(|s| s.pending)
         .then_some("(searching\u{2026})");
@@ -2111,7 +2333,7 @@ mod tests {
             json!({ "fieldId": "summary", "name": "Summary", "required": true,
                     "schema": { "type": "string", "system": "summary" } }),
         ];
-        let fields = parse_create_fields(&values);
+        let fields = parse_create_fields(&values, false);
         assert_eq!(fields.len(), 2);
         // Required summary sorted first.
         assert_eq!(fields[0].field_id, "summary");
@@ -2131,39 +2353,73 @@ mod tests {
             json!({ "fieldId": "summary", "name": "Summary", "required": true,
                     "schema": { "type": "string" } }),
         ];
-        let fields = parse_create_fields(&values);
+        let fields = parse_create_fields(&values, false);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].field_id, "summary");
     }
 
     #[test]
     fn schema_mapping_table() {
-        assert_eq!(schema_to_widget(&schema("string"), false), WidgetKind::Text);
         assert_eq!(
-            schema_to_widget(&json!({ "type": "string", "system": "description" }), false),
+            schema_to_widget(&schema("string"), false, false),
+            WidgetKind::Text
+        );
+        assert_eq!(
+            schema_to_widget(
+                &json!({ "type": "string", "system": "description" }),
+                false,
+                false
+            ),
             WidgetKind::RichText
         );
         assert_eq!(
-            schema_to_widget(&schema("number"), false),
+            schema_to_widget(&schema("number"), false, false),
             WidgetKind::Number
         );
-        assert_eq!(schema_to_widget(&schema("date"), false), WidgetKind::Date);
         assert_eq!(
-            schema_to_widget(&schema("datetime"), false),
+            schema_to_widget(&schema("date"), false, false),
+            WidgetKind::Date
+        );
+        assert_eq!(
+            schema_to_widget(&schema("datetime"), false, false),
             WidgetKind::DateTime
         );
         assert_eq!(
-            schema_to_widget(&schema("option"), true),
+            schema_to_widget(&schema("option"), true, false),
             WidgetKind::Select
         );
         assert_eq!(
-            schema_to_widget(&json!({ "type": "array", "items": "option" }), true),
+            schema_to_widget(&json!({ "type": "array", "items": "option" }), true, false),
             WidgetKind::MultiSelect
         );
-        assert_eq!(schema_to_widget(&schema("user"), true), WidgetKind::Select);
-        assert_eq!(schema_to_widget(&schema("user"), false), WidgetKind::User);
         assert_eq!(
-            schema_to_widget(&schema("timetracking"), false),
+            schema_to_widget(&schema("user"), true, false),
+            WidgetKind::Select
+        );
+        assert_eq!(
+            schema_to_widget(&schema("user"), false, false),
+            WidgetKind::User
+        );
+        assert_eq!(
+            schema_to_widget(&parent_schema(), false, false),
+            WidgetKind::Epic
+        );
+        assert_eq!(
+            schema_to_widget(&epic_link_schema(), false, false),
+            WidgetKind::Epic
+        );
+        // A sub-task's parent is a story, which this picker cannot find.
+        assert_eq!(
+            schema_to_widget(&parent_schema(), false, true),
+            WidgetKind::Unsupported
+        );
+        // The legacy Epic Link field always means an epic, sub-task or not.
+        assert_eq!(
+            schema_to_widget(&epic_link_schema(), false, true),
+            WidgetKind::Epic
+        );
+        assert_eq!(
+            schema_to_widget(&schema("timetracking"), false, false),
             WidgetKind::Unsupported
         );
     }
@@ -2175,7 +2431,7 @@ mod tests {
             "schema": { "type": "priority" },
             "allowedValues": [ { "id": "1", "name": "High" }, { "id": "2", "name": "Low" } ]
         })];
-        let fields = parse_create_fields(&values);
+        let fields = parse_create_fields(&values, false);
         assert_eq!(fields[0].widget, WidgetKind::Select);
         assert_eq!(fields[0].options.len(), 2);
         assert_eq!(fields[0].options[0].label, "High");
@@ -2193,6 +2449,7 @@ mod tests {
         form.issuetype = Some(IssueTypeField {
             id: "10001".into(),
             name: "Task".into(),
+            subtask: false,
         });
         form.fields_state = CacheState::Loaded(());
         form
@@ -2688,12 +2945,15 @@ mod tests {
     fn user_form(me: Option<UserField>) -> CreateForm {
         let mut form = base_form();
         form.current_user = me;
-        form.fields = parse_create_fields(&[
-            json!({ "fieldId": "reporter", "name": "Reporter", "required": false,
-                    "schema": { "type": "user", "system": "reporter" } }),
-            json!({ "fieldId": "assignee", "name": "Assignee", "required": false,
-                    "schema": { "type": "user", "system": "assignee" } }),
-        ]);
+        form.fields = parse_create_fields(
+            &[
+                json!({ "fieldId": "reporter", "name": "Reporter", "required": false,
+                        "schema": { "type": "user", "system": "reporter" } }),
+                json!({ "fieldId": "assignee", "name": "Assignee", "required": false,
+                        "schema": { "type": "user", "system": "assignee" } }),
+            ],
+            false,
+        );
         form
     }
 
@@ -2777,6 +3037,149 @@ mod tests {
         apply_reporter_prefill(&mut form);
         assert!(reporter_of(&form).is_none());
         assert_eq!(form.prefill, Prefill::Pending);
+    }
+
+    fn parent_schema() -> Value {
+        json!({ "type": "issuelink", "system": "parent" })
+    }
+
+    fn epic_link_schema() -> Value {
+        json!({ "type": "any", "custom": "com.pyxis.greenhopper.jira:gh-epic-link" })
+    }
+
+    fn epic(key: &str) -> EpicRef {
+        EpicRef {
+            key: key.into(),
+            summary: format!("{key} epic"),
+        }
+    }
+
+    /// A form whose one field is the epic link, in either spelling.
+    fn epic_form(field_id: &str, schema: Value) -> CreateForm {
+        let mut form = base_form();
+        form.fields = parse_create_fields(
+            &[
+                json!({ "fieldId": field_id, "name": "Parent", "required": false,
+                      "schema": schema }),
+            ],
+            false,
+        );
+        form
+    }
+
+    #[test]
+    fn epic_starts_unset_and_is_omitted_from_the_payload() {
+        let form = epic_form("parent", parent_schema());
+        assert_eq!(form.fields[0].widget, WidgetKind::Epic);
+        assert!(matches!(form.fields[0].value, FieldValue::Epic(None)));
+        let payload = build_create_payload(&form).expect("valid");
+        assert!(payload["fields"].get("parent").is_none());
+    }
+
+    #[test]
+    fn parent_field_submits_the_epic_as_an_issue_object() {
+        let mut form = epic_form("parent", parent_schema());
+        form.fields[0].value = FieldValue::Epic(Some(epic("PROJ-7")));
+        let payload = build_create_payload(&form).expect("valid");
+        assert_eq!(payload["fields"]["parent"], json!({ "key": "PROJ-7" }));
+    }
+
+    #[test]
+    fn legacy_epic_link_submits_the_bare_key() {
+        let mut form = epic_form("customfield_10014", epic_link_schema());
+        form.fields[0].value = FieldValue::Epic(Some(epic("PROJ-7")));
+        let payload = build_create_payload(&form).expect("valid");
+        assert_eq!(payload["fields"]["customfield_10014"], json!("PROJ-7"));
+    }
+
+    #[test]
+    fn epic_rows_lead_with_a_way_to_pick_none() {
+        let rows = epic_picker_rows(&[epic("PROJ-1"), epic("PROJ-2")]);
+        assert_eq!(rows.len(), 3);
+        assert!(epic_row_value(&rows[0]).is_none());
+        assert_eq!(epic_row_label(&rows[0]), "—  (no epic)");
+        assert_eq!(
+            epic_row_value(&rows[1]).map(|e| e.key.as_str()),
+            Some("PROJ-1")
+        );
+        assert_eq!(epic_row_label(&rows[1]), "PROJ-1  PROJ-1 epic");
+    }
+
+    /// Enter on a row writes it into the field and closes the picker; Enter on
+    /// the unset row clears it again.
+    #[test]
+    fn picking_an_epic_sets_the_field_and_closes_the_picker() {
+        let mut form = epic_form("parent", parent_schema());
+        form.focus = 2;
+        activate_field(&mut form);
+        assert!(matches!(form.picker, Some(CreatePicker::Epic { .. })));
+        assert!(form.epic_search.is_some(), "opening asks for the epics");
+
+        // The search lands, and the second row (first match) is chosen.
+        if let Some(search) = form.epic_search.as_mut() {
+            search.pending = false;
+            search.results = CacheState::Loaded(vec![epic("PROJ-7")]);
+        }
+        let picker = form.picker.take().expect("open");
+        handle_epic_picker_key(&mut form, KeyCode::Char('j'), picker);
+        let picker = form.picker.take().expect("still open");
+        handle_epic_picker_key(&mut form, KeyCode::Enter, picker);
+
+        assert!(form.picker.is_none(), "choosing closes the picker");
+        assert!(
+            form.epic_search.is_none(),
+            "matches do not outlive the picker"
+        );
+        assert!(matches!(
+            &form.fields[0].value,
+            FieldValue::Epic(Some(e)) if e.key == "PROJ-7"
+        ));
+        assert!(form_is_dirty(&form), "a chosen epic is unsaved work");
+
+        // Reopen and take the unset row: back to letting Jira decide.
+        form.focus = 2;
+        activate_field(&mut form);
+        let picker = form.picker.take().expect("open");
+        handle_epic_picker_key(&mut form, KeyCode::Enter, picker);
+        assert!(matches!(form.fields[0].value, FieldValue::Epic(None)));
+    }
+
+    #[test]
+    fn typing_in_the_epic_picker_requeries_under_a_fresh_token() {
+        let mut form = epic_form("parent", parent_schema());
+        form.focus = 2;
+        activate_field(&mut form);
+        let first_token = form.epic_search.as_ref().expect("open").token;
+
+        let picker = form.picker.take().expect("open");
+        handle_epic_picker_key(&mut form, KeyCode::Char('/'), picker);
+        let picker = form.picker.take().expect("open");
+        handle_epic_picker_key(&mut form, KeyCode::Char('p'), picker);
+
+        let search = form.epic_search.as_ref().expect("open");
+        assert_eq!(search.query, "p");
+        assert!(
+            search.token > first_token,
+            "stale responses must be droppable"
+        );
+        assert!(!search.spawned, "the dispatcher has yet to send it");
+        assert!(
+            search.changed_at.is_some(),
+            "a typed query waits out the debounce"
+        );
+    }
+
+    #[test]
+    fn switching_project_drops_epic_matches() {
+        let mut form = epic_form("parent", parent_schema());
+        form.focus = 2;
+        activate_field(&mut form);
+        form.set_project(ProjectField {
+            id: "10001".into(),
+            key: "OTHER".into(),
+            name: "Other".into(),
+        });
+        assert!(form.epic_search.is_none(), "epics are project-scoped");
     }
 
     #[test]
@@ -3057,6 +3460,7 @@ mod tests {
                     issuetype: IssueTypeField {
                         id: "1".into(),
                         name: "Task".into(),
+                        subtask: false,
                     },
                     project: ProjectField {
                         id: "1".into(),

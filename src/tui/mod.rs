@@ -142,7 +142,7 @@ async fn run_inner(
                 app.action_state,
                 crate::tui::app::ActionState::Searching { .. }
             )
-            || user_search_waiting(&app)
+            || create_search_waiting(&app)
         {
             if tick_handle
                 .as_ref()
@@ -322,12 +322,13 @@ fn hydrate_from_cache(app: &mut AppState, source_ids: &[String]) {
     }
 }
 
-/// Whether the create form's user chooser has a query waiting out its
-/// debounce. Nothing else would wake the loop to dispatch it: the last
-/// keystroke has already been handled.
-fn user_search_waiting(app: &AppState) -> bool {
+/// Whether one of the create form's server-backed choosers (user, epic) has a
+/// query waiting out its debounce. Nothing else would wake the loop to dispatch
+/// it: the last keystroke has already been handled.
+fn create_search_waiting(app: &AppState) -> bool {
     matches!(app.action_state, ActionState::CreatingIssue(ref form)
-        if form.user_search.as_ref().is_some_and(|s| !s.spawned))
+        if form.user_search.as_ref().is_some_and(|s| !s.spawned)
+            || form.epic_search.as_ref().is_some_and(|s| !s.spawned))
 }
 
 fn spawn_tick_task(tx: UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<()> {
@@ -840,12 +841,29 @@ fn dispatch_create_metadata(
             want_projects = true;
         }
         dispatch_user_search(form, client, tx);
+        dispatch_epic_search(form, client, tx);
     }
     if want_projects && app.project_cache.is_idle() {
         app.project_cache = crate::tui::app::CacheState::Loading;
         let team_idx = app.active_team_idx;
         spawn_projects_fetch(client.clone(), team_idx, tx.clone());
     }
+}
+
+/// The query and token of a picker search that is due to be sent — not already
+/// in flight, and settled for longer than the debounce. Marks it spawned, so a
+/// caller that gets a query owes it a request.
+fn take_due_query<T>(
+    search: &mut crate::tui::overlays::create_issue::PickerSearch<T>,
+) -> Option<(String, u64)> {
+    let still_typing = search
+        .changed_at
+        .is_some_and(|t| t.elapsed().as_millis() < PICKER_SEARCH_DEBOUNCE_MS);
+    if search.spawned || still_typing {
+        return None;
+    }
+    search.spawned = true;
+    Some((search.query.clone(), search.token))
 }
 
 /// Send the create form's user-picker query once it has stopped changing, so
@@ -856,22 +874,32 @@ fn dispatch_user_search(
     tx: &UnboundedSender<AppEvent>,
 ) {
     let project = form.project.key.clone();
-    let Some(search) = form.user_search.as_mut() else {
+    let Some((query, token)) = form.user_search.as_mut().and_then(take_due_query) else {
         return;
     };
-    let still_typing = search
-        .changed_at
-        .is_some_and(|t| t.elapsed().as_millis() < USER_SEARCH_DEBOUNCE_MS);
-    if search.spawned || still_typing {
-        return;
-    }
-    search.spawned = true;
-    let (query, token) = (search.query.clone(), search.token);
     let client = client.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
         let result = client.search_assignable_users(&project, &query).await;
         let _ = tx.send(AppEvent::CreateUsersLoaded { token, result });
+    });
+}
+
+/// Same debounce for the epic picker's query.
+fn dispatch_epic_search(
+    form: &mut crate::tui::overlays::create_issue::CreateForm,
+    client: &JiraClient,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let project = form.project.key.clone();
+    let Some((query, token)) = form.epic_search.as_mut().and_then(take_due_query) else {
+        return;
+    };
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = client.search_epics(&project, &query).await;
+        let _ = tx.send(AppEvent::CreateEpicsLoaded { token, result });
     });
 }
 
@@ -919,8 +947,9 @@ fn spawn_create_issue(
 
 const SEARCH_DEBOUNCE_MS: u128 = 250;
 
-/// Same idea for the create form's assignee/reporter chooser.
-const USER_SEARCH_DEBOUNCE_MS: u128 = 250;
+/// Same idea for the create form's server-backed choosers (assignee/reporter
+/// and epic).
+const PICKER_SEARCH_DEBOUNCE_MS: u128 = 250;
 
 /// How long a backlog rank move sits before dispatching to Jira, so rapid
 /// repeated moves of one issue collapse into a single API call.

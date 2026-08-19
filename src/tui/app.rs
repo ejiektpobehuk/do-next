@@ -1323,6 +1323,10 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
         AppEvent::CreateUsersLoaded { token, result } => {
             apply_create_users_loaded(app, token, result);
         }
+
+        AppEvent::CreateEpicsLoaded { token, result } => {
+            apply_create_epics_loaded(app, token, result);
+        }
     }
 }
 
@@ -1395,7 +1399,8 @@ fn apply_create_fields_loaded(
     }
     match result {
         Ok(values) => {
-            form.fields = crate::tui::overlays::create_issue::parse_create_fields(&values);
+            let subtask = form.issuetype.as_ref().is_some_and(|it| it.subtask);
+            form.fields = crate::tui::overlays::create_issue::parse_create_fields(&values, subtask);
             form.fields_state = CacheState::Loaded(());
             crate::tui::overlays::create_issue::apply_reporter_prefill(form);
             // Clamp focus to the new field/button range.
@@ -1427,6 +1432,27 @@ fn apply_create_users_loaded(
     search.pending = false;
     search.results = match result {
         Ok(users) => CacheState::Loaded(users),
+        Err(e) => CacheState::Failed(e.to_string()),
+    };
+}
+
+fn apply_create_epics_loaded(
+    app: &mut AppState,
+    token: u64,
+    result: Result<Vec<crate::jira::types::EpicRef>, anyhow::Error>,
+) {
+    let ActionState::CreatingIssue(ref mut form) = app.action_state else {
+        return;
+    };
+    let Some(search) = form.epic_search.as_mut() else {
+        return;
+    };
+    if token != search.token {
+        return; // the query moved on while this was in flight
+    }
+    search.pending = false;
+    search.results = match result {
+        Ok(epics) => CacheState::Loaded(epics),
         Err(e) => CacheState::Failed(e.to_string()),
     };
 }
@@ -5964,6 +5990,7 @@ mod tests {
                 issuetype: IssueTypeField {
                     id: "t1".into(),
                     name: "Task".into(),
+                    subtask: false,
                 },
                 project: ProjectField {
                     id: "p1".into(),

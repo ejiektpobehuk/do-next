@@ -94,6 +94,29 @@ impl UserField {
 pub struct IssueTypeField {
     pub id: String,
     pub name: String,
+    /// Whether this type is a sub-task. Its `parent` is a standard issue, not
+    /// an epic, so the create form must not offer the epic picker for it.
+    /// Absent from most payloads we deserialize; defaults to a standard type.
+    #[serde(default)]
+    pub subtask: bool,
+}
+
+/// An epic as the create form's picker needs it: the key is what goes into the
+/// payload, the summary is what identifies it on screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpicRef {
+    pub key: String,
+    pub summary: String,
+}
+
+impl EpicRef {
+    /// Key first: it is short, unique, and what the payload carries.
+    pub fn display(&self) -> String {
+        if self.summary.is_empty() {
+            return self.key.clone();
+        }
+        format!("{}  {}", self.key, self.summary)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -500,7 +523,29 @@ impl FieldSchema {
         matches!(self.system.as_deref(), Some("description" | "environment"))
             || self.custom.as_deref().is_some_and(is_adf_custom_field_type)
     }
+
+    /// Returns true when this field holds the issue's epic. Jira spells that
+    /// two ways: the system `parent` link on team-managed projects (and on
+    /// Cloud company-managed ones since the Epic Link retirement), and the
+    /// older Greenhopper "Epic Link" custom field everywhere else.
+    ///
+    /// For a sub-task `parent` is a standard issue rather than an epic; that
+    /// distinction lives with the issue type, not the schema, so callers pass
+    /// it in separately.
+    pub fn is_epic_link(&self) -> bool {
+        self.custom.as_deref() == Some(EPIC_LINK_CUSTOM_FIELD_TYPE)
+            || (self.ty == "issuelink" && self.system.as_deref() == Some("parent"))
+    }
+
+    /// Whether this is the system `parent` field rather than the legacy custom
+    /// one — they take different payload shapes.
+    pub fn is_system_parent(&self) -> bool {
+        self.system.as_deref() == Some("parent")
+    }
 }
+
+/// Greenhopper's "Epic Link" custom-field type key.
+const EPIC_LINK_CUSTOM_FIELD_TYPE: &str = "com.pyxis.greenhopper.jira:gh-epic-link";
 
 /// Custom-field type keys whose values are ADF documents.
 ///

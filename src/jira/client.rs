@@ -738,7 +738,11 @@ impl JiraClient {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                Some(IssueTypeField { id, name })
+                let subtask = v
+                    .get("subtask")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                Some(IssueTypeField { id, name, subtask })
             })
             .collect();
         Ok(types)
@@ -826,11 +830,7 @@ impl JiraClient {
         let resp = self
             .apply_auth(self.client.get(&url))
             .await
-            .query(&[
-                ("project", project),
-                ("query", query),
-                ("maxResults", "50"),
-            ])
+            .query(&[("project", project), ("query", query), ("maxResults", "50")])
             .send()
             .await
             .context("Failed to search users")?;
@@ -858,6 +858,66 @@ impl JiraClient {
             .collect())
     }
 
+    /// Open epics in `project`, most-recently-touched first, optionally
+    /// narrowed by `query` (see [`crate::jira::jql::epic_search_jql`]).
+    ///
+    /// One page only: this backs a picker, where fifty candidates are already
+    /// more than anyone scrolls, and paginating a project's whole epic history
+    /// on every keystroke would be waste.
+    pub async fn search_epics(
+        &self,
+        project: &str,
+        query: &str,
+    ) -> Result<Vec<crate::jira::types::EpicRef>> {
+        /// Just the two fields the picker shows; `Issue` would not deserialize
+        /// from a `fields=summary` response.
+        #[derive(serde::Deserialize)]
+        struct EpicIssue {
+            key: String,
+            fields: Option<EpicFields>,
+        }
+        #[derive(serde::Deserialize)]
+        struct EpicFields {
+            summary: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct EpicPage {
+            #[serde(default)]
+            issues: Vec<EpicIssue>,
+        }
+
+        let jql = crate::jira::jql::epic_search_jql(project, query);
+        let url = format!("{}/rest/api/3/search/jql", self.base_url);
+        self.maybe_refresh().await?;
+        let resp =
+            crate::http::send_with_retry(self.apply_auth(self.client.get(&url)).await.query(&[
+                ("jql", jql.as_str()),
+                ("maxResults", "50"),
+                ("fields", "summary"),
+            ]))
+            .await
+            .context("Failed to search epics")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Epic search failed {status}: {body}");
+        }
+
+        let page: EpicPage = resp
+            .json()
+            .await
+            .context("Failed to parse epic search response")?;
+        Ok(page
+            .issues
+            .into_iter()
+            .map(|i| crate::jira::types::EpicRef {
+                key: i.key,
+                summary: i.fields.and_then(|f| f.summary).unwrap_or_default(),
+            })
+            .collect())
+    }
+
     /// The authenticated user's full identity: account id for payloads,
     /// display name for the UI.
     pub async fn myself(&self) -> Result<crate::jira::types::UserField> {
@@ -876,9 +936,7 @@ impl JiraClient {
             anyhow::bail!("Fetch current user failed {status}: {body}");
         }
 
-        resp.json()
-            .await
-            .context("Failed to parse myself response")
+        resp.json().await.context("Failed to parse myself response")
     }
 
     /// Does `issuekey IN updatedBy(...)` work with this user literal?

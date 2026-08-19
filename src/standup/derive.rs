@@ -476,6 +476,7 @@ mod tests {
                 issuetype: IssueTypeField {
                     id: "1".into(),
                     name: "Bug".into(),
+                    subtask: false,
                 },
                 project: ProjectField {
                     id: "1".into(),

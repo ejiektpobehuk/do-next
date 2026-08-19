@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::items::WorkItem;
 use crate::jira::types::{
-    Attachment, Comment, FieldOption, FieldSchema, Issue, IssueTypeField, ProjectInfo, StatusField,
-    StatusInfo, Transition, UserField,
+    Attachment, Comment, EpicRef, FieldOption, FieldSchema, Issue, IssueTypeField, ProjectInfo,
+    StatusField, StatusInfo, Transition, UserField,
 };
 
 #[derive(Debug)]
@@ -102,6 +102,12 @@ pub enum AppEvent {
     CreateUsersLoaded {
         token: u64,
         result: Result<Vec<UserField>, anyhow::Error>,
+    },
+    /// Epics matching the create form's epic-picker query. `token` works the
+    /// same way as `CreateUsersLoaded`'s.
+    CreateEpicsLoaded {
+        token: u64,
+        result: Result<Vec<EpicRef>, anyhow::Error>,
     },
 }
 
