@@ -172,6 +172,11 @@ pub enum CreatePicker {
         query_cursor: usize,
         cursor: usize,
         searching: bool,
+        /// The row order, taken when the chooser opened: what was already on the
+        /// draft, then the rest as the site gave them. Frozen for as long as the
+        /// chooser is open so a toggle never slides the next row under the
+        /// cursor — see [`option_picker_rows`].
+        order: Vec<usize>,
     },
     Date {
         field_idx: usize,
@@ -232,6 +237,11 @@ pub enum CreatePicker {
         query_cursor: usize,
         cursor: usize,
         searching: bool,
+        /// The row order, taken when the chooser opened, in the same way and for
+        /// the same reason as `MultiSelect::order` — see [`label_picker_rows`].
+        /// A label typed into being joins it at the top, where the row that made
+        /// it was.
+        order: Vec<String>,
     },
 }
 
@@ -825,23 +835,42 @@ fn field_labels(form: &CreateForm, field_idx: usize) -> &[String] {
     }
 }
 
-/// Rows of the labels chooser: the draft's labels and the site's `known` ones,
-/// both narrowed to those *containing* `query`.
+/// Rows of the labels chooser: the labels of `order` narrowed to those
+/// *containing* `query`, ticked where they are on the draft.
 ///
 /// Matching anywhere in the label rather than at its start is the point of
 /// filtering here instead of asking Jira: labels are compounds, so `DRI` has to
 /// find `Platform-DRI`, which no Jira endpoint will do.
+///
+/// `order` is the row order the chooser froze when it opened — the draft's
+/// labels, then the site's. Ticking a row is not allowed to move it: the cursor
+/// stays put, so anything else would leave it over a row the user did not aim
+/// at. Gathering the draft's labels at the top is only ever right at the moment
+/// the list is built, which is why it happens there and not here.
+///
+/// The site's `known` labels are still needed for the two things `order` cannot
+/// carry: whether the typed query is a label that already exists, and the labels
+/// that finished loading after the chooser opened, which trail the frozen rows
+/// rather than being folded into them. The draft's own trail too if they are in
+/// neither list, so a label is never chosen with no way to unchoose it.
 ///
 /// The typed label leads, so what was just typed is under the cursor rather than
 /// below however many labels matched it. It is offered only when it is not
 /// already somewhere in the list, and never when it holds whitespace: Jira splits
 /// such a value into several labels, so what would be added is not what was
 /// typed.
-pub fn label_picker_rows(chosen: &[String], query: &str, known: &[String]) -> Vec<LabelRow> {
+pub fn label_picker_rows(
+    chosen: &[String],
+    query: &str,
+    known: &[String],
+    order: &[String],
+) -> Vec<LabelRow> {
     let q = query.trim();
     let mut rows: Vec<LabelRow> = Vec::new();
+    let listed = |l: &str| order.iter().any(|o| o == l);
     if !q.is_empty()
         && !q.contains(char::is_whitespace)
+        && !listed(q)
         && !chosen.iter().any(|l| l == q)
         && !known.iter().any(|l| l == q)
     {
@@ -849,20 +878,23 @@ pub fn label_picker_rows(chosen: &[String], query: &str, known: &[String]) -> Ve
     }
     let needle = q.to_lowercase();
     let matches = |l: &str| needle.is_empty() || l.to_lowercase().contains(&needle);
-    rows.extend(
-        chosen
-            .iter()
-            .filter(|l| matches(l))
-            .cloned()
-            .map(LabelRow::Chosen),
-    );
-    rows.extend(
-        known
-            .iter()
-            .filter(|l| matches(l) && !chosen.iter().any(|c| c == *l))
-            .cloned()
-            .map(LabelRow::Known),
-    );
+    let row_for = |l: &String| {
+        if chosen.iter().any(|c| c == l) {
+            LabelRow::Chosen(l.clone())
+        } else {
+            LabelRow::Known(l.clone())
+        }
+    };
+    rows.extend(order.iter().filter(|l| matches(l)).map(&row_for));
+    // Whatever the frozen order predates: labels that arrived from the site
+    // while the chooser was open, and any of the draft's own it never held.
+    let mut tail: Vec<&String> = Vec::new();
+    for l in known.iter().chain(chosen.iter()) {
+        if matches(l) && !listed(l) && !tail.contains(&l) {
+            tail.push(l);
+        }
+    }
+    rows.extend(tail.into_iter().map(&row_for));
     rows
 }
 
@@ -884,21 +916,51 @@ fn label_row_value(row: &LabelRow) -> &str {
     }
 }
 
-/// Rows of the option chooser: the indices of the `options` *containing* `query`,
-/// left in the order the site gave them.
+/// Rows of the option chooser: the indices of `order` whose option *contains*
+/// `query`.
 ///
 /// Narrowed locally and by substring for the same reason as the labels chooser —
-/// a component named `api-gateway` has to be findable by `gateway`. What differs
-/// is the order: chosen options stay where they are rather than being gathered at
-/// the top, because every option is in this list already. A label need not be,
-/// which is the whole reason the labels chooser lists the draft's own separately.
-pub fn option_picker_rows(options: &[CreateOption], query: &str) -> Vec<usize> {
+/// a component named `api-gateway` has to be findable by `gateway`. `order` is
+/// likewise the row order frozen when the chooser opened, so ticking an option
+/// leaves it exactly where the cursor found it; what was already on the draft
+/// having been gathered at the top back when the chooser opened.
+///
+/// Anything `order` does not mention trails it in the site's order, so an option
+/// is listed even if the two ever fall out of step.
+pub fn option_picker_rows(options: &[CreateOption], query: &str, order: &[usize]) -> Vec<usize> {
     let needle = query.trim().to_lowercase();
-    options
+    let matches = |i: usize| {
+        options
+            .get(i)
+            .is_some_and(|o| needle.is_empty() || o.label.to_lowercase().contains(&needle))
+    };
+    let mut rows: Vec<usize> = order.iter().copied().filter(|&i| matches(i)).collect();
+    rows.extend((0..options.len()).filter(|i| !order.contains(i) && matches(*i)));
+    rows
+}
+
+/// The row order to freeze for a chooser over `len` options: those already on
+/// the draft, in the site's order, then the rest. Gathering the chosen at the top
+/// is worth doing exactly once, when the list appears — see [`option_picker_rows`].
+fn option_open_order(form: &CreateForm, field_idx: usize, len: usize) -> Vec<usize> {
+    let (chosen, rest): (Vec<usize>, Vec<usize>) =
+        (0..len).partition(|&i| option_is_chosen(form, field_idx, i));
+    chosen.into_iter().chain(rest).collect()
+}
+
+/// The row order to freeze for the labels chooser: the draft's labels, in the
+/// order they were added, then the site's. The labels counterpart of
+/// [`option_open_order`], and taken at the same moment — when the chooser opens.
+fn label_open_order(chosen: &[String], known: &[String]) -> Vec<String> {
+    chosen
         .iter()
-        .enumerate()
-        .filter(|(_, o)| needle.is_empty() || o.label.to_lowercase().contains(&needle))
-        .map(|(i, _)| i)
+        .cloned()
+        .chain(
+            known
+                .iter()
+                .filter(|l| !chosen.iter().any(|c| c == *l))
+                .cloned(),
+        )
         .collect()
 }
 
@@ -1430,12 +1492,15 @@ fn open_labels_picker(form: &mut CreateForm, field_idx: usize) {
         form.labels = CacheState::Loading;
         form.needs_labels_fetch = true;
     }
+    let known: &[String] = form.labels.loaded().map_or(&[], Vec::as_slice);
+    let order = label_open_order(field_labels(form, field_idx), known);
     form.picker = Some(CreatePicker::Labels {
         field_idx,
         query: String::new(),
         query_cursor: 0,
         cursor: 0,
         searching: false,
+        order,
     });
 }
 
@@ -1448,12 +1513,15 @@ fn open_select_picker(form: &mut CreateForm, field_idx: usize) {
 }
 
 fn open_multiselect_picker(form: &mut CreateForm, field_idx: usize) {
+    let len = form.fields.get(field_idx).map_or(0, |f| f.options.len());
+    let order = option_open_order(form, field_idx, len);
     form.picker = Some(CreatePicker::MultiSelect {
         field_idx,
         query: String::new(),
         query_cursor: 0,
         cursor: 0,
         searching: false,
+        order,
     });
 }
 
@@ -1538,16 +1606,26 @@ fn picker_link_type_rows(form: &CreateForm) -> &[LinkTypeChoice] {
 }
 
 /// Rows currently shown by the open labels chooser.
-fn picker_label_rows(form: &CreateForm, field_idx: usize, query: &str) -> Vec<LabelRow> {
+fn picker_label_rows(
+    form: &CreateForm,
+    field_idx: usize,
+    query: &str,
+    order: &[String],
+) -> Vec<LabelRow> {
     let known: &[String] = form.labels.loaded().map_or(&[], Vec::as_slice);
-    label_picker_rows(field_labels(form, field_idx), query, known)
+    label_picker_rows(field_labels(form, field_idx), query, known, order)
 }
 
 /// Option indices currently shown by the open option chooser.
-fn picker_option_rows(form: &CreateForm, field_idx: usize, query: &str) -> Vec<usize> {
+fn picker_option_rows(
+    form: &CreateForm,
+    field_idx: usize,
+    query: &str,
+    order: &[usize],
+) -> Vec<usize> {
     form.fields
         .get(field_idx)
-        .map_or_else(Vec::new, |f| option_picker_rows(&f.options, query))
+        .map_or_else(Vec::new, |f| option_picker_rows(&f.options, query, order))
 }
 
 /// Key routing for the linked-issues list: edit a link's relation, remove one,
@@ -1774,6 +1852,7 @@ fn handle_labels_picker_key(form: &mut CreateForm, code: KeyCode, picker: Create
         mut query_cursor,
         mut cursor,
         mut searching,
+        mut order,
     } = picker
     else {
         return;
@@ -1796,20 +1875,28 @@ fn handle_labels_picker_key(form: &mut CreateForm, code: KeyCode, picker: Create
             KeyCode::Esc | KeyCode::Char('q') => return, // picker taken → closed
             KeyCode::Char('/') => searching = true,
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if let Some(label) = picker_label_rows(form, field_idx, &query)
-                    .get(cursor)
-                    .map(|row| label_row_value(row).to_string())
-                {
+                if let Some(row) = picker_label_rows(form, field_idx, &query, &order).get(cursor) {
+                    let label = label_row_value(row).to_string();
                     // Toggle, not add: the ticked box says the row is a switch,
                     // so the key that ticked it has to untick it too. A `New` or
                     // `Known` row is by definition not on the draft, so for those
                     // this is the add it always was.
                     let on = !field_labels(form, field_idx).contains(&label);
+                    // Only a label typed into being joins the frozen order, and
+                    // only because the row that made it is gone the moment it
+                    // exists: it takes the top, where that row was and the cursor
+                    // still is. Every other row already has its place — in the
+                    // order or after it — and putting it in here would move it,
+                    // which is the whole thing the frozen order exists to stop.
+                    let typed = matches!(row, LabelRow::New(_));
                     set_label(form, field_idx, &label, on);
+                    if typed && !order.contains(&label) {
+                        order.insert(0, label);
+                    }
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
-                if let Some(label) = picker_label_rows(form, field_idx, &query)
+                if let Some(label) = picker_label_rows(form, field_idx, &query, &order)
                     .get(cursor)
                     .map(|row| label_row_value(row).to_string())
                 {
@@ -1817,15 +1904,16 @@ fn handle_labels_picker_key(form: &mut CreateForm, code: KeyCode, picker: Create
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                let count = picker_label_rows(form, field_idx, &query).len();
+                let count = picker_label_rows(form, field_idx, &query, &order).len();
                 cursor = (cursor + 1).min(count.saturating_sub(1));
             }
             KeyCode::Up | KeyCode::Char('k') => cursor = cursor.saturating_sub(1),
             _ => {}
         }
-        // Adding or removing reshapes the list under the cursor — a new label
-        // moves out of its own row, a removed one may leave the list entirely.
-        let count = picker_label_rows(form, field_idx, &query).len();
+        // The frozen order holds the rows still under a toggle, but the list can
+        // still shorten: the row offering to add a typed label goes once it is
+        // added, taking the last row with it.
+        let count = picker_label_rows(form, field_idx, &query, &order).len();
         cursor = cursor.min(count.saturating_sub(1));
     }
 
@@ -1835,6 +1923,7 @@ fn handle_labels_picker_key(form: &mut CreateForm, code: KeyCode, picker: Create
         query_cursor,
         cursor,
         searching,
+        order,
     });
 }
 
@@ -1848,6 +1937,7 @@ fn handle_multiselect_picker_key(form: &mut CreateForm, code: KeyCode, picker: C
         mut query_cursor,
         mut cursor,
         mut searching,
+        order,
     } = picker
     else {
         return;
@@ -1868,7 +1958,7 @@ fn handle_multiselect_picker_key(form: &mut CreateForm, code: KeyCode, picker: C
     } else {
         // Toggling cannot reshape this list the way adding a label can, so the
         // rows are read once and the cursor only needs clamping to their count.
-        let rows = picker_option_rows(form, field_idx, &query);
+        let rows = picker_option_rows(form, field_idx, &query, &order);
         match code {
             KeyCode::Esc | KeyCode::Char('q') => return, // picker taken → closed
             KeyCode::Char('/') => searching = true,
@@ -1898,6 +1988,7 @@ fn handle_multiselect_picker_key(form: &mut CreateForm, code: KeyCode, picker: C
         query_cursor,
         cursor,
         searching,
+        order,
     });
 }
 
@@ -2807,15 +2898,17 @@ fn render_picker(f: &mut Frame, form: &CreateForm, picker: &CreatePicker, projec
             query,
             cursor,
             searching,
+            order,
             ..
-        } => render_labels_picker(f, form, *field_idx, query, *cursor, *searching),
+        } => render_labels_picker(f, form, *field_idx, query, *cursor, *searching, order),
         CreatePicker::MultiSelect {
             field_idx,
             query,
             cursor,
             searching,
+            order,
             ..
-        } => render_multiselect_picker(f, form, *field_idx, query, *cursor, *searching),
+        } => render_multiselect_picker(f, form, *field_idx, query, *cursor, *searching, order),
         CreatePicker::Date { field_idx, picker } => {
             let area = crate::tui::render::centered_rect(40, 50, f.area());
             let label = form
@@ -3065,6 +3158,7 @@ fn render_labels_picker(
     query: &str,
     cursor: usize,
     searching: bool,
+    order: &[String],
 ) {
     let label = form
         .fields
@@ -3083,7 +3177,7 @@ fn render_labels_picker(
         }
     };
 
-    let items: Vec<String> = picker_label_rows(form, field_idx, query)
+    let items: Vec<String> = picker_label_rows(form, field_idx, query, order)
         .iter()
         .map(label_row_label)
         .collect();
@@ -3119,12 +3213,13 @@ fn render_multiselect_picker(
     query: &str,
     cursor: usize,
     searching: bool,
+    order: &[usize],
 ) {
     let label = form
         .fields
         .get(field_idx)
         .map_or("Options", |f| f.label.as_str());
-    let rows = picker_option_rows(form, field_idx, query);
+    let rows = picker_option_rows(form, field_idx, query, order);
     let options = form.fields.get(field_idx).map_or(&[][..], |f| &f.options);
     let items: Vec<String> = rows
         .iter()
@@ -5000,12 +5095,34 @@ mod tests {
     /// Open the labels chooser with the site's labels already landed, as a form
     /// whose fetch has come back looks.
     fn open_labels_form(known: &[&str]) -> CreateForm {
+        open_labels_form_with(&[], known)
+    }
+
+    /// The same, on a draft that already carries `chosen` — what reopening a
+    /// field filled in earlier looks like.
+    fn open_labels_form_with(chosen: &[&str], known: &[&str]) -> CreateForm {
         let mut form = labels_form();
-        form.focus = 2;
-        activate_field(&mut form);
+        form.fields[0].value =
+            FieldValue::Labels(chosen.iter().map(|s| (*s).to_string()).collect());
         form.labels = CacheState::Loaded(known.iter().map(|s| (*s).to_string()).collect());
         form.needs_labels_fetch = false;
+        form.focus = 2;
+        activate_field(&mut form);
         form
+    }
+
+    /// The chooser's rows as drawn, so a test can say where a row sits and
+    /// whether it is ticked.
+    fn label_rows(form: &CreateForm) -> Vec<LabelRow> {
+        match form.picker {
+            Some(CreatePicker::Labels {
+                field_idx,
+                ref query,
+                ref order,
+                ..
+            }) => picker_label_rows(form, field_idx, query, order),
+            ref other => panic!("the labels chooser is not open: {other:?}"),
+        }
     }
 
     /// Route `code` through the open labels chooser, as `handle_picker_input`
@@ -5013,6 +5130,12 @@ mod tests {
     fn press_labels(form: &mut CreateForm, code: KeyCode) {
         let picker = form.picker.take().expect("the labels chooser is not open");
         handle_labels_picker_key(form, code, picker);
+    }
+
+    /// The rows a chooser just opened on `chosen` shows for `query` — the order
+    /// frozen at that moment, which is what every row test here is about.
+    fn rows_at_open(chosen: &[String], query: &str, known: &[String]) -> Vec<LabelRow> {
+        label_picker_rows(chosen, query, known, &label_open_order(chosen, known))
     }
 
     fn labels_of(form: &CreateForm) -> Vec<String> {
@@ -5055,7 +5178,7 @@ mod tests {
 
     #[test]
     fn rows_lead_with_the_typed_label_then_the_draft_then_the_sites_own() {
-        let rows = label_picker_rows(&["backend".into()], "back", &["backlog".into()]);
+        let rows = rows_at_open(&["backend".into()], "back", &["backlog".into()]);
         assert_eq!(
             rows,
             vec![
@@ -5065,7 +5188,7 @@ mod tests {
             ]
         );
         // An empty query has nothing to add, and hides nothing.
-        let rows = label_picker_rows(&["backend".into()], "", &["backlog".into()]);
+        let rows = rows_at_open(&["backend".into()], "", &["backlog".into()]);
         assert_eq!(
             rows,
             vec![
@@ -5081,7 +5204,7 @@ mod tests {
     fn a_query_matches_anywhere_in_a_label_not_just_at_its_start() {
         let known = vec!["Platform-DRI".to_string(), "unrelated".to_string()];
         assert_eq!(
-            label_picker_rows(&[], "DRI", &known),
+            rows_at_open(&[], "DRI", &known),
             vec![
                 LabelRow::New("DRI".into()),
                 LabelRow::Known("Platform-DRI".into()),
@@ -5089,7 +5212,7 @@ mod tests {
         );
         // And case is no obstacle either.
         assert_eq!(
-            label_picker_rows(&[], "dri", &known),
+            rows_at_open(&[], "dri", &known),
             vec![
                 LabelRow::New("dri".into()),
                 LabelRow::Known("Platform-DRI".into()),
@@ -5101,12 +5224,12 @@ mod tests {
     fn a_label_that_is_already_listed_is_not_offered_as_a_new_one() {
         // Already on the draft.
         assert_eq!(
-            label_picker_rows(&["backend".into()], "backend", &[]),
+            rows_at_open(&["backend".into()], "backend", &[]),
             vec![LabelRow::Chosen("backend".into())]
         );
         // Already the site's — and one the draft also has is listed once.
         assert_eq!(
-            label_picker_rows(&["backend".into()], "backend", &["backend".into()]),
+            rows_at_open(&["backend".into()], "backend", &["backend".into()]),
             vec![LabelRow::Chosen("backend".into())]
         );
     }
@@ -5114,17 +5237,17 @@ mod tests {
     #[test]
     fn a_label_with_a_space_in_it_is_not_offered() {
         // Jira would split it in two, so what was typed is not what would land.
-        assert!(label_picker_rows(&[], "tech debt", &[]).is_empty());
+        assert!(rows_at_open(&[], "tech debt", &[]).is_empty());
         // Surrounding space is just typing, and is trimmed off.
         assert_eq!(
-            label_picker_rows(&[], "  backend ", &[]),
+            rows_at_open(&[], "  backend ", &[]),
             vec![LabelRow::New("backend".into())]
         );
     }
 
     #[test]
     fn the_query_narrows_the_draft_labels_as_well_as_the_sites_own() {
-        let rows = label_picker_rows(&["backend".into(), "ui".into()], "Back", &[]);
+        let rows = rows_at_open(&["backend".into(), "ui".into()], "Back", &[]);
         assert_eq!(
             rows,
             vec![
@@ -5147,7 +5270,7 @@ mod tests {
             "a field taking several labels does not close on the first"
         );
 
-        // The added label moved up into the draft's own rows; `ui` follows it.
+        // Ticking `backend` left it where it was, so `ui` is still the next row.
         press_labels(&mut form, KeyCode::Char('j'));
         press_labels(&mut form, KeyCode::Char(' '));
         assert_eq!(
@@ -5173,9 +5296,8 @@ mod tests {
     }
 
     #[test]
-    fn d_removes_the_highlighted_label_and_keeps_the_cursor_on_a_row() {
-        let mut form = open_labels_form(&[]);
-        form.fields[0].value = FieldValue::Labels(vec!["backend".into(), "ui".into()]);
+    fn d_removes_the_highlighted_label_and_leaves_the_cursor_on_its_row() {
+        let mut form = open_labels_form_with(&["backend", "ui"], &[]);
 
         press_labels(&mut form, KeyCode::Char('j'));
         assert_eq!(label_cursor(&form), 1);
@@ -5183,13 +5305,18 @@ mod tests {
         assert_eq!(labels_of(&form), vec!["backend".to_string()]);
         assert_eq!(
             label_cursor(&form),
-            0,
-            "the removed row is gone, so the cursor comes back to one that is not"
+            1,
+            "the row stays, unticked, so the cursor has no reason to move"
         );
+        assert_eq!(label_rows(&form)[1], LabelRow::Known("ui".into()));
 
         press_labels(&mut form, KeyCode::Char('d'));
-        assert!(labels_of(&form).is_empty());
-        assert_eq!(label_cursor(&form), 0, "an empty list still has a cursor");
+        assert_eq!(
+            labels_of(&form),
+            vec!["backend".to_string()],
+            "on a row already off, `d` is a no-op"
+        );
+        assert_eq!(label_cursor(&form), 1);
     }
 
     #[test]
@@ -5203,6 +5330,150 @@ mod tests {
             form.labels.loaded().is_some(),
             "the site's labels are site-wide, so they outlive the chooser"
         );
+    }
+
+    /// The bug this froze the order for: with the draft's labels gathered at the
+    /// top on every keystroke, ticking a row sent it to the top and slid the next
+    /// one under a cursor that had not moved — so a second Space hit whatever had
+    /// taken its place.
+    #[test]
+    fn toggling_a_label_leaves_every_row_where_it_was() {
+        let mut form = open_labels_form(&["api", "backend", "ui"]);
+        let before = label_rows(&form);
+        assert_eq!(
+            before,
+            vec![
+                LabelRow::Known("api".into()),
+                LabelRow::Known("backend".into()),
+                LabelRow::Known("ui".into()),
+            ]
+        );
+
+        press_labels(&mut form, KeyCode::Char('j'));
+        press_labels(&mut form, KeyCode::Char(' '));
+        assert_eq!(labels_of(&form), vec!["backend".to_string()]);
+        assert_eq!(
+            label_rows(&form),
+            vec![
+                LabelRow::Known("api".into()),
+                LabelRow::Chosen("backend".into()),
+                LabelRow::Known("ui".into()),
+            ],
+            "only the tick changed"
+        );
+        assert_eq!(label_cursor(&form), 1, "still on the row it ticked");
+
+        // And unticking is the same move back, so the pair is reversible.
+        press_labels(&mut form, KeyCode::Char(' '));
+        assert!(labels_of(&form).is_empty());
+        assert_eq!(label_rows(&form), before);
+        assert_eq!(label_cursor(&form), 1);
+    }
+
+    /// Gathering the draft's labels at the top is worth doing — just not while
+    /// the list is on screen. Closing and opening is what settles it.
+    #[test]
+    fn reopening_gathers_the_drafts_labels_at_the_top() {
+        let mut form = open_labels_form(&["api", "backend", "ui"]);
+        press_labels(&mut form, KeyCode::Char('j'));
+        press_labels(&mut form, KeyCode::Char(' ')); // backend
+        press_labels(&mut form, KeyCode::Char('q'));
+
+        activate_field(&mut form);
+        assert_eq!(
+            label_rows(&form),
+            vec![
+                LabelRow::Chosen("backend".into()),
+                LabelRow::Known("api".into()),
+                LabelRow::Known("ui".into()),
+            ]
+        );
+    }
+
+    /// A label typed into being is the one row that has to move: the row that
+    /// made it stops existing the moment it does. It lands where that row was,
+    /// which is where the cursor still is.
+    #[test]
+    fn a_typed_label_takes_the_top_row_and_the_cursor_stays_on_it() {
+        let mut form = open_labels_form(&["backend"]);
+        press_labels(&mut form, KeyCode::Char('/'));
+        for c in "flaky".chars() {
+            press_labels(&mut form, KeyCode::Char(c));
+        }
+        press_labels(&mut form, KeyCode::Esc); // out of search, query kept
+        press_labels(&mut form, KeyCode::Enter); // adds
+        assert_eq!(label_rows(&form), vec![LabelRow::Chosen("flaky".into())]);
+        assert_eq!(label_cursor(&form), 0);
+
+        // Clearing the query shows it at the top of the whole list, and
+        // unticking it there leaves it in place rather than losing the row.
+        press_labels(&mut form, KeyCode::Char('/'));
+        for _ in 0..5 {
+            press_labels(&mut form, KeyCode::Backspace);
+        }
+        press_labels(&mut form, KeyCode::Esc);
+        press_labels(&mut form, KeyCode::Char(' '));
+        assert!(labels_of(&form).is_empty());
+        assert_eq!(
+            label_rows(&form),
+            vec![
+                LabelRow::Known("flaky".into()),
+                LabelRow::Known("backend".into()),
+            ],
+            "a label typed and then untyped is still reachable"
+        );
+    }
+
+    /// The chooser can open before the site's labels land. They join the rows
+    /// already there rather than rearranging them.
+    #[test]
+    fn labels_that_arrive_after_the_chooser_opened_trail_the_rows_it_froze() {
+        let mut form = open_labels_form_with(&["mine"], &[]);
+        assert_eq!(label_rows(&form), vec![LabelRow::Chosen("mine".into())]);
+
+        form.labels = CacheState::Loaded(vec!["backend".into(), "mine".into()]);
+        assert_eq!(
+            label_rows(&form),
+            vec![
+                LabelRow::Chosen("mine".into()),
+                LabelRow::Known("backend".into()),
+            ],
+            "the frozen row keeps its place and is not listed twice"
+        );
+    }
+
+    /// The first open is the one that ordered wrong: the fetch for the site's
+    /// labels is still out, so the order frozen then is empty and every row is a
+    /// late arrival. Toggling one must still leave it where it is.
+    #[test]
+    fn labels_that_arrived_while_the_chooser_was_open_hold_still_under_a_toggle() {
+        let mut form = labels_form();
+        form.focus = 2;
+        activate_field(&mut form);
+        assert!(
+            label_rows(&form).is_empty(),
+            "nothing to show until the fetch lands"
+        );
+        form.labels = CacheState::Loaded(vec!["api".into(), "backend".into(), "ui".into()]);
+        let before = label_rows(&form);
+
+        press_labels(&mut form, KeyCode::Char('j'));
+        press_labels(&mut form, KeyCode::Char(' '));
+        assert_eq!(labels_of(&form), vec!["backend".to_string()]);
+        assert_eq!(
+            label_rows(&form),
+            vec![
+                LabelRow::Known("api".into()),
+                LabelRow::Chosen("backend".into()),
+                LabelRow::Known("ui".into()),
+            ],
+            "ticked in place, not gathered to the top"
+        );
+        assert_eq!(label_cursor(&form), 1, "still on the row it ticked");
+
+        press_labels(&mut form, KeyCode::Char(' '));
+        assert_eq!(label_rows(&form), before);
+        assert_eq!(label_cursor(&form), 1);
     }
 
     /// The vocabulary is asked for once and kept: reopening the chooser — or
@@ -5232,13 +5503,19 @@ mod tests {
 
     /// A form whose one field is a components-style chooser, with the chooser open.
     fn open_components_form(options: &[&str]) -> CreateForm {
+        open_components_form_with(options, &[])
+    }
+
+    /// The same, on a draft that already carries the options at `chosen` — what
+    /// reopening a field filled in earlier looks like.
+    fn open_components_form_with(options: &[&str], chosen: &[usize]) -> CreateForm {
         let mut form = base_form();
         form.fields = vec![FormField {
             field_id: "components".into(),
             label: "Components".into(),
             required: false,
             widget: WidgetKind::MultiSelect,
-            value: FieldValue::MultiOption(HashSet::new()),
+            value: FieldValue::MultiOption(chosen.iter().copied().collect()),
             options: options
                 .iter()
                 .map(|o| CreateOption {
@@ -5268,6 +5545,30 @@ mod tests {
                 .map(|(_, o)| o.label.clone())
                 .collect(),
             ref other => panic!("not an option field: {other:?}"),
+        }
+    }
+
+    /// The chooser's rows as drawn: the option names, ticked where they are on
+    /// the draft.
+    fn option_rows(form: &CreateForm) -> Vec<String> {
+        match form.picker {
+            Some(CreatePicker::MultiSelect {
+                field_idx,
+                ref query,
+                ref order,
+                ..
+            }) => picker_option_rows(form, field_idx, query, order)
+                .into_iter()
+                .map(|i| {
+                    let tick = if option_is_chosen(form, field_idx, i) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    format!("{tick}{}", form.fields[field_idx].options[i].label)
+                })
+                .collect(),
+            ref other => panic!("the option chooser is not open: {other:?}"),
         }
     }
 
@@ -5307,6 +5608,49 @@ mod tests {
         );
     }
 
+    /// The option chooser's half of the frozen order: it gathers what is on the
+    /// draft at the top as it opens, and then holds still — the same bargain the
+    /// labels chooser strikes.
+    #[test]
+    fn reopening_gathers_the_chosen_options_at_the_top_and_toggling_does_not() {
+        let mut form = open_components_form(&["api", "web", "db"]);
+        assert_eq!(option_rows(&form), vec![" api", " web", " db"]);
+
+        press_options(&mut form, KeyCode::Char('j'));
+        press_options(&mut form, KeyCode::Char(' ')); // web
+        assert_eq!(chosen_options(&form), vec!["web".to_string()]);
+        assert_eq!(
+            option_rows(&form),
+            vec![" api", "*web", " db"],
+            "ticked in place: only the box changed"
+        );
+        assert_eq!(option_state(&form).1, 1, "still on the row it ticked");
+
+        press_options(&mut form, KeyCode::Char(' '));
+        assert!(chosen_options(&form).is_empty());
+        assert_eq!(option_rows(&form), vec![" api", " web", " db"]);
+
+        // Closing and opening is what settles the order.
+        press_options(&mut form, KeyCode::Char(' ')); // web, again
+        press_options(&mut form, KeyCode::Char('q'));
+        activate_field(&mut form);
+        assert_eq!(option_rows(&form), vec!["*web", " api", " db"]);
+    }
+
+    /// The frozen order narrows like any other: the query hides rows, it does not
+    /// reorder what is left.
+    #[test]
+    fn a_query_keeps_the_frozen_order_of_the_rows_it_leaves() {
+        let form = open_components_form_with(&["api", "web", "web-admin"], &[2]);
+        assert_eq!(option_rows(&form), vec!["*web-admin", " api", " web"]);
+        let mut form = form;
+        press_options(&mut form, KeyCode::Char('/'));
+        for c in "web".chars() {
+            press_options(&mut form, KeyCode::Char(c));
+        }
+        assert_eq!(option_rows(&form), vec!["*web-admin", " web"]);
+    }
+
     #[test]
     fn d_deselects_the_highlighted_option_outright() {
         let mut form = open_components_form(&["api", "web"]);
@@ -5332,10 +5676,11 @@ mod tests {
                 raw: json!({}),
             },
         ];
-        assert_eq!(option_picker_rows(&options, "gateway"), vec![0]);
-        assert_eq!(option_picker_rows(&options, "GATE"), vec![0]);
-        assert_eq!(option_picker_rows(&options, ""), vec![0, 1]);
-        assert!(option_picker_rows(&options, "nope").is_empty());
+        let order = [0, 1];
+        assert_eq!(option_picker_rows(&options, "gateway", &order), vec![0]);
+        assert_eq!(option_picker_rows(&options, "GATE", &order), vec![0]);
+        assert_eq!(option_picker_rows(&options, "", &order), vec![0, 1]);
+        assert!(option_picker_rows(&options, "nope", &order).is_empty());
     }
 
     #[test]
