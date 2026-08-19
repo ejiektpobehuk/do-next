@@ -221,8 +221,9 @@ pub struct CreateForm {
     pub focus: usize,
     pub mode: FormMode,
     pub picker: Option<CreatePicker>,
-    /// `Some(selected)` while the discard-changes prompt is up (0=Discard, 1=Keep editing).
-    pub discard_confirm: Option<usize>,
+    /// State of the exit-confirmation prompt. It has no buttons — the footer
+    /// hints are the menu — so there is nothing to track but open/closed.
+    pub discard_prompt: DiscardPrompt,
     /// Index into `fields` of the value waiting for `$EDITOR`. Set by `e`/Ctrl+E
     /// and cleared by the main loop: it owns the terminal, so it is the only
     /// place that can suspend the TUI to hand over to an external editor.
@@ -252,7 +253,7 @@ impl CreateForm {
             focus: 1, // start on Issue Type (project is pre-filled)
             mode: FormMode::Nav,
             picker: None,
-            discard_confirm: None,
+            discard_prompt: DiscardPrompt::Closed,
             pending_editor: None,
             meta_token: 1,
             needs_issuetype_fetch: true,
@@ -649,7 +650,7 @@ pub fn handle_create_input(app: &mut AppState, event: Event) {
     // Discard-confirm prompt swallows input first.
     let confirm_open = matches!(
         app.action_state,
-        ActionState::CreatingIssue(ref f) if f.discard_confirm.is_some()
+        ActionState::CreatingIssue(ref f) if f.discard_prompt == DiscardPrompt::Open
     );
     if confirm_open {
         handle_discard_confirm_input(app, code);
@@ -720,7 +721,7 @@ pub fn handle_create_input(app: &mut AppState, event: Event) {
             return;
         };
         if form_is_dirty(form) {
-            form.discard_confirm = Some(1);
+            form.discard_prompt = DiscardPrompt::Open;
         } else {
             app.action_state = ActionState::None;
         }
@@ -875,28 +876,40 @@ fn form_is_dirty(form: &CreateForm) -> bool {
     })
 }
 
+/// Whether the exit-confirmation prompt is showing over the form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardPrompt {
+    Closed,
+    Open,
+}
+
+/// What a keystroke means to the discard prompt; any other key is ignored.
+#[derive(Debug, PartialEq, Eq)]
+enum DiscardChoice {
+    Discard,
+    KeepEditing,
+}
+
+const fn discard_confirm_choice(code: KeyCode) -> Option<DiscardChoice> {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => Some(DiscardChoice::KeepEditing),
+        KeyCode::Enter | KeyCode::Char('y') => Some(DiscardChoice::Discard),
+        _ => None,
+    }
+}
+
 fn handle_discard_confirm_input(app: &mut AppState, code: KeyCode) {
     let ActionState::CreatingIssue(ref mut form) = app.action_state else {
         return;
     };
-    let Some(selected) = form.discard_confirm else {
+    if form.discard_prompt == DiscardPrompt::Closed {
         return;
-    };
-    match code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            form.discard_confirm = None;
-        }
-        KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') | KeyCode::Tab => {
-            form.discard_confirm = Some(1 - selected);
-        }
-        KeyCode::Enter => {
-            if selected == 0 {
-                app.action_state = ActionState::None;
-            } else {
-                form.discard_confirm = None;
-            }
-        }
-        _ => {}
+    }
+    match discard_confirm_choice(code) {
+        Some(DiscardChoice::Discard) => app.action_state = ActionState::None,
+        // Dismissing the prompt returns to the form with everything intact.
+        Some(DiscardChoice::KeepEditing) => form.discard_prompt = DiscardPrompt::Closed,
+        None => {}
     }
 }
 
@@ -1555,14 +1568,8 @@ pub fn render_create_issue_overlay(f: &mut Frame, app: &AppState) {
         render_picker(f, form, picker, app.project_cache.is_pending());
     }
 
-    if let Some(selected) = form.discard_confirm {
-        crate::tui::overlays::delete_confirm::render_delete_confirm_overlay(
-            f,
-            " Discard new issue? ",
-            selected,
-            ("Discard", "Keep editing"),
-            "You have unsaved fields. Discard them?",
-        );
+    if form.discard_prompt == DiscardPrompt::Open {
+        render_discard_confirm_overlay(f);
     }
 }
 
@@ -1812,6 +1819,33 @@ fn render_picker(f: &mut Frame, form: &CreateForm, picker: &CreatePicker, projec
             datetime_picker::render_datetime_picker_in(f, area, picker, label, None);
         }
     }
+}
+
+/// Discard prompt for a dirty form. No buttons: like the rest of the app, the
+/// footer hints are the menu. One key per action is hinted; `y` and `Esc` work
+/// too, but spelling out every alias is what made the old footer noisy.
+fn render_discard_confirm_overlay(f: &mut Frame) {
+    let area = crate::tui::render::centered_rect(40, 20, f.area());
+    f.render_widget(Clear, area);
+    let hint = Line::from(vec![
+        Span::raw("┤ "),
+        Span::styled("↵", Style::default().fg(Color::Red)),
+        Span::raw(" discard | "),
+        Span::styled("q", Style::default().fg(Color::Magenta)),
+        Span::raw(" keep editing ├──"),
+    ])
+    .alignment(Alignment::Right);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Discard new issue? ")
+        .title_bottom(hint);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(
+        Paragraph::new("You have unsaved fields. Discard them?"),
+        inner,
+    );
 }
 
 /// Small confirmation popup shown after a successful create.
@@ -2743,6 +2777,28 @@ mod tests {
         apply_reporter_prefill(&mut form);
         assert!(reporter_of(&form).is_none());
         assert_eq!(form.prefill, Prefill::Pending);
+    }
+
+    #[test]
+    fn discard_prompt_keys_have_no_selector() {
+        use DiscardChoice::{Discard, KeepEditing};
+        assert_eq!(discard_confirm_choice(KeyCode::Enter), Some(Discard));
+        assert_eq!(discard_confirm_choice(KeyCode::Char('y')), Some(Discard));
+        assert_eq!(discard_confirm_choice(KeyCode::Esc), Some(KeepEditing));
+        assert_eq!(
+            discard_confirm_choice(KeyCode::Char('q')),
+            Some(KeepEditing)
+        );
+        // The two-button selector is gone, so its movement keys do nothing.
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Tab,
+            KeyCode::Char('h'),
+            KeyCode::Char('l'),
+        ] {
+            assert_eq!(discard_confirm_choice(code), None, "{code:?} must be inert");
+        }
     }
 
     #[test]
