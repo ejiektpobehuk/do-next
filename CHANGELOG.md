@@ -20,6 +20,7 @@ All notable changes to `do-next` are documented here.
 - `$EDITOR` support for text fields in the new issue form.
 - Linked issues support for the new issue form
 - Labels support for the new issue form
+- `inspect` command to make configuration easier
 
 ### Fixes
 

@@ -37,16 +37,24 @@ enum Commands {
         #[arg(long)]
         no_history: bool,
     },
-    /// List all fields on a Jira issue (useful for configuring views)
-    Fields {
-        /// Issue key (e.g. PROJ-123)
-        issue_key: String,
-        /// Dump the raw JSON value of a specific field ID
-        #[arg(long, value_name = "FIELD_ID")]
-        field: Option<String>,
-        /// Dump the raw editmeta JSON object for the field specified by --field
-        #[arg(long, requires = "field")]
-        raw: bool,
+    /// Validate the configuration and report what it resolved to
+    ///
+    /// Offline by default: no credentials are touched, so it works headless.
+    Check {
+        /// Also run every source's query against Jira and report hit counts
+        #[arg(long)]
+        online: bool,
+    },
+    /// Read-only lookups against Jira — the values a team config needs
+    Inspect {
+        /// Which team's Jira connection to query (default: the first team)
+        #[arg(long, global = true, value_name = "TEAM_ID")]
+        team: Option<String>,
+        /// Print machine-readable JSON instead of a table
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        what: subcommands::inspect::What,
     },
     /// Reconfigure Jira authentication
     Auth,
@@ -96,6 +104,42 @@ fn confluence_shares_jira(team: &config::types::ResolvedTeam) -> bool {
     team.confluence == team.jira && std::env::var("DO_NEXT_CONFLUENCE_API_TOKEN").is_err()
 }
 
+/// The Jira connection an `inspect` lookup runs against, plus the project key
+/// its project-scoped arguments default to.
+///
+/// A lookup asks about one Jira site, so it follows one team: `--team` names
+/// it, and without one the first team stands in — the same team whose client
+/// the other subcommands use.
+fn inspect_target(
+    loaded: &config::LoadedConfig,
+    clients: &sources::Clients,
+    default_client: &jira::JiraClient,
+    team: Option<&str>,
+) -> Result<(jira::JiraClient, String)> {
+    let Some(wanted) = team else {
+        let project = loaded.teams.first().map_or_else(
+            || loaded.config.jira.default_project.clone(),
+            |t| t.jira.default_project.clone(),
+        );
+        return Ok((default_client.clone(), project));
+    };
+
+    let team = loaded
+        .teams
+        .iter()
+        .find(|t| t.id == wanted)
+        .with_context(|| {
+            let ids: Vec<&str> = loaded.teams.iter().map(|t| t.id.as_str()).collect();
+            format!("no team '{wanted}' (configured: {})", ids.join(", "))
+        })?;
+    let client = clients
+        .jira
+        .get(&team.jira.base_url)
+        .cloned()
+        .with_context(|| format!("No Jira client for team '{}'", team.id))?;
+    Ok((client, team.jira.default_project.clone()))
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -142,6 +186,14 @@ async fn main() -> Result<()> {
             &mut std::io::stdout(),
         );
         return Ok(());
+    }
+
+    // `check` runs before everything interactive: it must never prompt, never
+    // rewrite the config, and — offline — never reach for a credential store,
+    // which is what lets it run headless. `--online` resolves the Jira auth it
+    // needs itself, for the same reason.
+    if let Some(Commands::Check { online }) = &cli.command {
+        return subcommands::check::run(&loaded, *online).await;
     }
 
     // Auth reset runs before credential resolution (auth may currently be broken).
@@ -616,14 +668,17 @@ async fn main() -> Result<()> {
         }) => {
             subcommands::comment::run(&default_client, issue_key.as_deref(), no_history).await?;
         }
-        Some(Commands::Fields {
-            issue_key,
-            field,
-            raw,
-        }) => {
-            subcommands::fields::run(&default_client, &issue_key, field.as_deref(), raw).await?;
+        Some(Commands::Inspect { team, json, what }) => {
+            let (client, project) =
+                inspect_target(&loaded, &clients, &default_client, team.as_deref())?;
+            subcommands::inspect::run(&client, &project, json, &what).await?;
         }
-        Some(Commands::Auth | Commands::Company { .. } | Commands::Completions { .. }) => {
+        Some(
+            Commands::Auth
+            | Commands::Check { .. }
+            | Commands::Company { .. }
+            | Commands::Completions { .. },
+        ) => {
             unreachable!("handled before credential resolution")
         }
         None => {

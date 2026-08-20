@@ -329,6 +329,18 @@ pub enum BoardType {
     Unknown,
 }
 
+impl BoardType {
+    /// The type as Jira spells it, for report lines.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Scrum => "scrum",
+            Self::Kanban => "kanban",
+            Self::Simple => "simple",
+            Self::Unknown => "unknown type",
+        }
+    }
+}
+
 /// Agile board configuration (`GET /rest/agile/1.0/board/{id}/configuration`).
 /// Carries the ordered columns and the board type — one call serves both.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -499,11 +511,35 @@ impl StatusCategory {
             _ => Self::Undefined,
         }
     }
+
+    /// The `statusCategory.key` this variant came from — what JQL's
+    /// `statusCategory` compares against, so it is also what a config author
+    /// needs to see next to a status name.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Indeterminate => "indeterminate",
+            Self::Done => "done",
+            Self::Undefined => "undefined",
+        }
+    }
 }
 
 /// A Jira status with the category it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusInfo {
+    pub name: String,
+    pub category: StatusCategory,
+}
+
+/// A status as Jira defines it site-wide, id included.
+///
+/// The id is the part [`StatusInfo`] has no room for and a board cannot do
+/// without: a board's column configuration carries only status ids (see
+/// [`ColumnStatus`]), so naming its columns means joining against this list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusDetail {
+    pub id: String,
     pub name: String,
     pub category: StatusCategory,
 }

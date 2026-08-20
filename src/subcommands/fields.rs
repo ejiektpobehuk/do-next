@@ -4,16 +4,19 @@ use anyhow::{Context, Result};
 
 use crate::jira::JiraClient;
 
-/// `do-next fields ISSUE_KEY [--field FIELD_ID] [--raw]`
+/// `do-next inspect fields ISSUE_KEY [--field FIELD_ID] [--raw] [--json]`
 ///
 /// Prints all fields on the given issue alongside their human-readable names.
 /// Use `--field` to dump the raw value of one specific field.
 /// Add `--raw` to dump the raw editmeta JSON object for that field instead.
+/// `--json` swaps the table for `{ field_id: { name, value } }`; it does
+/// nothing next to `--field`, whose output is already raw JSON.
 pub async fn run(
     client: &JiraClient,
     issue_key: &str,
     field: Option<&str>,
     raw: bool,
+    json_out: bool,
 ) -> Result<()> {
     // --field --raw: dump the raw editmeta JSON object for this field.
     if let (Some(fid), true) = (field, raw) {
@@ -50,6 +53,24 @@ pub async fn run(
             }
             None => anyhow::bail!("Field '{fid}' not present on issue {issue_key}"),
         }
+    }
+
+    if json_out {
+        let value: serde_json::Map<String, serde_json::Value> = fields
+            .iter()
+            .filter(|(_, v)| !v.is_null())
+            .map(|(id, value)| {
+                (
+                    id.clone(),
+                    serde_json::json!({
+                        "name": name_map.get(id.as_str()),
+                        "value": value,
+                    }),
+                )
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
     }
 
     // Full table output.

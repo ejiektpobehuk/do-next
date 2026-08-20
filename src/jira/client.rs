@@ -12,7 +12,7 @@ use crate::jira::types::{
     AgileIssuesResponse, AgilePage, Attachment, BoardConfiguration, ChangelogEntry, ChangelogPage,
     Comment, CommentPage, FieldMeta, FieldSchema, GreenHopperBoardData, GreenHopperSwimlane, Issue,
     IssueTypeField, KeysResponse, ProjectInfo, RankAnchor, SearchResponse, Sprint, StatusCategory,
-    StatusInfo, Transition, TransitionsResponse, Worklog, WorklogPage,
+    StatusDetail, StatusInfo, Transition, TransitionsResponse, Worklog, WorklogPage,
 };
 
 const MAX_RESULTS: u32 = 100;
@@ -1057,6 +1057,44 @@ impl JiraClient {
         Ok(page.issues.into_iter().map(|i| i.key).collect())
     }
 
+    /// How many issues a JQL query matches, fetching none of them —
+    /// `POST /rest/api/3/search/approximate-count`.
+    ///
+    /// The token-paginated `/search/jql` endpoint dropped `total`, so this is
+    /// what is left for asking "does this query match anything?" without
+    /// walking the result set. `Ok(None)` means the instance has no such
+    /// endpoint (Data Center), leaving the caller to fall back to a
+    /// one-issue probe; a malformed query still comes back as an error
+    /// carrying Jira's own explanation of it.
+    pub async fn approximate_count(&self, jql: &str) -> Result<Option<u32>> {
+        #[derive(serde::Deserialize)]
+        struct CountResponse {
+            count: u32,
+        }
+
+        let url = format!("{}/rest/api/3/search/approximate-count", self.base_url);
+        self.maybe_refresh().await?;
+        let resp = self
+            .apply_auth(self.client.post(&url))
+            .await
+            .json(&json!({ "jql": jql }))
+            .send()
+            .await
+            .context("Failed to send approximate-count request")?;
+
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Ok(None);
+        }
+
+        let page: CountResponse = crate::http::json_response("Jira", &url, resp)
+            .await
+            .context("Failed to parse approximate-count response")?;
+        Ok(Some(page.count))
+    }
+
     /// Recent comments, newest first.
     ///
     /// `orderBy=-created` is why this exists: the `comment` block inside a
@@ -1383,12 +1421,16 @@ impl JiraClient {
         &self.base_url
     }
 
-    /// Fetch all statuses configured on this Jira instance via
-    /// `GET /rest/api/3/status`. Returns the distinct status names alongside
-    /// their `statusCategory.key` (used to surface terminal statuses).
-    pub async fn get_all_statuses(&self) -> Result<Vec<StatusInfo>> {
+    /// Every status configured on this Jira instance via
+    /// `GET /rest/api/3/status`, ids and categories included.
+    ///
+    /// Ids are what make this the board-naming call: a board's column
+    /// configuration lists only status ids, so a column's statuses are named
+    /// by joining them against this list.
+    pub async fn get_all_statuses_detailed(&self) -> Result<Vec<StatusDetail>> {
         #[derive(serde::Deserialize)]
         struct RawStatus {
+            id: String,
             name: String,
             #[serde(rename = "statusCategory")]
             status_category: Option<RawCategory>,
@@ -1411,16 +1453,31 @@ impl JiraClient {
             .await
             .context("Failed to parse statuses")?;
 
+        Ok(raw
+            .into_iter()
+            .map(|s| StatusDetail {
+                id: s.id,
+                name: s.name,
+                category: s.status_category.map_or(StatusCategory::Undefined, |c| {
+                    StatusCategory::from_key(&c.key)
+                }),
+            })
+            .collect())
+    }
+
+    /// The instance's distinct status *names* with their categories — the
+    /// vocabulary a status picker offers. Deduped by name, because two
+    /// same-named statuses are one choice on screen; the ids that tell them
+    /// apart live in [`Self::get_all_statuses_detailed`].
+    pub async fn get_all_statuses(&self) -> Result<Vec<StatusInfo>> {
+        let detailed = self.get_all_statuses_detailed().await?;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out: Vec<StatusInfo> = Vec::new();
-        for s in raw {
+        for s in detailed {
             if seen.insert(s.name.clone()) {
-                let category = s.status_category.map_or(StatusCategory::Undefined, |c| {
-                    StatusCategory::from_key(&c.key)
-                });
                 out.push(StatusInfo {
                     name: s.name,
-                    category,
+                    category: s.category,
                 });
             }
         }
