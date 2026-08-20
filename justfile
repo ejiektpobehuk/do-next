@@ -39,6 +39,19 @@ watch:
 run:
     {{wrap}}cargo run
 
+# Update crate dependencies within their semver ranges and commit the new lock file
+update:
+    {{wrap}}cargo update
+    @git diff --quiet -- Cargo.lock || git commit --only Cargo.lock -m "chore: update cargo dependencies"
+
+# Scan the dependency tree for known security advisories (RustSec)
+audit:
+    {{wrap}}cargo audit
+
+# Find the minimum supported Rust version; `just msrv verify` checks the manifest instead
+msrv command="find":
+    {{wrap}}cargo msrv {{command}}
+
 # Enter the Nix dev shell
 shell:
     nix develop
