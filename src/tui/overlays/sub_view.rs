@@ -386,23 +386,19 @@ fn render_attachment_detail(f: &mut Frame, att: &Attachment, right_rect: Rect) {
     );
 }
 
-/// Height of a comment widget: top border (1) + header (1) + body lines + bottom border (1).
+/// Height of a comment widget: top border with header (1) + body lines +
+/// bottom border (1).
+///
+/// Measured with `Paragraph::line_count` over the same markdown lines the
+/// widget draws — word wrapping and the markdown line set both break a
+/// character-count estimate, and these offsets are what scrolling indexes into.
 fn measure_comment_block(comment: &Comment, width: u16) -> usize {
-    let usable = if width > 2 { (width - 2) as usize } else { 1 };
+    let usable = if width > 2 { width - 2 } else { 1 };
     let text = json_to_text(&comment.body);
-    let body_lines: usize = text
-        .lines()
-        .map(|line| {
-            let chars = line.chars().count();
-            if chars == 0 {
-                1
-            } else {
-                chars.div_ceil(usable)
-            }
-        })
-        .sum();
-    let body_rows = body_lines.max(1);
-    // border-top with title (1) + body + border-bottom (1)
+    let body_rows = Paragraph::new(markdown_to_lines(&text))
+        .wrap(Wrap { trim: false })
+        .line_count(usable)
+        .max(1);
     2 + body_rows
 }
 
@@ -490,30 +486,18 @@ fn render_comments(
         };
 
         let focused = idx == app.overlay_focused_comment && !dim_focus;
-        render_comment_widget(f, widget_area, comment, focused);
+        let clipped_top = scroll.saturating_sub(top);
+        let clipped_bottom = clipped_top + (visible_h as usize) < widget_h;
+        render_comment_widget(
+            f,
+            widget_area,
+            comment,
+            focused,
+            (clipped_top, clipped_bottom),
+        );
     }
 
-    // Render "press n" hint at the bottom of the virtual list
-    let hint_top = y; // virtual position of the hint line
-    if hint_top < scroll + viewport_h && hint_top + hint_h > scroll {
-        let screen_y =
-            area_top + u16::try_from(hint_top.saturating_sub(scroll)).unwrap_or(u16::MAX);
-        let hint_area = Rect {
-            x: inner.x,
-            y: screen_y,
-            width: inner.width,
-            height: 1,
-        };
-        let hint = Line::from(vec![
-            Span::styled("n", Style::default().fg(Color::Blue)),
-            Span::styled(
-                " — compose a new comment",
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ])
-        .alignment(Alignment::Center);
-        f.render_widget(Paragraph::new(vec![hint]), hint_area);
-    }
+    render_new_comment_hint(f, inner, y, scroll, viewport_h);
 
     if content_h > viewport_h {
         // Re-derive `area` from inner + border offset
@@ -523,14 +507,60 @@ fn render_comments(
             width: inner.width + 2,
             height: inner.height + 2,
         };
-        render_scrollbar(f, outer, content_h, viewport_h, scroll, theme::BORDER_FOCUS);
+        render_scrollbar(
+            f,
+            outer,
+            content_h - viewport_h + 1,
+            viewport_h,
+            scroll.min(content_h - viewport_h),
+            theme::BORDER_FOCUS,
+        );
     }
 }
 
-fn render_comment_widget(f: &mut Frame, area: Rect, comment: &Comment, focused: bool) {
+/// The "press n" hint that trails the last comment. `hint_top` is its row in
+/// the virtual list, so it scrolls with the comments rather than sticking.
+fn render_new_comment_hint(
+    f: &mut Frame,
+    inner: Rect,
+    hint_top: usize,
+    scroll: usize,
+    viewport_h: usize,
+) {
+    if hint_top >= scroll + viewport_h || hint_top < scroll {
+        return;
+    }
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.top() + u16::try_from(hint_top.saturating_sub(scroll)).unwrap_or(u16::MAX),
+        width: inner.width,
+        height: 1,
+    };
+    let hint = Line::from(vec![
+        Span::styled("n", Style::default().fg(Color::Blue)),
+        Span::styled(
+            " — compose a new comment",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ])
+    .alignment(Alignment::Center);
+    f.render_widget(Paragraph::new(vec![hint]), hint_area);
+}
+
+/// `clip` is `(rows cut off the top, whether the comment continues past the
+/// bottom)`: a border drawn on a clipped edge would cover a line of the
+/// comment, so that edge loses its border instead.
+fn render_comment_widget(
+    f: &mut Frame,
+    area: Rect,
+    comment: &Comment,
+    focused: bool,
+    clip: (usize, bool),
+) {
     if area.height == 0 {
         return;
     }
+    let (clipped_top, clipped_bottom) = clip;
 
     let border_style = if focused {
         Style::default().fg(theme::BORDER_FOCUS)
@@ -553,13 +583,20 @@ fn render_comment_widget(f: &mut Frame, area: Rect, comment: &Comment, focused: 
     };
     let header = format!("{author} · {created}{modified}");
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(Span::styled(
+    let mut block = Block::default()
+        .borders(crate::tui::widgets::scroll::clipped_borders(
+            clipped_top > 0,
+            clipped_bottom,
+        ))
+        .border_style(border_style);
+    // The author/date header lives on the top border; once that has scrolled
+    // away the title row would cover the first visible line of the comment.
+    if clipped_top == 0 {
+        block = block.title(Span::styled(
             format!(" {header} "),
             Style::default().add_modifier(Modifier::BOLD),
         ));
+    }
 
     let block_inner = block.inner(area);
     f.render_widget(block, area);
@@ -570,8 +607,14 @@ fn render_comment_widget(f: &mut Frame, area: Rect, comment: &Comment, focused: 
 
     let body_text = json_to_text(&comment.body);
     let styled_lines = markdown_to_lines(&body_text);
+    // Rows scrolled off the top, less the header row that went with them.
+    let inner_scroll = u16::try_from(clipped_top)
+        .unwrap_or(u16::MAX)
+        .saturating_sub(1);
     f.render_widget(
-        Paragraph::new(styled_lines).wrap(Wrap { trim: false }),
+        Paragraph::new(styled_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((inner_scroll, 0)),
         block_inner,
     );
 }

@@ -59,9 +59,19 @@ pub fn render_detail(
     let total_lines = render_detail_content(f, inner, app, render_out);
     render_out.detail_content_h = total_lines;
 
-    if total_lines > 0 {
-        let viewport = area.height.saturating_sub(2) as usize;
-        render_scrollbar(f, area, total_lines, viewport, app.detail_scroll, accent);
+    // Same convention as every other scrollbar caller: no track when the
+    // content fits, and `content - viewport + 1` so the thumb can reach the
+    // bottom row now that the bottom row is reachable.
+    let viewport = render_out.detail_viewport_h;
+    if viewport > 0 && total_lines > viewport {
+        render_scrollbar(
+            f,
+            area,
+            total_lines - viewport + 1,
+            viewport,
+            app.detail_scroll.min(total_lines - viewport),
+            accent,
+        );
     }
 }
 

@@ -7,7 +7,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols::border::{self, Set as BorderSet},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Paragraph, Wrap},
 };
 
 /// Border set that shows only the four corners; lines are replaced with spaces.
@@ -30,6 +30,7 @@ use crate::tui::app::{ActionState, AppState, DetailFocus};
 use crate::tui::markdown::markdown_to_lines;
 use crate::tui::render::RenderOut;
 use crate::tui::theme;
+use crate::tui::widgets::scroll;
 
 // ── Segment model ─────────────────────────────────────────────────────────────
 
@@ -125,6 +126,21 @@ pub fn num_view_fields(cfg: Option<&CustomViewConfig>, item: Option<&WorkItem>) 
         || item.map_or(0, |i| default_view_fields(i).len()),
         |c| c.sections.iter().map(|s| s.fields.len()).sum(),
     )
+}
+
+/// The view's focus ring, in the order the segments are laid out — the
+/// Comments and Attachments widgets (items that have them) followed by one
+/// entry per field. Index in this list is the index into
+/// `AppState::detail_focus_offsets`, so this is the single source of truth for
+/// both navigation and auto-scroll.
+pub fn focus_targets(cfg: Option<&CustomViewConfig>, item: Option<&WorkItem>) -> Vec<DetailFocus> {
+    let mut targets = Vec::new();
+    if item.is_none_or(WorkItem::supports_comments) {
+        targets.push(DetailFocus::Comments);
+        targets.push(DetailFocus::Attachments);
+    }
+    targets.extend((0..num_view_fields(cfg, item)).map(DetailFocus::Field));
+    targets
 }
 
 /// Retrieve the field config at flat index `idx`.
@@ -276,7 +292,10 @@ pub fn render_detail_view(
             height: avail_h,
         };
 
-        render_segment(f, rect, clipped_top, seg, app);
+        // Does the segment continue below the bottom of what we can draw?
+        let clipped_bottom = clipped_top + avail_rows < seg_height;
+
+        render_segment(f, rect, (clipped_top, clipped_bottom), seg, app);
     }
 
     virtual_y
@@ -290,7 +309,11 @@ pub fn current_view_config(app: &AppState) -> Option<&CustomViewConfig> {
     }
 }
 
-fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, app: &AppState) {
+/// `clip` is `(rows cut off the top, whether the segment continues past the
+/// bottom)` — bordered segments drop the border on a clipped edge so it does
+/// not cover a content row.
+fn render_segment(f: &mut Frame, rect: Rect, clip: (usize, bool), seg: &Segment, app: &AppState) {
+    let (clipped_top, clipped_bottom) = clip;
     match seg {
         Segment::ReadOnly { lines } => {
             #[allow(clippy::cast_possible_truncation)]
@@ -317,7 +340,7 @@ fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, 
                 Style::default().fg(theme::MUTED)
             };
             let block = Block::default()
-                .borders(Borders::ALL)
+                .borders(scroll::clipped_borders(clipped_top > 0, clipped_bottom))
                 .border_set(border::PLAIN)
                 .border_style(border_style);
             let inner = block.inner(rect);
@@ -333,7 +356,7 @@ fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, 
             }
         }
         Segment::EditableField { .. } => {
-            render_editable_field(f, rect, clipped_top, seg, app);
+            render_editable_field(f, rect, clip, seg, app);
         }
     }
 }
@@ -341,10 +364,11 @@ fn render_segment(f: &mut Frame, rect: Rect, clipped_top: usize, seg: &Segment, 
 fn render_editable_field(
     f: &mut Frame,
     rect: Rect,
-    clipped_top: usize,
+    clip: (usize, bool),
     seg: &Segment,
     app: &AppState,
 ) {
+    let (clipped_top, clipped_bottom) = clip;
     let Segment::EditableField {
         label,
         field_idx,
@@ -369,20 +393,21 @@ fn render_editable_field(
     } else {
         Style::default().fg(theme::MUTED)
     };
-    let title = format!(" {label} ");
-    let block = if *readonly {
-        Block::default()
-            .title(title.as_str())
-            .borders(Borders::ALL)
-            .border_set(CORNERS_ONLY)
-            .border_style(border_style)
+    let borders = scroll::clipped_borders(clipped_top > 0, clipped_bottom);
+    let border_set = if *readonly {
+        CORNERS_ONLY
     } else {
-        Block::default()
-            .title(title.as_str())
-            .borders(Borders::ALL)
-            .border_set(border::PLAIN)
-            .border_style(border_style)
+        border::PLAIN
     };
+    let mut block = Block::default()
+        .borders(borders)
+        .border_set(border_set)
+        .border_style(border_style);
+    // The label lives on the top border; once that has scrolled away the title
+    // row would cover the first visible line of content instead.
+    if clipped_top == 0 {
+        block = block.title(format!(" {label} "));
+    }
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -637,46 +662,41 @@ fn measure_segment(seg: &Segment, width: u16) -> usize {
         return 1;
     }
     match seg {
-        Segment::ReadOnly { lines } => lines
-            .iter()
-            .map(|l| measure_line(l, width))
-            .sum::<usize>()
-            .max(1),
+        Segment::ReadOnly { lines } => measure_paragraph(Paragraph::new(lines.clone()), width),
         Segment::NavWidget { content, .. } => {
             // Single-line content inside a full-border block → always 3 rows
             let _ = content; // content fits on one line
             3
         }
-        Segment::EditableField { content, .. } => {
-            let inner_w = (width as usize).saturating_sub(2).max(1);
-            let content_h = if content.is_empty() {
-                1
+        Segment::EditableField {
+            content,
+            is_markdown,
+            ..
+        } => {
+            let inner_w = width.saturating_sub(2).max(1);
+            let paragraph = if *is_markdown {
+                Paragraph::new(markdown_to_lines(content))
             } else {
-                content
-                    .lines()
-                    .map(|l| {
-                        let chars = l.chars().count();
-                        if chars == 0 {
-                            1
-                        } else {
-                            chars.div_ceil(inner_w)
-                        }
-                    })
-                    .sum::<usize>()
-                    .max(1)
+                Paragraph::new(content.as_str())
             };
-            2 + content_h // top border + content rows + bottom border
+            // top border + content rows + bottom border
+            2 + measure_paragraph(paragraph, inner_w)
         }
     }
 }
 
-fn measure_line(line: &Line, width: u16) -> usize {
-    let text_w: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-    if text_w == 0 {
-        1 // empty line still takes 1 row
-    } else {
-        text_w.div_ceil(width as usize).max(1)
-    }
+/// Height of `paragraph` once wrapped to `width`.
+///
+/// `Paragraph::line_count` rather than dividing a character count by the width:
+/// word wrapping breaks lines early, and a markdown field renders a different
+/// line set entirely (block gaps, list markers, blockquote prefixes). The
+/// segment offsets this feeds are what scrolling and the scrollbar index into,
+/// so they have to match the drawn rows exactly.
+fn measure_paragraph(paragraph: Paragraph, width: u16) -> usize {
+    paragraph
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
 }
 
 // ── Header section ────────────────────────────────────────────────────────────
@@ -1100,6 +1120,34 @@ mod tests {
         assert_eq!(second.field_id, "customfield_1");
 
         assert!(view_field_cfg(None, Some(&item), 2).is_none());
+    }
+
+    /// The focus ring is what `detail_focus_offsets` is indexed by, so its
+    /// order has to match `app::focus_offset_idx`: Comments, Attachments, then
+    /// one entry per field.
+    #[test]
+    fn the_focus_ring_lists_the_widgets_then_every_field() {
+        let item = jira_item(Some(adf("hello")), &["customfield_1"]);
+        assert_eq!(
+            focus_targets(None, Some(&item)),
+            [
+                DetailFocus::Comments,
+                DetailFocus::Attachments,
+                DetailFocus::Field(0),
+                DetailFocus::Field(1),
+            ]
+        );
+    }
+
+    /// Items with no comments or attachments (Confluence tasks, GitLab MRs)
+    /// must not offer those widgets — nothing renders them.
+    #[test]
+    fn the_focus_ring_skips_the_widgets_for_items_without_them() {
+        for item in [confluence_item(), gitlab_item()] {
+            let targets = focus_targets(None, Some(&item));
+            assert_eq!(targets.first(), Some(&DetailFocus::Field(0)));
+            assert_eq!(targets.len(), num_view_fields(None, Some(&item)));
+        }
     }
 
     #[test]

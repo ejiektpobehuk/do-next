@@ -65,12 +65,12 @@ fn key_line_colored(key: &'static str, desc: &'static str, color: Color) -> Line
 fn left_column() -> Vec<Line<'static>> {
     vec![
         section_header("Navigation"),
-        key_line("↑ / k", "move up"),
-        key_line("↓ / j", "move down"),
+        key_line("↑ / k", "select up, then scroll"),
+        key_line("↓ / j", "select down, then scroll"),
         key_line("← / h", "move left"),
         key_line("→ / l", "move right"),
-        key_line("gg / G", "first / last"),
-        key_line("PgUp / PgDn", "scroll"),
+        key_line("gg / G", "top / bottom of the page"),
+        key_line("PgUp / PgDn", "scroll a page"),
         Line::raw(""),
         section_header("View"),
         key_line("v", "cycle view modes"),

@@ -12,6 +12,7 @@ use crate::jira::types::{
     BoardConfiguration, Comment, FieldOption, FieldSchema, Issue, ProjectInfo, StatusInfo,
 };
 use crate::tui::search::{RankedHit, SearchFilters};
+use crate::tui::widgets::scroll;
 
 /// Per-team state that is saved/restored when switching tabs.
 #[derive(Debug, Clone)]
@@ -2727,6 +2728,18 @@ fn handle_comment_edit_confirm_input(
 }
 
 fn overlay_comment_nav_down(app: &mut AppState) {
+    overlay_comment_step(app, scroll::Dir::Down);
+}
+
+fn overlay_comment_nav_up(app: &mut AppState) {
+    overlay_comment_step(app, scroll::Dir::Up);
+}
+
+/// One `j`/`k` step in the comments overlay, with the same edge-aware scrolling
+/// as the detail view: a comment taller than the popup scrolls through line by
+/// line before focus hands over to the next one, and the trailing hint line
+/// below the last comment stays reachable.
+fn overlay_comment_step(app: &mut AppState, dir: scroll::Dir) {
     let count = app
         .selected_issue()
         .and_then(|i| i.fields.comment.as_ref())
@@ -2734,29 +2747,38 @@ fn overlay_comment_nav_down(app: &mut AppState) {
     if count == 0 {
         return;
     }
-    if app.overlay_focused_comment + 1 < count {
-        app.overlay_focused_comment += 1;
-        auto_scroll_to_comment(app);
-    }
-}
-
-fn overlay_comment_nav_up(app: &mut AppState) {
-    if app.overlay_focused_comment > 0 {
-        app.overlay_focused_comment -= 1;
-        auto_scroll_to_comment(app);
-    }
-}
-
-fn auto_scroll_to_comment(app: &mut AppState) {
-    let idx = app.overlay_focused_comment;
-    let Some(&(top, bottom)) = app.overlay_comment_offsets.get(idx) else {
-        return;
+    let idx = app.overlay_focused_comment.min(count - 1);
+    let Some(&block) = app.overlay_comment_offsets.get(idx) else {
+        return; // No frame measured yet.
     };
-    let viewport_h = app.overlay_viewport_h;
-    if top < app.overlay_scroll {
-        app.overlay_scroll = top;
-    } else if bottom > app.overlay_scroll + viewport_h {
-        app.overlay_scroll = bottom.saturating_sub(viewport_h);
+    let next = match dir {
+        scroll::Dir::Down => (idx + 1 < count).then_some(idx + 1),
+        scroll::Dir::Up => idx.checked_sub(1),
+    };
+    match scroll::step(
+        dir,
+        app.overlay_scroll,
+        app.overlay_viewport_h,
+        app.overlay_content_h,
+        block,
+        next.is_some(),
+        1,
+    ) {
+        scroll::Step::Scroll(offset) => app.overlay_scroll = offset,
+        scroll::Step::MoveFocus => {
+            if let Some(next) = next {
+                app.overlay_focused_comment = next;
+                if let Some(&block) = app.overlay_comment_offsets.get(next) {
+                    app.overlay_scroll = scroll::reveal_block(
+                        app.overlay_scroll,
+                        app.overlay_viewport_h,
+                        block,
+                        dir,
+                    );
+                }
+            }
+        }
+        scroll::Step::Stop => {}
     }
 }
 
@@ -3215,12 +3237,8 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
             };
             app.detail_scroll = 0;
         }
-        (KeyCode::PageDown, _) => {
-            app.detail_scroll = app.detail_scroll.saturating_add(10);
-        }
-        (KeyCode::PageUp, _) => {
-            app.detail_scroll = app.detail_scroll.saturating_sub(10);
-        }
+        (KeyCode::PageDown, _) => page_detail_scroll(app, scroll::Dir::Down),
+        (KeyCode::PageUp, _) => page_detail_scroll(app, scroll::Dir::Up),
         (KeyCode::Char('o'), _) => {
             if let Some(item) = app.selected_item() {
                 let url = item.browse_url(&app.team_jira().base_url);
@@ -4519,28 +4537,10 @@ fn key_nav_down(app: &mut AppState) {
     if app.focused_panel == FocusedPanel::Detail
         && matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
     {
-        let view_cfg = crate::tui::views::custom::current_view_config(app);
-        let num_fields = crate::tui::views::custom::num_view_fields(view_cfg, app.selected_item());
-        app.detail_focus = match &app.detail_focus {
-            DetailFocus::Comments => DetailFocus::Attachments,
-            DetailFocus::Attachments => {
-                if num_fields > 0 {
-                    DetailFocus::Field(0)
-                } else {
-                    DetailFocus::Attachments
-                }
-            }
-            DetailFocus::Field(i) => {
-                if *i + 1 < num_fields {
-                    DetailFocus::Field(i + 1)
-                } else {
-                    DetailFocus::Field(*i)
-                }
-            }
-        };
-        auto_scroll_to_field(app);
+        detail_step(app, scroll::Dir::Down);
     } else if app.focused_panel == FocusedPanel::Detail {
         app.detail_scroll = app.detail_scroll.saturating_add(1);
+        clamp_detail_scroll(app);
     } else if !app.nav_items.is_empty() {
         app.nav_idx = (app.nav_idx + 1).min(app.nav_items.len() - 1);
         update_view_mode_on_navigate(app);
@@ -4551,19 +4551,7 @@ fn key_nav_up(app: &mut AppState) {
     if app.focused_panel == FocusedPanel::Detail
         && matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
     {
-        let has_widgets = app.selected_item().is_none_or(WorkItem::supports_comments);
-        app.detail_focus = match &app.detail_focus {
-            DetailFocus::Comments | DetailFocus::Attachments => DetailFocus::Comments,
-            DetailFocus::Field(0) => {
-                if has_widgets {
-                    DetailFocus::Attachments
-                } else {
-                    DetailFocus::Field(0)
-                }
-            }
-            DetailFocus::Field(i) => DetailFocus::Field(i - 1),
-        };
-        auto_scroll_to_field(app);
+        detail_step(app, scroll::Dir::Up);
     } else if app.focused_panel == FocusedPanel::Detail {
         app.detail_scroll = app.detail_scroll.saturating_sub(1);
     } else if app.nav_idx > 0 {
@@ -4573,7 +4561,8 @@ fn key_nav_up(app: &mut AppState) {
 }
 
 /// The first focusable detail element: the Comments widget for Jira issues,
-/// the first field for items without comment/attachment widgets.
+/// the first field for items without comment/attachment widgets. Must agree
+/// with the head of `views::custom::focus_targets`.
 fn first_detail_focus(item: Option<&WorkItem>) -> DetailFocus {
     if item.is_none_or(WorkItem::supports_comments) {
         DetailFocus::Comments
@@ -4590,10 +4579,10 @@ fn key_jump_first(app: &mut AppState) {
     if app.focused_panel == FocusedPanel::Detail {
         if matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) {
             app.detail_focus = first_detail_focus(app.selected_item());
-            auto_scroll_to_field(app);
-        } else {
-            app.detail_scroll = 0;
         }
+        // The very top of the page, not the top of the first focusable item —
+        // the header sits above it.
+        app.detail_scroll = 0;
     } else {
         app.nav_idx = 0;
         update_view_mode_on_navigate(app);
@@ -4606,21 +4595,16 @@ fn key_jump_last(app: &mut AppState) {
         return;
     }
     if app.focused_panel == FocusedPanel::Detail {
-        if matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_)) {
-            let view_cfg = crate::tui::views::custom::current_view_config(app);
-            let num_fields =
-                crate::tui::views::custom::num_view_fields(view_cfg, app.selected_item());
-            app.detail_focus = if num_fields > 0 {
-                DetailFocus::Field(num_fields - 1)
-            } else {
-                DetailFocus::Attachments
-            };
-            auto_scroll_to_field(app);
-        } else {
-            app.detail_scroll = app
-                .last_detail_content_h
-                .saturating_sub(app.last_detail_viewport_h);
+        if matches!(app.view_mode, ViewMode::Default | ViewMode::Custom(_))
+            && let Some(last) = detail_focus_targets(app).pop()
+        {
+            app.detail_focus = last;
         }
+        // The very bottom of the page: trailing read-only rows sit below the
+        // last focusable item.
+        app.detail_scroll = app
+            .last_detail_content_h
+            .saturating_sub(app.last_detail_viewport_h);
     } else if !app.nav_items.is_empty() {
         app.nav_idx = app.nav_items.len() - 1;
         update_view_mode_on_navigate(app);
@@ -5040,22 +5024,88 @@ fn focus_offset_idx(focus: &DetailFocus) -> usize {
     }
 }
 
-fn auto_scroll_to_field(app: &mut AppState) {
-    let idx = focus_offset_idx(&app.detail_focus);
-    let Some(&(top, bottom)) = app.detail_focus_offsets.get(idx) else {
+/// The detail view's focus ring for the current item and view config.
+fn detail_focus_targets(app: &AppState) -> Vec<DetailFocus> {
+    let cfg = crate::tui::views::custom::current_view_config(app);
+    crate::tui::views::custom::focus_targets(cfg, app.selected_item())
+}
+
+/// One `j`/`k` step in the detail view. Focus hops between the view's
+/// focusable segments, but where there is nothing left to select in that
+/// direction the offset scrolls instead: through a segment taller than the
+/// viewport (descriptions routinely are), up into the header above the first
+/// segment, and down into the trailing rows below the last. The focus
+/// highlight stays on its anchor segment even when that scrolls off screen.
+fn detail_step(app: &mut AppState, dir: scroll::Dir) {
+    let targets = detail_focus_targets(app);
+    let Some(pos) = targets.iter().position(|t| *t == app.detail_focus) else {
+        // Focus is stale (the item or view changed under it) — re-seat it.
+        app.detail_focus = first_detail_focus(app.selected_item());
         return;
     };
-    let viewport_h = app.last_detail_viewport_h;
-    if bottom.saturating_sub(top) > viewport_h {
-        // Taller than the viewport — it can never be shown whole, so align to
-        // its start rather than scrolling past the opening lines. Descriptions
-        // routinely land here.
-        app.detail_scroll = top;
-    } else if bottom > app.detail_scroll + viewport_h {
-        app.detail_scroll = bottom.saturating_sub(viewport_h);
-    } else if top < app.detail_scroll {
-        app.detail_scroll = top;
+    let Some(&block) = app
+        .detail_focus_offsets
+        .get(focus_offset_idx(&app.detail_focus))
+    else {
+        return; // No frame measured yet.
+    };
+    let next = match dir {
+        scroll::Dir::Down => targets.get(pos + 1),
+        scroll::Dir::Up => pos.checked_sub(1).and_then(|p| targets.get(p)),
+    };
+    match scroll::step(
+        dir,
+        app.detail_scroll,
+        app.last_detail_viewport_h,
+        app.last_detail_content_h,
+        block,
+        next.is_some(),
+        1,
+    ) {
+        scroll::Step::Scroll(offset) => app.detail_scroll = offset,
+        scroll::Step::MoveFocus => {
+            if let Some(next) = next {
+                app.detail_focus = next.clone();
+                reveal_detail_focus(app, dir);
+            }
+        }
+        scroll::Step::Stop => {}
     }
+}
+
+/// Scroll the focused detail segment into view after focus moved in `dir`.
+fn reveal_detail_focus(app: &mut AppState, dir: scroll::Dir) {
+    let Some(&block) = app
+        .detail_focus_offsets
+        .get(focus_offset_idx(&app.detail_focus))
+    else {
+        return;
+    };
+    app.detail_scroll =
+        scroll::reveal_block(app.detail_scroll, app.last_detail_viewport_h, block, dir);
+}
+
+/// `PageUp`/`PageDown` in the detail panel: a fixed jump, clamped to the page.
+/// Focus stays where it is, exactly as when `j`/`k` scroll past it.
+fn page_detail_scroll(app: &mut AppState, dir: scroll::Dir) {
+    const PAGE: usize = 10;
+    match dir {
+        scroll::Dir::Down => {
+            app.detail_scroll = app.detail_scroll.saturating_add(PAGE);
+            clamp_detail_scroll(app);
+        }
+        scroll::Dir::Up => app.detail_scroll = app.detail_scroll.saturating_sub(PAGE),
+    }
+}
+
+/// No scrolling past the end of the detail content, and none at all when the
+/// content fits. Heights come from the last rendered frame — which is the one
+/// the user was looking at when they pressed the key.
+fn clamp_detail_scroll(app: &mut AppState) {
+    let max_scroll = app
+        .last_detail_content_h
+        .saturating_sub(app.last_detail_viewport_h);
+    app.detail_scroll = app.detail_scroll.min(max_scroll);
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -5947,6 +5997,251 @@ mod tests {
             credential_key: None,
         });
         team
+    }
+
+    /// Render the default detail view of an issue whose description is far
+    /// taller than the panel, and return the visible rows.
+    ///
+    /// Rendering is normally left untested here, but the scroll offsets, the
+    /// measured segment heights and the borders drawn on clipped edges have to
+    /// agree row for row — and nothing but a real frame proves they do.
+    fn rendered_detail_rows(scroll: usize) -> (Vec<String>, usize) {
+        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+        let teams = vec![resolved_team("platform", vec![jira_source("mine")])];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        let mut issue = make_issue("PROJ-1", "Open", Some("mine"));
+        let body: String = (1..=20)
+            .map(|i| format!("description line {i}\n\n"))
+            .collect();
+        issue.fields.description = Some(serde_json::json!(body));
+        app.sources.insert(
+            "mine".into(),
+            SourceState::Loaded(vec![WorkItem::Jira(issue)]),
+        );
+        app.rebuild_issues();
+        app.view_mode = ViewMode::Default;
+        app.detail_scroll = scroll;
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 44,
+            height: 14,
+        };
+        let item = app.selected_item().expect("the fixture issue").clone();
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test backend starts");
+        let mut out = crate::tui::render::RenderOut::default();
+        let mut content_h = 0;
+        terminal
+            .draw(|f| {
+                content_h =
+                    crate::tui::views::custom::render_detail_view(f, area, &item, &app, &mut out);
+            })
+            .expect("frame draws");
+
+        let buf = terminal.backend().buffer().clone();
+        let rows = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect();
+        (rows, content_h)
+    }
+
+    /// Both halves of the reported bug, checked against real frames: the header
+    /// is on screen at the top of the page, and the description's final line is
+    /// on screen at the bottom — it used to sit behind the bottom border, one
+    /// row past anywhere the offset could reach.
+    #[test]
+    fn the_detail_view_can_show_both_its_header_and_the_end_of_a_long_description() {
+        let (top_rows, content_h) = rendered_detail_rows(0);
+        assert!(
+            top_rows[0].contains("Summary PROJ-1"),
+            "header should lead the page, got {:?}",
+            top_rows[0]
+        );
+
+        let viewport_h = 14;
+        let (bottom_rows, _) = rendered_detail_rows(content_h - viewport_h);
+        let visible = bottom_rows.join("\n");
+        assert!(
+            visible.contains("description line 20"),
+            "the description's last line must be reachable, got:\n{visible}"
+        );
+        assert!(
+            bottom_rows.iter().any(|r| r.contains('\u{2518}')),
+            "and its closing border with it, got:\n{visible}"
+        );
+    }
+
+    // ── Detail-view scrolling ────────────────────────────────────────────
+    //
+    // The renderer feeds the key handlers measured geometry through
+    // `detail_focus_offsets` / `last_detail_*`, so these tests supply that
+    // geometry directly instead of driving a terminal.
+
+    const DETAIL_VIEWPORT: usize = 10;
+    /// Read-only header rows above the first focusable segment.
+    const HEADER_H: usize = 4;
+    /// A description far taller than the viewport.
+    const TALL_H: usize = 26;
+    /// Read-only rows trailing below the last focusable segment.
+    const FOOTER_H: usize = 4;
+
+    /// An app focused on the detail panel of a Jira issue, with synthetic
+    /// geometry: header, the Comments and Attachments widgets, an oversized
+    /// first field, short remaining fields, then trailing read-only rows.
+    fn detail_app() -> (AppState, Vec<DetailFocus>) {
+        let teams = vec![resolved_team("platform", vec![jira_source("mine")])];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        let mut issue = make_issue("PROJ-1", "Open", Some("mine"));
+        // The default view lists the description first, then every extra field.
+        for id in ["customfield_1", "customfield_2"] {
+            issue
+                .fields
+                .extra
+                .insert(id.to_owned(), serde_json::json!("value"));
+        }
+        app.sources.insert(
+            "mine".into(),
+            SourceState::Loaded(vec![WorkItem::Jira(issue)]),
+        );
+        app.rebuild_issues();
+        app.focused_panel = FocusedPanel::Detail;
+        app.view_mode = ViewMode::Default;
+        app.detail_focus = DetailFocus::Comments;
+
+        let targets = detail_focus_targets(&app);
+        assert!(
+            targets.len() > 3,
+            "fixture needs the two widgets plus at least two fields"
+        );
+        let mut y = HEADER_H;
+        app.detail_focus_offsets = targets
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let h = if i == 2 { TALL_H } else { 3 };
+                let block = (y, y + h);
+                y += h;
+                block
+            })
+            .collect();
+        app.last_detail_viewport_h = DETAIL_VIEWPORT;
+        app.last_detail_content_h = y + FOOTER_H;
+        (app, targets)
+    }
+
+    /// The reported bug: with no focusable segment above the Comments widget,
+    /// `k` used to snap the offset to that widget's top and leave the header
+    /// permanently off screen.
+    #[test]
+    fn scrolling_up_past_the_first_widget_reveals_the_header() {
+        let (mut app, _) = detail_app();
+        app.detail_scroll = HEADER_H;
+
+        for expected in (0..HEADER_H).rev() {
+            key_nav_up(&mut app);
+            assert_eq!(app.detail_scroll, expected);
+            assert_eq!(app.detail_focus, DetailFocus::Comments, "anchor stays put");
+        }
+        // Top of the page — nothing further to reveal.
+        key_nav_up(&mut app);
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    /// The other half of the bug: a description taller than the panel could
+    /// only ever show its first screenful, because `j` jumped to the next
+    /// field instead of scrolling.
+    #[test]
+    fn scrolling_down_walks_through_an_oversized_field_before_leaving_it() {
+        let (mut app, targets) = detail_app();
+        app.detail_focus = targets[2].clone();
+        let (top, bottom) = app.detail_focus_offsets[2];
+        app.detail_scroll = top;
+
+        // Every step advances the offset while the field runs off the bottom…
+        for _ in 0..(bottom - top - DETAIL_VIEWPORT) {
+            let before = app.detail_scroll;
+            key_nav_down(&mut app);
+            assert_eq!(app.detail_scroll, before + 1);
+            assert_eq!(app.detail_focus, targets[2]);
+        }
+        // …and its last row is on screen before focus hands over.
+        assert_eq!(app.detail_scroll, bottom - DETAIL_VIEWPORT);
+        key_nav_down(&mut app);
+        assert_eq!(app.detail_focus, targets[3]);
+    }
+
+    /// Entered from below, an oversized field shows its end — otherwise `k`
+    /// would skip the whole thing and land on its opening lines.
+    #[test]
+    fn scrolling_up_into_an_oversized_field_shows_its_end() {
+        let (mut app, targets) = detail_app();
+        app.detail_focus = targets[3].clone();
+        let (top, _) = app.detail_focus_offsets[3];
+        app.detail_scroll = top;
+
+        key_nav_up(&mut app);
+        assert_eq!(app.detail_focus, targets[2]);
+        let (_, tall_bottom) = app.detail_focus_offsets[2];
+        assert_eq!(app.detail_scroll, tall_bottom - DETAIL_VIEWPORT);
+    }
+
+    #[test]
+    fn scrolling_down_past_the_last_field_reveals_the_trailing_rows_and_stops() {
+        let (mut app, targets) = detail_app();
+        app.detail_focus = targets.last().expect("targets are non-empty").clone();
+        let max_scroll = app.last_detail_content_h - DETAIL_VIEWPORT;
+        app.detail_scroll = max_scroll - FOOTER_H;
+
+        for _ in 0..FOOTER_H {
+            let before = app.detail_scroll;
+            key_nav_down(&mut app);
+            assert_eq!(app.detail_scroll, before + 1);
+        }
+        assert_eq!(app.detail_scroll, max_scroll);
+        // End of the page — and never past it.
+        key_nav_down(&mut app);
+        assert_eq!(app.detail_scroll, max_scroll);
+    }
+
+    #[test]
+    fn gg_and_shift_g_reach_the_true_top_and_bottom_of_the_page() {
+        let (mut app, targets) = detail_app();
+        app.detail_scroll = 12;
+
+        key_jump_last(&mut app);
+        assert_eq!(
+            app.detail_scroll,
+            app.last_detail_content_h - DETAIL_VIEWPORT
+        );
+        assert_eq!(app.detail_focus, *targets.last().expect("non-empty"));
+
+        key_jump_first(&mut app);
+        assert_eq!(app.detail_scroll, 0);
+        assert_eq!(app.detail_focus, DetailFocus::Comments);
+    }
+
+    /// Before the first frame there is no measured geometry, so navigation has
+    /// nothing to act on and must not panic or move the offset.
+    #[test]
+    fn detail_navigation_is_inert_without_measured_geometry() {
+        let (mut app, _) = detail_app();
+        app.detail_focus_offsets.clear();
+        app.last_detail_viewport_h = 0;
+        app.last_detail_content_h = 0;
+        app.detail_scroll = 0;
+
+        key_nav_down(&mut app);
+        key_nav_up(&mut app);
+        assert_eq!(app.detail_scroll, 0);
     }
 
     #[test]
