@@ -70,6 +70,32 @@ enum CompanyAction {
     Teams,
 }
 
+/// Pre-resolved Confluence credentials, keyed by base URL. A URL missing from
+/// the map shares its team's Jira auth handle instead (see
+/// [`confluence_shares_jira`]).
+type ConfluenceAuths = std::collections::HashMap<String, jira::auth::Auth>;
+
+/// True when a team's sources include Confluence. Normal *and* on-duty sources
+/// count: the duty view can be toggled on at runtime (`D`), so its clients must
+/// exist up front.
+fn needs_confluence(team: &config::types::ResolvedTeam) -> bool {
+    let duty_sources = team
+        .grafana
+        .iter()
+        .flat_map(|grafana| &grafana.on_duty_sources);
+    team.normal_sources
+        .iter()
+        .chain(duty_sources)
+        .any(|s| s.kind == config::types::SourceKind::Confluence)
+}
+
+/// True when a team's effective Confluence connection is its Jira one, so the
+/// two clients can share an auth handle — keeping OAuth refresh coordinated and
+/// saving a second credential lookup.
+fn confluence_shares_jira(team: &config::types::ResolvedTeam) -> bool {
+    team.confluence == team.jira && std::env::var("DO_NEXT_CONFLUENCE_API_TOKEN").is_err()
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -270,23 +296,65 @@ async fn main() -> Result<()> {
     // client construction so Confluence needs and fetches see the effective
     // source set.
     if cli.command.is_none() {
-        // Teams that want the on-call view but have no token anywhere get an
-        // interactive setup offer first (like the Jira auth prompts).
-        // Declining skips for this launch only; `do-next auth` works any time.
+        // Teams that want the on-call view (Grafana) or have GitLab sources but
+        // no token anywhere get an interactive setup offer first (like the Jira
+        // auth prompts). Declining skips for this launch only; `do-next auth`
+        // works any time.
+        //
+        // Both probes are independent keyring lookups, so they run together: a
+        // slow or locked secret service is waited on once instead of twice.
+        // Only the *reads* overlap — the setup offers below stay strictly
+        // serial, because two prompts cannot share one terminal, and each may
+        // rewrite the config the next check reads.
         let has_grafana = loaded.teams.iter().any(|t| t.grafana.is_some());
-        let step = has_grafana.then(|| startup::Step::start("reading Grafana OnCall token"));
-        let missing = grafana::teams_missing_token(&loaded.teams);
-        if let Some(step) = step {
-            if missing.is_empty() {
-                step.done("Grafana OnCall token found");
-            } else {
-                // Finish the line before the setup offer takes over the screen.
-                step.warn("no Grafana OnCall token stored");
-            }
-        }
-        if !missing.is_empty() {
+        let has_gitlab = loaded
+            .teams
+            .iter()
+            .any(config::types::ResolvedTeam::uses_gitlab);
+
+        let (missing_grafana, missing_gitlab) = {
+            let (group, [grafana_slot, gitlab_slot]) = startup::Group::start([
+                has_grafana.then_some("reading Grafana OnCall token"),
+                has_gitlab.then_some("reading GitLab token"),
+            ]);
+            let teams = &loaded.teams;
+            let probes = std::thread::scope(|scope| {
+                let grafana_probe = scope.spawn(|| {
+                    let missing = grafana::teams_missing_token(teams);
+                    if missing.is_empty() {
+                        grafana_slot.done("Grafana OnCall token found");
+                    } else {
+                        grafana_slot.warn("no Grafana OnCall token stored");
+                    }
+                    missing
+                });
+                let gitlab_probe = scope.spawn(|| {
+                    let missing = gitlab::teams_missing_token(teams);
+                    if missing.is_empty() {
+                        gitlab_slot.done("GitLab token found");
+                    } else {
+                        gitlab_slot.warn("no GitLab token stored");
+                    }
+                    missing
+                });
+                (grafana_probe.join(), gitlab_probe.join())
+            });
+            // Dropping the group collapses the block, so the setup offers below
+            // start on a clean line.
+            drop(group);
+            (
+                probes
+                    .0
+                    .map_err(|_| anyhow::anyhow!("Grafana token probe panicked"))?,
+                probes
+                    .1
+                    .map_err(|_| anyhow::anyhow!("GitLab token probe panicked"))?,
+            )
+        };
+
+        if !missing_grafana.is_empty() {
             let mut configured = false;
-            for target in &missing {
+            for target in &missing_grafana {
                 match tui::onboarding::grafana::setup_grafana_token(target, &mut loaded.raw).await {
                     Ok(tui::onboarding::SetupOutcome::Configured) => configured = true,
                     Ok(_) => {}
@@ -302,25 +370,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Same offer for teams with GitLab sources and no token anywhere. A
-        // declined or failed setup must not block the launch — the GitLab
-        // sources report the missing token as their own error rows.
-        let step = loaded
-            .teams
-            .iter()
-            .any(config::types::ResolvedTeam::uses_gitlab)
-            .then(|| startup::Step::start("reading GitLab token"));
-        let missing = gitlab::teams_missing_token(&loaded.teams);
-        if let Some(step) = step {
-            if missing.is_empty() {
-                step.done("GitLab token found");
-            } else {
-                step.warn("no GitLab token stored");
-            }
-        }
-        if !missing.is_empty() {
+        // A declined or failed GitLab setup must not block the launch either —
+        // the GitLab sources report the missing token as their own error rows.
+        if !missing_gitlab.is_empty() {
             let mut configured = false;
-            for target in &missing {
+            for target in &missing_gitlab {
                 match tui::onboarding::gitlab::setup_gitlab_token(target, &mut loaded.raw).await {
                     Ok(tui::onboarding::SetupOutcome::Configured) => configured = true,
                     Ok(_) => {}
@@ -354,129 +408,188 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Build one JiraClient per unique base_url across all teams.
+    // Every credential below is an independent blocking lookup — a keyring
+    // read, a `credential_command` subprocess, an OAuth token file — so all
+    // three run at once and the launch waits out the slowest, not their sum.
+    // Only resolution is parallel: building the clients afterwards is pure CPU,
+    // and keeping it serial is what lets Confluence borrow Jira's auth handle.
     let mut clients = sources::Clients {
         jira: std::collections::HashMap::new(),
         confluence: std::collections::HashMap::new(),
         gitlab: std::collections::HashMap::new(),
     };
-    let step = startup::Step::start("resolving Jira credentials");
-    for team in &loaded.teams {
-        let url = &team.jira.base_url;
-        if !clients.jira.contains_key(url) {
-            let auth = config::credentials::resolve_auth(&team.jira)
-                .with_context(|| format!("Failed to resolve auth for team '{}'", team.id))?;
-            let client = jira::JiraClient::new(url.clone(), auth)
-                .with_context(|| format!("Failed to create Jira client for team '{}'", team.id))?;
-            clients.jira.insert(url.clone(), client);
-        }
-    }
-    let jira_count = clients.jira.len();
-    step.done(format!(
-        "Jira ready ({jira_count} instance{})",
-        if jira_count == 1 { "" } else { "s" }
-    ));
+    let needs_gitlab = loaded
+        .teams
+        .iter()
+        .any(config::types::ResolvedTeam::uses_gitlab);
+    let resolved = {
+        let (group, [jira_slot, confluence_slot, gitlab_slot]) = startup::Group::start([
+            Some("resolving Jira credentials"),
+            loaded
+                .teams
+                .iter()
+                .any(needs_confluence)
+                .then_some("resolving Confluence credentials"),
+            needs_gitlab.then_some("resolving GitLab credentials"),
+        ]);
+        let teams = &loaded.teams;
+        let resolved = std::thread::scope(|scope| {
+            // One auth per unique Jira base_url across all teams.
+            let jira = scope.spawn(|| -> Result<Vec<(String, String, jira::auth::Auth)>> {
+                let mut auths: Vec<(String, String, jira::auth::Auth)> = Vec::new();
+                for team in teams {
+                    let url = &team.jira.base_url;
+                    if auths.iter().any(|(seen, _, _)| seen == url) {
+                        continue;
+                    }
+                    let auth =
+                        config::credentials::resolve_auth(&team.jira).with_context(|| {
+                            format!("Failed to resolve auth for team '{}'", team.id)
+                        })?;
+                    auths.push((url.clone(), team.id.clone(), auth));
+                }
+                let count = auths.len();
+                jira_slot.done(format!(
+                    "Jira ready ({count} instance{})",
+                    if count == 1 { "" } else { "s" }
+                ));
+                Ok(auths)
+            });
 
-    // Build one ConfluenceClient per unique Confluence base_url, but only for
-    // teams that define confluence sources. When the effective Confluence
-    // connection equals the team's Jira one, share the auth handle so OAuth
-    // refresh stays coordinated (and no second credential lookup runs).
-    let step = startup::Step::start("resolving Confluence credentials");
+            // One auth per unique Confluence base_url, but only for teams that
+            // define Confluence sources and whose Confluence connection differs
+            // from their Jira one — the rest share Jira's auth handle, which
+            // costs no lookup at all. The dedup order mirrors the construction
+            // loop below, so the same team wins each URL.
+            let confluence = scope.spawn(|| -> Result<ConfluenceAuths> {
+                let mut needed: Vec<String> = Vec::new();
+                let mut own: std::collections::HashMap<String, jira::auth::Auth> =
+                    std::collections::HashMap::new();
+                for team in teams {
+                    if !needs_confluence(team) {
+                        continue;
+                    }
+                    let url = team.confluence.base_url.clone();
+                    if needed.contains(&url) {
+                        continue;
+                    }
+                    needed.push(url.clone());
+                    if confluence_shares_jira(team) {
+                        continue;
+                    }
+                    let auth = config::credentials::resolve_confluence_auth(&team.confluence)
+                        .with_context(|| {
+                            format!("Failed to resolve Confluence auth for team '{}'", team.id)
+                        })?;
+                    own.insert(url, auth);
+                }
+                let count = needed.len();
+                if count == 0 {
+                    // No team asked for Confluence — nothing happened, say nothing.
+                    confluence_slot.clear();
+                } else {
+                    confluence_slot.done(format!(
+                        "Confluence ready ({count} instance{})",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                }
+                Ok(own)
+            });
+
+            // One token per unique GitLab instance, for teams whose normal or
+            // on-duty sources include a GitLab source (the `D` toggle can add
+            // duty sources at runtime). A missing token is not fatal: the
+            // source reports it, so the rest of the list still loads.
+            let gitlab = scope.spawn(|| {
+                let mut tokens: Vec<(String, String, String)> = Vec::new();
+                let mut warnings = Vec::new();
+                for team in teams {
+                    if !team.uses_gitlab() {
+                        continue;
+                    }
+                    let url = team.gitlab.base_url.clone();
+                    if tokens.iter().any(|(seen, _, _)| *seen == url) {
+                        continue;
+                    }
+                    match config::credentials::resolve_gitlab_token(&team.gitlab) {
+                        Ok(Some(token)) => tokens.push((url, team.id.clone(), token)),
+                        Ok(None) => warnings.push(format!(
+                            "team '{}': no GitLab token configured for {url} \
+                             (run `do-next auth` to set it up)",
+                            team.id
+                        )),
+                        Err(e) => warnings.push(format!(
+                            "team '{}': GitLab token resolution failed: {e:#}",
+                            team.id
+                        )),
+                    }
+                }
+                if !warnings.is_empty() {
+                    gitlab_slot.warn("GitLab credentials incomplete");
+                } else if tokens.is_empty() {
+                    gitlab_slot.clear();
+                } else {
+                    let count = tokens.len();
+                    gitlab_slot.done(format!(
+                        "GitLab ready ({count} instance{})",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                }
+                (tokens, warnings)
+            });
+
+            (jira.join(), confluence.join(), gitlab.join())
+        });
+        // Collapse the block before any warning or error below is printed.
+        drop(group);
+        resolved
+    };
+    let jira_auths = resolved
+        .0
+        .map_err(|_| anyhow::anyhow!("Jira credential resolution panicked"))??;
+    let mut confluence_auths = resolved
+        .1
+        .map_err(|_| anyhow::anyhow!("Confluence credential resolution panicked"))??;
+    let (gitlab_tokens, gitlab_warnings) = resolved
+        .2
+        .map_err(|_| anyhow::anyhow!("GitLab credential resolution panicked"))?;
+
+    for (url, team_id, auth) in jira_auths {
+        let client = jira::JiraClient::new(url.clone(), auth)
+            .with_context(|| format!("Failed to create Jira client for team '{team_id}'"))?;
+        clients.jira.insert(url, client);
+    }
+
     for team in &loaded.teams {
-        // Consider normal AND on-duty sources: the duty view can be toggled
-        // on at runtime (`D`), so its clients must exist up front.
-        let duty_sources = team
-            .grafana
-            .iter()
-            .flat_map(|grafana| &grafana.on_duty_sources);
-        let needs_confluence = team
-            .normal_sources
-            .iter()
-            .chain(duty_sources)
-            .any(|s| s.kind == config::types::SourceKind::Confluence);
-        if !needs_confluence {
+        if !needs_confluence(team) {
             continue;
         }
         let url = team.confluence.base_url.clone();
         if clients.confluence.contains_key(&url) {
             continue;
         }
-        let same_as_jira =
-            team.confluence == team.jira && std::env::var("DO_NEXT_CONFLUENCE_API_TOKEN").is_err();
-        let client = if same_as_jira {
+        // Present in the map means this URL resolved its own credentials above;
+        // absent means it shares Jira's auth handle, so OAuth refresh stays
+        // coordinated across the two clients.
+        let client = if let Some(auth) = confluence_auths.remove(&url) {
+            confluence::ConfluenceClient::new(&url, auth)
+        } else {
             let jira_client = clients
                 .jira
                 .get(&team.jira.base_url)
                 .context("No Jira client for shared Confluence auth")?;
             confluence::ConfluenceClient::from_shared(&url, jira_client.auth_handle())
-        } else {
-            let auth = config::credentials::resolve_confluence_auth(&team.confluence)
-                .with_context(|| {
-                    format!("Failed to resolve Confluence auth for team '{}'", team.id)
-                })?;
-            confluence::ConfluenceClient::new(&url, auth)
         }
         .with_context(|| format!("Failed to create Confluence client for team '{}'", team.id))?;
         clients.confluence.insert(url, client);
     }
-    let confluence_count = clients.confluence.len();
-    if confluence_count == 0 {
-        // No team asked for Confluence — nothing happened, say nothing.
-        step.clear();
-    } else {
-        step.done(format!(
-            "Confluence ready ({confluence_count} instance{})",
-            if confluence_count == 1 { "" } else { "s" }
-        ));
+
+    for (url, team_id, token) in gitlab_tokens {
+        let client = gitlab::GitlabClient::new(&url, token)
+            .with_context(|| format!("Failed to create GitLab client for team '{team_id}'"))?;
+        clients.gitlab.insert(url, client);
     }
 
-    // Build one GitlabClient per unique instance, but only for teams whose
-    // normal or on-duty sources include a GitLab source (the `D` toggle can
-    // add duty sources at runtime). A missing token is not fatal: the source
-    // reports it, so the rest of the list still loads.
-    let step = startup::Step::start("resolving GitLab credentials");
-    let mut gitlab_warnings = Vec::new();
-    for team in &loaded.teams {
-        if !team.uses_gitlab() {
-            continue;
-        }
-        let url = team.gitlab.base_url.clone();
-        if clients.gitlab.contains_key(&url) {
-            continue;
-        }
-        match config::credentials::resolve_gitlab_token(&team.gitlab) {
-            Ok(Some(token)) => {
-                let client = gitlab::GitlabClient::new(&url, token).with_context(|| {
-                    format!("Failed to create GitLab client for team '{}'", team.id)
-                })?;
-                clients.gitlab.insert(url, client);
-            }
-            Ok(None) => {
-                gitlab_warnings.push(format!(
-                    "team '{}': no GitLab token configured for {url} \
-                     (run `do-next auth` to set it up)",
-                    team.id
-                ));
-            }
-            Err(e) => {
-                gitlab_warnings.push(format!(
-                    "team '{}': GitLab token resolution failed: {e:#}",
-                    team.id
-                ));
-            }
-        }
-    }
-    let gitlab_count = clients.gitlab.len();
-    if !gitlab_warnings.is_empty() {
-        step.warn("GitLab credentials incomplete");
-    } else if gitlab_count == 0 {
-        step.clear();
-    } else {
-        step.done(format!(
-            "GitLab ready ({gitlab_count} instance{})",
-            if gitlab_count == 1 { "" } else { "s" }
-        ));
-    }
     for warning in gitlab_warnings {
         eprintln!("warning: {warning}");
     }
