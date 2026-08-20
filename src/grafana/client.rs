@@ -44,16 +44,8 @@ impl GrafanaClient {
             .send()
             .await
             .context("Failed to send Grafana OnCall request")?;
-        let status = resp.status();
-        log::debug!("Grafana OnCall response: HTTP {status}");
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            log::error!("Grafana OnCall API error {status}: {body}");
-            anyhow::bail!("Grafana OnCall API error {status}: {body}");
-        }
-        resp.json()
-            .await
-            .context("Failed to parse Grafana OnCall response")
+        log::debug!("Grafana OnCall response: HTTP {}", resp.status());
+        crate::http::json_response("Grafana OnCall", url, resp).await
     }
 
     /// The user this personal API token belongs to.

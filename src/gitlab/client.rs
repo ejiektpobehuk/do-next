@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -18,6 +19,13 @@ use super::types::{
 
 /// Page size for list endpoints (GitLab's maximum).
 const PER_PAGE: usize = 100;
+
+/// Give up on a self-hosted instance we cannot even reach — usually a VPN
+/// that is off — instead of leaving the source spinning.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Ceiling on a whole request; generous, since a large MR list is legitimately
+/// slow, but bounded so a stalled connection surfaces as an error.
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Hard cap on pages followed per list endpoint. A "what should I do next"
 /// queue never runs this long; the cap is the runaway-paging guard.
@@ -59,7 +67,13 @@ pub struct GitlabClient {
 
 impl GitlabClient {
     pub fn new(base_url: &str, token: String) -> Result<Self> {
+        // Self-hosted instances are commonly VPN-only; with the VPN off the
+        // connect never answers, and without a deadline the merge-request
+        // sources would spin for the whole session instead of showing an
+        // error row the user can act on.
         let client = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .context("Failed to build HTTP client")?;
         Ok(Self {
@@ -88,15 +102,7 @@ impl GitlabClient {
             .send()
             .await
             .with_context(|| format!("Failed to send GitLab request: {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            log::error!("GitLab API error {status}: {body}");
-            anyhow::bail!("GitLab API error {status}: {body}");
-        }
-        resp.json::<T>()
-            .await
-            .context("Failed to parse GitLab response")
+        crate::http::json_response("GitLab", url, resp).await
     }
 
     /// Follow a paginated list endpoint via the `x-next-page` response header.
@@ -125,21 +131,13 @@ impl GitlabClient {
                 .send()
                 .await
                 .with_context(|| format!("Failed to send GitLab request: {url}"))?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                log::error!("GitLab API error {status}: {body}");
-                anyhow::bail!("GitLab API error {status}: {body}");
-            }
+            // Read the paging header before the body is consumed.
             let header = resp
                 .headers()
                 .get("x-next-page")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned);
-            let batch: Vec<T> = resp
-                .json()
-                .await
-                .context("Failed to parse GitLab response")?;
+            let batch: Vec<T> = crate::http::json_response("GitLab", url, resp).await?;
             let batch_len = batch.len();
             out.extend(batch);
 

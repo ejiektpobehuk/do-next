@@ -23,6 +23,16 @@ All notable changes to `do-next` are documented here.
 
 ### Fixes
 
+- An API request answered by an access gateway (Cloudflare Access, Entra ID,
+  Okta, Google sign-in) now says so — which gate, and that connecting to the
+  VPN is the fix — instead of a JSON decode error carrying a screenful of
+  signed redirect URL
+- Startup no longer hangs when the config repo's remote is unreachable (VPN
+  off): the `git fetch` gets a 5s deadline, the reason is reported as a startup
+  warning, and the app opens with the current checkout. Pending updates known
+  from the last successful fetch are still reported, marked as stale.
+- GitLab requests now time out (10s to connect, 60s total) instead of leaving
+  merge-request sources spinning forever against an unreachable instance
 - Config timezone offsets with a colon (`"+05:45"`) parsed as whole hours,
   silently dropping the minutes
 - HTTP 429 responses now retry once or twice, honouring `Retry-After`

@@ -177,36 +177,64 @@ async fn main() -> Result<()> {
 
     // Company config repo: offer to pull upstream updates before the TUI
     // starts so manifest/team changes apply to this run. TUI launch only —
-    // quick subcommands shouldn't block on a network fetch.
+    // quick subcommands shouldn't block on a network fetch. The fetch runs
+    // under its own deadline and every failure is reported and stepped over:
+    // a repo hosted behind a VPN that is currently off must not hold the app
+    // hostage, it just means this run uses the checkout as it stands.
     if cli.command.is_none()
         && let Some(company) = &loaded.config.company
     {
+        use config::updates::{STARTUP_FETCH_TIMEOUT, check_repo};
+
         let repo = config::expand_tilde(&company.path);
         let step = startup::Step::start("checking company config for updates (git fetch)");
-        let behind = config::updates::fetch_behind_count(&repo).unwrap_or(0);
-        if behind > 0 {
-            let plural = if behind == 1 { "" } else { "s" };
-            // Report before prompting: the verdict explains the question.
-            step.warn(format!("company config is {behind} commit{plural} behind"));
-            let pull = tui::onboarding::prompt_yes_no(
-                &format!("Company config has {behind} update{plural}. Pull now? [Y/n]: "),
-                true,
-            )
-            .unwrap_or(false);
-            if pull {
-                match config::updates::pull_ff_only(&repo) {
-                    Ok(()) => {
-                        let step = startup::Step::start("reloading config");
-                        loaded = config::load().context("Failed to reload configuration")?;
-                        step.done("config reloaded");
-                    }
-                    Err(e) => {
-                        eprintln!("warning: {e:#}; continuing with the current checkout");
+        let status = check_repo(&repo, STARTUP_FETCH_TIMEOUT);
+        match status {
+            None => step.skip("company config is not a git checkout — nothing to update"),
+            Some(status) => {
+                let behind = status.behind;
+                let plural = if behind == 1 { "" } else { "s" };
+                match (behind, status.unreachable_reason()) {
+                    (0, None) => step.done("company config up to date"),
+                    (0, Some(why)) => step.warn(format!(
+                        "cannot reach the company config remote ({why}) — \
+                         using the current checkout"
+                    )),
+                    // Pending updates we know about only from the last
+                    // successful fetch: pulling them needs the remote, so
+                    // report and move on rather than prompt for a doomed pull.
+                    (_, Some(why)) => step.warn(format!(
+                        "company config was {behind} commit{plural} behind at the last check, \
+                         remote unreachable now ({why}) — using the current checkout"
+                    )),
+                    (_, None) => {
+                        // Report before prompting: the verdict explains the question.
+                        step.warn(format!("company config is {behind} commit{plural} behind"));
+                        let pull = tui::onboarding::prompt_yes_no(
+                            &format!(
+                                "Company config has {behind} update{plural}. Pull now? [Y/n]: "
+                            ),
+                            true,
+                        )
+                        .unwrap_or(false);
+                        if pull {
+                            match config::updates::pull_ff_only(&repo) {
+                                Ok(()) => {
+                                    let step = startup::Step::start("reloading config");
+                                    loaded =
+                                        config::load().context("Failed to reload configuration")?;
+                                    step.done("config reloaded");
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "warning: {e:#}; continuing with the current checkout"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
-        } else {
-            step.done("company config up to date");
         }
     }
 

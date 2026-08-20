@@ -77,15 +77,7 @@ impl ConfluenceClient {
             .send()
             .await
             .with_context(|| format!("Failed to send Confluence request: {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            log::error!("Confluence API error {status}: {body}");
-            anyhow::bail!("Confluence API error {status}: {body}");
-        }
-        resp.json::<T>()
-            .await
-            .context("Failed to parse Confluence response")
+        crate::http::json_response("Confluence", url, resp).await
     }
 
     /// Fetch all inline tasks matching the source filters, with container

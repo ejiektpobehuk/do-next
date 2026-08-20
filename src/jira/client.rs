@@ -113,16 +113,9 @@ impl JiraClient {
             })
             .context("Failed to send JQL request")?;
 
-            let status = resp.status();
-            log::debug!("JQL response: HTTP {status}");
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                log::error!("JQL API error {status}: {body}");
-                anyhow::bail!("Jira API error {status}: {body}");
-            }
+            log::debug!("JQL response: HTTP {}", resp.status());
 
-            let page: SearchResponse = resp
-                .json()
+            let page: SearchResponse = crate::http::json_response("Jira", &url, resp)
                 .await
                 .context("Failed to parse search response")?;
             let fetched = page.issues.len();
@@ -164,14 +157,7 @@ impl JiraClient {
                 .await
                 .context("Failed to send JQL keys request")?;
 
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Jira API error {status}: {body}");
-            }
-
-            let page: KeysResponse = resp
-                .json()
+            let page: KeysResponse = crate::http::json_response("Jira", &url, resp)
                 .await
                 .context("Failed to parse search keys response")?;
             let fetched = page.issues.len();
@@ -201,13 +187,7 @@ impl JiraClient {
             .await
             .context("Failed to fetch board configuration")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        resp.json()
+        crate::http::json_response("Jira", &url, resp)
             .await
             .context("Failed to parse board configuration")
     }
@@ -245,12 +225,10 @@ impl JiraClient {
             if status == reqwest::StatusCode::BAD_REQUEST {
                 return Ok(None);
             }
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Jira API error {status}: {body}");
-            }
 
-            let page: AgilePage<Sprint> = resp.json().await.context("Failed to parse sprints")?;
+            let page: AgilePage<Sprint> = crate::http::json_response("Jira", &url, resp)
+                .await
+                .context("Failed to parse sprints")?;
             let fetched = u32::try_from(page.values.len()).unwrap_or(0);
             let is_last = page.is_last;
             sprints.extend(page.values);
@@ -411,13 +389,7 @@ impl JiraClient {
             .await
             .context("Failed to send Agile issues request")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        resp.json()
+        crate::http::json_response("Jira", &url, resp)
             .await
             .context("Failed to parse Agile issues response")
     }
@@ -453,14 +425,7 @@ impl JiraClient {
             .await
             .context("Failed to fetch board swimlanes")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        let data: GreenHopperBoardData = resp
-            .json()
+        let data: GreenHopperBoardData = crate::http::json_response("Jira", &url, resp)
             .await
             .context("Failed to parse board swimlanes")?;
         Ok(data.into_swimlanes())
@@ -480,13 +445,9 @@ impl JiraClient {
             .await
             .context("Failed to fetch issue")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        resp.json().await.context("Failed to parse issue response")
+        crate::http::json_response("Jira", &url, resp)
+            .await
+            .context("Failed to parse issue response")
     }
 
     /// Get available transitions for an issue.
@@ -500,13 +461,9 @@ impl JiraClient {
             .await
             .context("Failed to fetch transitions")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        let tr: TransitionsResponse = resp.json().await.context("Failed to parse transitions")?;
+        let tr: TransitionsResponse = crate::http::json_response("Jira", &url, resp)
+            .await
+            .context("Failed to parse transitions")?;
         Ok(tr.transitions)
     }
 
@@ -692,14 +649,7 @@ impl JiraClient {
                 .await
                 .context("Failed to fetch createmeta")?;
 
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Jira API error {status}: {body}");
-            }
-
-            let body: serde_json::Value = resp
-                .json()
+            let body: serde_json::Value = crate::http::json_response("Jira", &url, resp)
                 .await
                 .context("Failed to parse createmeta response")?;
             let page = array_keys
@@ -1101,13 +1051,7 @@ impl JiraClient {
         .await
         .context("Failed to send JQL keys request")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-        let page: KeysResponse = resp
-            .json()
+        let page: KeysResponse = crate::http::json_response("Jira", &url, resp)
             .await
             .context("Failed to parse search keys response")?;
         Ok(page.issues.into_iter().map(|i| i.key).collect())
@@ -1131,12 +1075,9 @@ impl JiraClient {
         .await
         .context("Failed to fetch comments")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-        let page: CommentPage = resp.json().await.context("Failed to parse comment page")?;
+        let page: CommentPage = crate::http::json_response("Jira", &url, resp)
+            .await
+            .context("Failed to parse comment page")?;
         Ok(page.comments)
     }
 
@@ -1164,12 +1105,9 @@ impl JiraClient {
         .await
         .context("Failed to fetch changelog")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-        let page: ChangelogPage = resp.json().await.context("Failed to parse changelog")?;
+        let page: ChangelogPage = crate::http::json_response("Jira", &url, resp)
+            .await
+            .context("Failed to parse changelog")?;
         Ok(page.values)
     }
 
@@ -1195,12 +1133,9 @@ impl JiraClient {
         .await
         .context("Failed to fetch worklogs")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-        let page: WorklogPage = resp.json().await.context("Failed to parse worklogs")?;
+        let page: WorklogPage = crate::http::json_response("Jira", &url, resp)
+            .await
+            .context("Failed to parse worklogs")?;
         Ok(page.worklogs)
     }
 
@@ -1215,13 +1150,7 @@ impl JiraClient {
             .await
             .context("Failed to fetch field definitions")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        resp.json()
+        crate::http::json_response("Jira", &url, resp)
             .await
             .context("Failed to parse field definitions")
     }
@@ -1238,13 +1167,9 @@ impl JiraClient {
             .await
             .context("Failed to fetch issue")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        resp.json().await.context("Failed to parse issue response")
+        crate::http::json_response("Jira", &url, resp)
+            .await
+            .context("Failed to parse issue response")
     }
 
     /// Fetch allowed values for a field via `GET /rest/api/3/issue/{key}/editmeta`.
@@ -1262,14 +1187,7 @@ impl JiraClient {
             .await
             .context("Failed to fetch editmeta")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        let body: serde_json::Value = resp
-            .json()
+        let body: serde_json::Value = crate::http::json_response("Jira", &url, resp)
             .await
             .context("Failed to parse editmeta response")?;
 
@@ -1311,14 +1229,7 @@ impl JiraClient {
             .await
             .context("Failed to fetch editmeta")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        let body: serde_json::Value = resp
-            .json()
+        let body: serde_json::Value = crate::http::json_response("Jira", &url, resp)
             .await
             .context("Failed to parse editmeta response")?;
 
@@ -1345,14 +1256,7 @@ impl JiraClient {
             .await
             .context("Failed to fetch editmeta")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        let body: serde_json::Value = resp
-            .json()
+        let body: serde_json::Value = crate::http::json_response("Jira", &url, resp)
             .await
             .context("Failed to parse editmeta response")?;
 
@@ -1503,13 +1407,9 @@ impl JiraClient {
             .await
             .context("Failed to fetch all statuses")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        let raw: Vec<RawStatus> = resp.json().await.context("Failed to parse statuses")?;
+        let raw: Vec<RawStatus> = crate::http::json_response("Jira", &url, resp)
+            .await
+            .context("Failed to parse statuses")?;
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out: Vec<StatusInfo> = Vec::new();
@@ -1552,14 +1452,7 @@ impl JiraClient {
             .await
             .context("Failed to fetch project statuses")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        let groups: Vec<IssueTypeStatuses> = resp
-            .json()
+        let groups: Vec<IssueTypeStatuses> = crate::http::json_response("Jira", &url, resp)
             .await
             .context("Failed to parse project statuses")?;
 
@@ -1598,14 +1491,7 @@ impl JiraClient {
             .await
             .context("Failed to fetch projects")?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Jira API error {status}: {body}");
-        }
-
-        let page: ProjectSearchResponse = resp
-            .json()
+        let page: ProjectSearchResponse = crate::http::json_response("Jira", &url, resp)
             .await
             .context("Failed to parse project search response")?;
 
