@@ -31,6 +31,15 @@
           nativeBuildInputs = [ pkgs.pkg-config ];
         };
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        # The suite drives a real `git` (update checks) and builds a reqwest
+        # client, which refuses to start without a system CA store. Kept out of
+        # commonArgs so the deps derivation stays cached.
+        testArgs = {
+          nativeCheckInputs = [
+            pkgs.cacert
+            pkgs.git
+          ];
+        };
       in
       {
         checks = {
@@ -44,6 +53,7 @@
           );
           test = craneLib.cargoTest (
             commonArgs
+            // testArgs
             // {
               inherit cargoArtifacts;
             }
@@ -52,6 +62,7 @@
 
         packages.default = craneLib.buildPackage (
           commonArgs
+          // testArgs
           // {
             inherit cargoArtifacts;
             nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.installShellFiles ];
