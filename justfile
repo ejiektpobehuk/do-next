@@ -44,6 +44,11 @@ update:
     {{wrap}}cargo update
     @git diff --quiet -- Cargo.lock || git commit --only Cargo.lock -m "chore: update cargo dependencies"
 
+# Raise dependency version requirements in Cargo.toml; `just upgrade breaking` allows semver-major bumps
+upgrade mode="compatible":
+    {{wrap}}cargo upgrade {{ if mode == "breaking" { "--incompatible" } else { "" } }}
+    {{wrap}}cargo update
+
 # Scan the dependency tree for known security advisories (RustSec)
 audit:
     {{wrap}}cargo audit

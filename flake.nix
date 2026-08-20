@@ -72,6 +72,7 @@
           packages = [
             pkgs.bacon
             pkgs.cargo-audit
+            pkgs.cargo-edit
             pkgs.cargo-msrv
             pkgs.clippy
             pkgs.rust-analyzer
