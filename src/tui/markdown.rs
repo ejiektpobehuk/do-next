@@ -93,7 +93,11 @@ pub fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
             }
             Event::Start(Tag::Link { dest_url, .. }) => {
                 link_url = Some(dest_url.to_string());
-                style_stack.push(Style::default().add_modifier(Modifier::UNDERLINED));
+                style_stack.push(
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
             }
 
             // ── Text content ────────────────────────────────────────────
@@ -223,9 +227,7 @@ pub fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
                 if let Some(url) = link_url.take() {
                     current_spans.push(Span::styled(
                         format!(" ({url})"),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
+                        Style::default().fg(Color::Blue),
                     ));
                 }
             }
@@ -402,16 +404,16 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(
             lines[0].spans[0],
-            Span::styled("click", Style::default().add_modifier(Modifier::UNDERLINED))
+            Span::styled(
+                "click",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::UNDERLINED)
+            )
         );
         assert_eq!(
             lines[0].spans[1],
-            Span::styled(
-                " (https://example.com)",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM)
-            )
+            Span::styled(" (https://example.com)", Style::default().fg(Color::Blue))
         );
     }
 
