@@ -58,6 +58,8 @@ pub fn render_comment_edit_confirm_overlay(
         Span::raw("┤ "),
         Span::styled("↵", Style::default().fg(Color::Green)),
         Span::raw(" confirm  "),
+        Span::styled("e", Style::default().fg(Color::Blue)),
+        Span::raw(" edit  "),
         Span::styled("←", Style::default().fg(nav_color(*tab == 1))),
         Span::styled("↕", Style::default().fg(nav_color(scrollable))),
         Span::styled("→", Style::default().fg(nav_color(*tab == 0))),

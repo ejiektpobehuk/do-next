@@ -57,7 +57,9 @@ pub fn render_field_edit_confirm_overlay(
     let hint = Line::from(vec![
         Span::raw("┤ "),
         Span::styled("↵", Style::default().fg(Color::Green)),
-        Span::raw(" | "),
+        Span::raw(" | ("),
+        Span::styled("e", Style::default().fg(Color::Blue)),
+        Span::raw(")dit | "),
         Span::styled("←", Style::default().fg(nav_color(*tab == 1))),
         Span::styled("↕", Style::default().fg(nav_color(scrollable))),
         Span::styled("→", Style::default().fg(nav_color(*tab == 0))),

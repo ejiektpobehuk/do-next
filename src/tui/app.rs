@@ -164,6 +164,10 @@ pub enum ActionState {
         current_value: String,
         /// Original JSON value of the field (used to determine PUT value shape).
         original_json: serde_json::Value,
+        /// Text to open in `$EDITOR` instead of `current_value`. Set when the user
+        /// goes back to editing from the confirm overlay, so the editor reopens on
+        /// the draft while the diff stays relative to `current_value`.
+        draft: Option<String>,
     },
     /// Offering to use a template for an empty field; `previewing` toggles between
     /// a small dialog and a full markdown preview.
@@ -226,6 +230,9 @@ pub enum ActionState {
         old_text: String,
         new_text: String,
         new_value: serde_json::Value,
+        /// Original JSON value of the field, kept so `e` can hand the edit back to
+        /// `PendingFieldEdit` and reshape the value after another editor round.
+        original_json: serde_json::Value,
         /// Active tab: 0 = Preview, 1 = Diff
         tab: usize,
         /// Vertical scroll offset within the active tab.
@@ -236,6 +243,9 @@ pub enum ActionState {
         issue_key: String,
         comment_id: String,
         original_body: String,
+        /// Text to open in `$EDITOR` instead of `original_body`. Set when the user
+        /// goes back to editing from the confirm overlay.
+        draft: Option<String>,
     },
     /// Showing a diff/preview for the edited comment; waiting for confirm or cancel.
     ConfirmingCommentEdit {
@@ -2300,6 +2310,7 @@ fn field_options_to_state(
             field_id,
             current_value,
             original_json,
+            draft: None,
         }
     } else if multi {
         let current_values: HashSet<String> = original_json
@@ -2651,10 +2662,10 @@ fn handle_comment_edit_confirm_input(
     let ActionState::ConfirmingCommentEdit {
         ref issue_key,
         ref comment_id,
+        ref old_text,
         ref new_text,
         ref mut tab,
         ref mut scroll,
-        ..
     } = app.action_state
     else {
         return false;
@@ -2699,6 +2710,15 @@ fn handle_comment_edit_confirm_input(
                 issue_key,
                 comment_id,
                 new_body,
+            };
+        }
+        // Back to `$EDITOR` with the draft; the diff stays against `old_text`.
+        (KeyCode::Char('e'), _) => {
+            app.action_state = ActionState::PendingCommentEdit {
+                issue_key: issue_key.clone(),
+                comment_id: comment_id.clone(),
+                original_body: old_text.clone(),
+                draft: Some(new_text.clone()),
             };
         }
         _ => {}
@@ -2916,6 +2936,7 @@ fn start_comment_edit(app: &mut AppState) {
         issue_key: issue.key.clone(),
         comment_id: comment.id.clone(),
         original_body: crate::jira::adf::json_to_text(&comment.body),
+        draft: None,
     };
 }
 
@@ -4921,6 +4942,7 @@ fn key_edit_detail_field(app: &mut AppState) {
             field_id,
             current_value,
             original_json,
+            draft: None,
         };
         return;
     }
@@ -4993,6 +5015,7 @@ fn set_detail_edit_state(
                 field_id,
                 current_value,
                 original_json,
+                draft: None,
             };
         }
         _ => {
@@ -5222,10 +5245,12 @@ fn handle_confirm_field_edit_input(app: &mut AppState, event: &crossterm::event:
     let ActionState::ConfirmingFieldEdit {
         ref issue_key,
         ref field_id,
+        ref old_text,
+        ref new_text,
         ref new_value,
+        ref original_json,
         ref mut tab,
         ref mut scroll,
-        ..
     } = app.action_state
     else {
         return;
@@ -5270,6 +5295,16 @@ fn handle_confirm_field_edit_input(app: &mut AppState, event: &crossterm::event:
                 issue_key,
                 field_id,
                 new_value,
+            };
+        }
+        // Back to `$EDITOR` with the draft; the diff stays against `old_text`.
+        KeyCode::Char('e') => {
+            app.action_state = ActionState::PendingFieldEdit {
+                issue_key: issue_key.clone(),
+                field_id: field_id.clone(),
+                current_value: old_text.clone(),
+                original_json: original_json.clone(),
+                draft: Some(new_text.clone()),
             };
         }
         KeyCode::Char('n' | 'q') | KeyCode::Esc => {
@@ -5339,6 +5374,7 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
                     field_id,
                     current_value,
                     original_json,
+                    draft: None,
                 };
             }
             KeyCode::Char('n' | 'd') => {
@@ -5350,6 +5386,7 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
                     field_id,
                     current_value: String::new(),
                     original_json,
+                    draft: None,
                 };
             }
             KeyCode::Char('q') | KeyCode::Esc => {
@@ -5383,6 +5420,7 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
                     field_id,
                     current_value,
                     original_json,
+                    draft: None,
                 };
             }
             KeyCode::Char('n' | 'd') => {
@@ -5394,6 +5432,7 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
                     field_id,
                     current_value: String::new(),
                     original_json,
+                    draft: None,
                 };
             }
             KeyCode::Char('p') => {
@@ -6541,5 +6580,78 @@ mod tests {
             anyhow::anyhow!("boom"),
         );
         assert!(matches!(state, ActionState::Error { .. }));
+    }
+
+    fn app_for_keys() -> AppState {
+        AppState::new(
+            vec![resolved_team("platform", vec![jira_source("mine")])],
+            &cfg::Config::default(),
+        )
+    }
+
+    #[test]
+    fn e_on_the_field_confirm_reopens_the_editor_on_the_draft() {
+        let mut app = app_for_keys();
+        app.action_state = ActionState::ConfirmingFieldEdit {
+            issue_key: "PLAT-1".into(),
+            field_id: "description".into(),
+            old_text: "before".into(),
+            new_text: "after".into(),
+            new_value: serde_json::json!("after"),
+            original_json: serde_json::json!("before"),
+            tab: 1,
+            scroll: 3,
+        };
+        handle_confirm_field_edit_input(
+            &mut app,
+            &crossterm::event::Event::Key(crossterm::event::KeyEvent::from(KeyCode::Char('e'))),
+        );
+        let ActionState::PendingFieldEdit {
+            issue_key,
+            field_id,
+            current_value,
+            original_json,
+            draft,
+        } = app.action_state
+        else {
+            panic!("expected PendingFieldEdit, got a different state");
+        };
+        assert_eq!(issue_key, "PLAT-1");
+        assert_eq!(field_id, "description");
+        // The editor reopens on the draft, but the diff baseline stays the original.
+        assert_eq!(draft.as_deref(), Some("after"));
+        assert_eq!(current_value, "before");
+        assert_eq!(original_json, serde_json::json!("before"));
+    }
+
+    #[test]
+    fn e_on_the_comment_confirm_reopens_the_editor_on_the_draft() {
+        let mut app = app_for_keys();
+        app.action_state = ActionState::ConfirmingCommentEdit {
+            issue_key: "PLAT-1".into(),
+            comment_id: "10001".into(),
+            old_text: "before".into(),
+            new_text: "after".into(),
+            tab: 0,
+            scroll: 0,
+        };
+        assert!(handle_comment_edit_confirm_input(
+            &mut app,
+            KeyCode::Char('e'),
+            KeyModifiers::NONE,
+        ));
+        let ActionState::PendingCommentEdit {
+            issue_key,
+            comment_id,
+            original_body,
+            draft,
+        } = app.action_state
+        else {
+            panic!("expected PendingCommentEdit, got a different state");
+        };
+        assert_eq!(issue_key, "PLAT-1");
+        assert_eq!(comment_id, "10001");
+        assert_eq!(draft.as_deref(), Some("after"));
+        assert_eq!(original_body, "before");
     }
 }

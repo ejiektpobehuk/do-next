@@ -404,19 +404,22 @@ fn handle_pending_field_edit(
         ref field_id,
         ref current_value,
         ref original_json,
+        ref draft,
     } = app.action_state
     else {
         return;
     };
-    let (key, field_id, current_value, original_json) = (
+    let (key, field_id, current_value, original_json, draft) = (
         issue_key.clone(),
         field_id.clone(),
         current_value.clone(),
         original_json.clone(),
+        draft.clone(),
     );
     app.action_state = ActionState::None;
     input_task.abort();
-    let editor_result = open_editor_with_content(terminal, &current_value);
+    let seed = draft.as_ref().unwrap_or(&current_value);
+    let editor_result = open_editor_with_content(terminal, seed);
     *input_task = spawn_input_task(tx.clone());
     drain_input_events(rx);
     match editor_result {
@@ -432,6 +435,7 @@ fn handle_pending_field_edit(
                     old_text: current_value,
                     new_text,
                     new_value,
+                    original_json,
                     tab: 0,
                     scroll: 0,
                 };
@@ -1516,14 +1520,21 @@ fn handle_pending_comment_edit(
         ref issue_key,
         ref comment_id,
         ref original_body,
+        ref draft,
     } = app.action_state
     else {
         return;
     };
-    let (key, cid, original) = (issue_key.clone(), comment_id.clone(), original_body.clone());
+    let (key, cid, original, draft) = (
+        issue_key.clone(),
+        comment_id.clone(),
+        original_body.clone(),
+        draft.clone(),
+    );
     app.action_state = ActionState::None;
     input_task.abort();
-    let editor_result = open_editor_with_content(terminal, &original);
+    let seed = draft.as_ref().unwrap_or(&original);
+    let editor_result = open_editor_with_content(terminal, seed);
     *input_task = spawn_input_task(tx.clone());
     drain_input_events(rx);
     match editor_result {
