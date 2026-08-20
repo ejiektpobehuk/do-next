@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration as ChronoDuration, Utc};
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 
 use crate::jira::auth::{OAuthCredentials, OAuthStore};
@@ -389,8 +389,17 @@ fn load_oauth_from_keyring() -> Result<Option<OAuthCredentials>> {
     // We need the cloud_id to build the key, but we don't know it before loading.
     // Try loading from a well-known probe key first; if the user has tokens in the
     // keyring, we stored a pointer under "oauth:_index" with the cloud_id.
-    let index_entry =
-        keyring::Entry::new("do-next", "oauth:_index").context("Failed to access keyring")?;
+    //
+    // Since keyring 4 the platform store is initialized on the first `Entry::new`,
+    // so a keyring that isn't available fails here. Treat that like a missing
+    // entry so the file store still gets a chance.
+    let index_entry = match keyring::Entry::new("do-next", "oauth:_index") {
+        Ok(entry) => entry,
+        Err(e) => {
+            log::debug!("keyring unavailable for OAuth index lookup: {e}");
+            return Ok(None);
+        }
+    };
     let cloud_id = match index_entry.get_password() {
         Ok(id) => id,
         Err(keyring::Error::NoEntry) => return Ok(None),
@@ -401,7 +410,13 @@ fn load_oauth_from_keyring() -> Result<Option<OAuthCredentials>> {
     };
 
     let key = format!("oauth:{cloud_id}");
-    let entry = keyring::Entry::new("do-next", &key).context("Failed to access keyring")?;
+    let entry = match keyring::Entry::new("do-next", &key) {
+        Ok(entry) => entry,
+        Err(e) => {
+            log::debug!("keyring unavailable for OAuth token lookup: {e}");
+            return Ok(None);
+        }
+    };
     let json = match entry.get_password() {
         Ok(s) => s,
         Err(keyring::Error::NoEntry) => return Ok(None),

@@ -26,8 +26,9 @@
         };
         commonArgs = {
           inherit src;
+          # pkg-config is for aws-lc-sys (rustls); the keyring's Secret Service
+          # client is pure Rust (zbus), so there is no libdbus to link.
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.dbus ];
         };
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
       in

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::process::Command;
 
 use crate::config::types::{JiraConfig, ResolvedGitlab, ResolvedGrafana};
@@ -265,7 +265,9 @@ struct KeyringHints {
 /// platform failures are hard errors with actionable messages.
 fn keyring_lookup(key: &str, hints: &KeyringHints) -> Result<Option<String>> {
     log::debug!("credentials: looking up keyring entry for key={key}");
-    let entry = keyring::Entry::new("do-next", key).context("Failed to create keyring entry")?;
+    // Since keyring 4 the platform store is initialized on the first `Entry::new`,
+    // so an unavailable or locked keyring surfaces here rather than on the lookup.
+    let entry = keyring::Entry::new("do-next", key).map_err(|e| keyring_failure(key, hints, &e))?;
     match entry.get_password() {
         Ok(secret) => {
             log::debug!("credentials: keyring lookup succeeded");
@@ -275,9 +277,17 @@ fn keyring_lookup(key: &str, hints: &KeyringHints) -> Result<Option<String>> {
             log::debug!("credentials: no keyring entry found, falling through");
             Ok(None)
         }
-        Err(keyring::Error::NoStorageAccess(e)) => {
-            log::debug!("credentials: keyring storage not accessible: {e}");
-            bail!(
+        Err(e) => Err(keyring_failure(key, hints, &e)),
+    }
+}
+
+/// Turn a keyring failure into an actionable error. `NoEntry` never reaches
+/// here: a missing entry means "fall through to the next source", not a failure.
+fn keyring_failure(key: &str, hints: &KeyringHints, err: &keyring::Error) -> anyhow::Error {
+    match err {
+        keyring::Error::NoStorageAccess(_) | keyring::Error::NoDefaultStore => {
+            log::debug!("credentials: keyring storage not accessible: {err}");
+            anyhow!(
                 "The system keyring is not accessible (key={key}).\n\
                  The secret service may not be running or the keyring may be locked.\n\
                  \n\
@@ -289,11 +299,11 @@ fn keyring_lookup(key: &str, hints: &KeyringHints) -> Result<Option<String>> {
                  \n\
                  Run with --log <file> for details.",
                 hints.env_var
-            );
+            )
         }
-        Err(keyring::Error::PlatformFailure(e)) => {
-            log::debug!("credentials: keyring platform failure: {e}");
-            bail!(
+        keyring::Error::PlatformFailure(_) => {
+            log::debug!("credentials: keyring platform failure: {err}");
+            anyhow!(
                 "The keyring returned an error while reading the secret (key={key}).\n\
                  The keyring may be locked or the stored entry may be corrupted.\n\
                  \n\
@@ -306,12 +316,12 @@ fn keyring_lookup(key: &str, hints: &KeyringHints) -> Result<Option<String>> {
                  Run with --log <file> for details.",
                 hints.refresh,
                 hints.env_var
-            );
+            )
         }
-        Err(e) => {
-            log::debug!("credentials: keyring error: {e}");
-            bail!(
-                "Unexpected keyring error (key={key}): {e}\n\
+        _ => {
+            log::debug!("credentials: keyring error: {err}");
+            anyhow!(
+                "Unexpected keyring error (key={key}): {err}\n\
                  \n\
                  Possible fixes:\n\
                  • {}\n\
@@ -319,7 +329,7 @@ fn keyring_lookup(key: &str, hints: &KeyringHints) -> Result<Option<String>> {
                  • Add credentials to ~/.config/do-next/credentials.json5",
                 hints.refresh,
                 hints.env_var
-            );
+            )
         }
     }
 }
