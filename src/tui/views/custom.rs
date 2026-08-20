@@ -59,11 +59,70 @@ enum Segment {
 
 // ── Public helpers ─────────────────────────────────────────────────────────────
 
+/// The item's body field — the long-form prose the default view shows above
+/// everything else. Jira keeps it in the typed `description` field, a merge
+/// request in `gl.description`. A Confluence task's body (`conf.task`) is
+/// deliberately absent: it doubles as the task's title, so hoisting it would
+/// print the same text twice.
+const fn body_field_id(item: &WorkItem) -> Option<&'static str> {
+    match item {
+        WorkItem::Jira(_) => Some(crate::items::FIELD_DESCRIPTION),
+        WorkItem::Gitlab(_) => Some(crate::gitlab::types::FIELD_DESCRIPTION),
+        WorkItem::Confluence(_) => None,
+    }
+}
+
+/// Whether a field cannot be edited *yet* because the item's full detail is
+/// still on its way. A board-trimmed issue reports no description until the
+/// background fetch lands, so editing it would open a blank buffer whose
+/// contents replace the real text.
+pub fn field_awaiting_detail(item: &WorkItem, field_id: &str) -> bool {
+    field_id == crate::items::FIELD_DESCRIPTION && item.as_jira().is_some_and(|issue| issue.partial)
+}
+
+/// Fields the default view exposes, in focus order: the body field first, then
+/// every entry in `fields_map()` sorted by id, minus the hoisted body field.
+///
+/// This is the single source of truth behind `num_view_fields`,
+/// `view_field_cfg` and `build_default_segments` — the flat `field_idx` that
+/// `DetailFocus::Field` carries indexes into exactly this list, so deriving it
+/// three separate ways is how the focus ring and the rendered segments drift
+/// apart.
+///
+/// The body field is listed even when it is empty, so an issue with no
+/// description still offers a place to write the first one.
+fn default_view_fields(item: &WorkItem) -> Vec<CustomViewFieldConfig> {
+    let body = body_field_id(item);
+    let mut fields: Vec<CustomViewFieldConfig> = body
+        .map(|field_id| CustomViewFieldConfig {
+            field_id: field_id.to_owned(),
+            name: Some("Description".to_owned()),
+            // Prose belongs in $EDITOR, never in the inline single-line editor.
+            use_editor: Some(true),
+            ..Default::default()
+        })
+        .into_iter()
+        .collect();
+
+    let mut extra: Vec<&String> = item
+        .fields_map()
+        .keys()
+        .filter(|k| Some(k.as_str()) != body)
+        .collect();
+    extra.sort();
+    fields.extend(extra.into_iter().map(|key| CustomViewFieldConfig {
+        field_id: key.clone(),
+        ..Default::default()
+    }));
+    fields
+}
+
 /// Number of focusable fields in the view.
-/// For custom views: total configured fields. For the default view (cfg=None): all extra fields.
+/// For custom views: total configured fields. For the default view (cfg=None):
+/// the body field plus all extra fields.
 pub fn num_view_fields(cfg: Option<&CustomViewConfig>, item: Option<&WorkItem>) -> usize {
     cfg.map_or_else(
-        || item.map_or(0, |i| i.fields_map().len()),
+        || item.map_or(0, |i| default_view_fields(i).len()),
         |c| c.sections.iter().map(|s| s.fields.len()).sum(),
     )
 }
@@ -87,13 +146,7 @@ pub fn view_field_cfg(
         }
         None
     } else if let Some(item) = item {
-        let mut keys: Vec<&String> = item.fields_map().keys().collect();
-        keys.sort();
-        let key = keys.into_iter().nth(idx)?;
-        Some(CustomViewFieldConfig {
-            field_id: key.clone(),
-            ..Default::default()
-        })
+        default_view_fields(item).into_iter().nth(idx)
     } else {
         None
     }
@@ -511,50 +564,48 @@ fn build_default_segments(
     width: u16,
     field_names: &HashMap<String, String>,
 ) {
-    // Description section — Jira issues carry an ADF description; merge
-    // requests carry plain markdown in `gl.description`.
-    let description = item
-        .as_jira()
-        .and_then(|issue| issue.fields.description.as_ref().map(json_to_text));
-    let description = description.or_else(|| {
-        item.as_gitlab()
-            .and_then(|_| item.field(crate::gitlab::types::FIELD_DESCRIPTION))
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    });
-    if let Some(text) = description.filter(|t| !t.is_empty()) {
-        segs.push(Segment::ReadOnly {
-            lines: vec![
-                Line::from(""),
-                section_sep("Description", width),
-                Line::from(""),
-            ],
-        });
-        let desc_lines = markdown_to_lines(&text.replace('\r', ""));
-        segs.push(Segment::ReadOnly { lines: desc_lines });
-    }
+    // `default_view_fields` decides both the order and the flat `field_idx`
+    // that `DetailFocus::Field` navigates, so the segments are built straight
+    // from it rather than re-deriving the same list here.
+    let fields = default_view_fields(item);
+    let has_body = body_field_id(item).is_some();
+    let editable = item.supports_field_edit();
 
-    // Extra fields section
-    if !item.fields_map().is_empty() {
-        segs.push(Segment::ReadOnly {
-            lines: vec![Line::from(""), section_sep("Fields", width), Line::from("")],
-        });
-        let mut extra_fields: Vec<(&String, &serde_json::Value)> =
-            item.fields_map().iter().collect();
-        extra_fields.sort_by_key(|(k, _)| k.as_str());
-        for (field_idx, (field_id, value)) in extra_fields.into_iter().enumerate() {
-            let label = field_names.get(field_id).cloned().unwrap_or_else(|| {
-                builtin_field_name(field_id).map_or_else(|| field_id.clone(), str::to_owned)
+    for (field_idx, field) in fields.iter().enumerate() {
+        let is_body = has_body && field_idx == 0;
+
+        if is_body {
+            // No section separator: the block's own border is titled
+            // "Description" already, so a header above it says it twice. Just
+            // part it from the item header.
+            segs.push(Segment::ReadOnly {
+                lines: vec![Line::from("")],
             });
-            let content = val_to_str(value);
-            segs.push(Segment::EditableField {
-                label,
-                content,
-                field_idx,
-                readonly: !item.supports_field_edit(),
-                is_markdown: is_adf(value) || is_markdown_field(item, field_id),
+        } else if field_idx == usize::from(has_body) {
+            // The extras do share one header, since their blocks are titled
+            // with individual field names.
+            segs.push(Segment::ReadOnly {
+                lines: vec![Line::from(""), section_sep("Fields", width), Line::from("")],
             });
         }
+
+        let value = item.field(&field.field_id);
+        let content = value
+            .filter(|v| !v.is_null())
+            .map(val_to_str)
+            .unwrap_or_default();
+        segs.push(Segment::EditableField {
+            label: resolve_field_label(field, field_names),
+            content,
+            field_idx,
+            readonly: !editable || field_awaiting_detail(item, &field.field_id),
+            // A Jira description is ADF and a merge request's is markdown, so
+            // the body always renders styled — including while it is empty,
+            // where there is no value to sniff.
+            is_markdown: is_body
+                || value.is_some_and(is_adf)
+                || is_markdown_field(item, &field.field_id),
+        });
     }
 }
 
@@ -937,3 +988,164 @@ fn inline_cursor_line(input: &str, cursor_char: usize) -> Line<'static> {
 
 // Re-export for local use.
 pub use crate::jira::adf::json_to_text;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A Jira item whose `extra` map carries `keys`, with the typed
+    /// description set from `description`.
+    fn jira_item(description: Option<serde_json::Value>, keys: &[&str]) -> WorkItem {
+        let mut issue: Issue = serde_json::from_value(json!({
+            "id": "1",
+            "key": "PROJ-1",
+            "fields": {
+                "summary": "Summary",
+                "status": { "id": "s1", "name": "Open" },
+                "issuetype": { "id": "t1", "name": "Task", "subtask": false },
+                "project": { "id": "p1", "key": "PROJ", "name": "Project" },
+            },
+        }))
+        .expect("issue fixture parses");
+        issue.fields.description = description;
+        for key in keys {
+            issue.fields.extra.insert((*key).to_owned(), json!("value"));
+        }
+        WorkItem::Jira(issue)
+    }
+
+    fn adf(text: &str) -> serde_json::Value {
+        json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "paragraph",
+                "content": [{ "type": "text", "text": text }],
+            }],
+        })
+    }
+
+    fn gitlab_item() -> WorkItem {
+        let api = serde_json::from_value(json!({
+            "iid": 1,
+            "project_id": 2,
+            "title": "Add a thing",
+            "description": "MR body",
+            "state": "opened",
+            "web_url": "https://gitlab.example/x/y/-/merge_requests/1",
+        }))
+        .expect("merge request fixture parses");
+        WorkItem::Gitlab(crate::gitlab::types::to_display(api))
+    }
+
+    fn confluence_item() -> WorkItem {
+        let mut task: crate::confluence::types::Task = serde_json::from_value(json!({
+            "id": "9",
+            "key": "CONF:9",
+            "status": "incomplete",
+            "title": "Do the thing",
+            "extra": {},
+        }))
+        .expect("task fixture parses");
+        task.extra.insert(
+            crate::confluence::types::FIELD_TASK.to_owned(),
+            json!("body"),
+        );
+        task.extra.insert(
+            crate::confluence::types::FIELD_PAGE.to_owned(),
+            json!("Page"),
+        );
+        WorkItem::Confluence(task)
+    }
+
+    fn field_ids(item: &WorkItem) -> Vec<String> {
+        default_view_fields(item)
+            .into_iter()
+            .map(|f| f.field_id)
+            .collect()
+    }
+
+    #[test]
+    fn description_leads_the_default_view_and_extras_stay_sorted() {
+        let item = jira_item(Some(adf("hello")), &["customfield_2", "customfield_1"]);
+        assert_eq!(
+            field_ids(&item),
+            ["description", "customfield_1", "customfield_2"]
+        );
+    }
+
+    /// The empty case is the whole point of showing it unconditionally: without
+    /// a slot to focus there is no way to write a first description.
+    #[test]
+    fn description_is_listed_even_when_the_issue_has_none() {
+        let item = jira_item(None, &[]);
+        assert_eq!(field_ids(&item), ["description"]);
+    }
+
+    /// `num_view_fields` bounds focus navigation while `view_field_cfg`
+    /// resolves what Enter acts on. They index the same list or Enter edits the
+    /// wrong field.
+    #[test]
+    fn focus_indices_agree_with_the_resolved_field_configs() {
+        let item = jira_item(Some(adf("hello")), &["customfield_1"]);
+        assert_eq!(num_view_fields(None, Some(&item)), 2);
+
+        let first = view_field_cfg(None, Some(&item), 0).expect("index 0 resolves");
+        assert_eq!(first.field_id, "description");
+        assert_eq!(first.use_editor, Some(true));
+        assert_eq!(first.name.as_deref(), Some("Description"));
+
+        let second = view_field_cfg(None, Some(&item), 1).expect("index 1 resolves");
+        assert_eq!(second.field_id, "customfield_1");
+
+        assert!(view_field_cfg(None, Some(&item), 2).is_none());
+    }
+
+    #[test]
+    fn editable_field_spec_hands_the_description_adf_to_the_editor() {
+        let item = jira_item(Some(adf("hello")), &[]);
+        let (field_id, value) = view_editable_field_spec(None, &item, 0);
+        assert_eq!(field_id, "description");
+        assert_eq!(value, adf("hello"));
+    }
+
+    /// The hazard the gate exists for: a board-trimmed issue has no description
+    /// yet, so it must not be editable — a blank $EDITOR buffer would be
+    /// committed over the real text.
+    #[test]
+    fn a_partial_issue_will_not_let_its_description_be_edited() {
+        let mut item = jira_item(None, &[]);
+        assert!(!field_awaiting_detail(&item, "description"));
+
+        item.as_jira_mut().expect("jira item").partial = true;
+        assert!(field_awaiting_detail(&item, "description"));
+        assert!(
+            !field_awaiting_detail(&item, "customfield_1"),
+            "only the lazily-fetched description is gated"
+        );
+    }
+
+    /// A merge request keeps its description in `extra`, so hoisting it has to
+    /// remove it from the sorted tail — otherwise it renders twice, which is
+    /// what happened before the body field was introduced.
+    #[test]
+    fn a_merge_request_description_is_hoisted_and_not_duplicated() {
+        let item = gitlab_item();
+        let ids = field_ids(&item);
+        assert_eq!(ids.first().map(String::as_str), Some("gl.description"));
+        assert_eq!(
+            ids.iter().filter(|id| *id == "gl.description").count(),
+            1,
+            "the hoisted body must not also appear among the extras"
+        );
+    }
+
+    /// A Confluence task's body doubles as its title, so it stays where it was:
+    /// in sorted position among the extras, with nothing hoisted above it.
+    #[test]
+    fn a_confluence_task_keeps_its_fields_in_sorted_order() {
+        let item = confluence_item();
+        assert_eq!(field_ids(&item), ["conf.page", "conf.task"]);
+    }
+}

@@ -2207,12 +2207,18 @@ fn apply_field_updated(
     field_id: &str,
     new_value: &serde_json::Value,
 ) {
-    // Update in-memory field value immediately (no re-fetch needed)
+    // Update in-memory field value immediately (no re-fetch needed).
+    // `description` is a typed field rather than an `extra` entry, so writing
+    // it into the map would leave the rendered description stale.
     if let Some(issue) = app.jira_issue_mut(issue_key) {
-        issue
-            .fields
-            .extra
-            .insert(field_id.to_owned(), new_value.clone());
+        if field_id == crate::items::FIELD_DESCRIPTION {
+            issue.fields.description = Some(new_value.clone());
+        } else {
+            issue
+                .fields
+                .extra
+                .insert(field_id.to_owned(), new_value.clone());
+        }
     }
     app.action_state = ActionState::None;
 }
@@ -4821,7 +4827,12 @@ fn key_edit_detail_field(app: &mut AppState) {
     // Readonly fields: open URL if the value is a link, otherwise do nothing.
     // Items without field editing (non-Jira) treat every field as readonly.
     // Slack URLs are opened in the Slack desktop app by default.
-    if field_cfg.as_ref().and_then(|f| f.readonly).unwrap_or(false) || !item.supports_field_edit() {
+    // A field whose value has not been fetched yet is readonly too: editing an
+    // apparently-empty description would overwrite the real one.
+    if field_cfg.as_ref().and_then(|f| f.readonly).unwrap_or(false)
+        || !item.supports_field_edit()
+        || crate::tui::views::custom::field_awaiting_detail(&item, &field_id)
+    {
         if let serde_json::Value::String(s) = &original_json
             && (s.starts_with("http://") || s.starts_with("https://"))
         {
@@ -5012,7 +5023,12 @@ fn auto_scroll_to_field(app: &mut AppState) {
         return;
     };
     let viewport_h = app.last_detail_viewport_h;
-    if bottom > app.detail_scroll + viewport_h {
+    if bottom.saturating_sub(top) > viewport_h {
+        // Taller than the viewport — it can never be shown whole, so align to
+        // its start rather than scrolling past the opening lines. Descriptions
+        // routinely land here.
+        app.detail_scroll = top;
+    } else if bottom > app.detail_scroll + viewport_h {
         app.detail_scroll = bottom.saturating_sub(viewport_h);
     } else if top < app.detail_scroll {
         app.detail_scroll = top;
@@ -6068,6 +6084,42 @@ mod tests {
             partial: false,
             changelog: None,
         }
+    }
+
+    // ── field updates ────────────────────────────────────────────────────────
+
+    /// A description lives in the typed field, not the `extra` map, so an
+    /// optimistic update has to land there or the panel keeps showing the old
+    /// text until the next refetch.
+    #[test]
+    fn a_description_update_lands_on_the_typed_field() {
+        let teams = vec![resolved_team("platform", vec![jira_source("mine")])];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        app.issues = vec![make_item("PROJ-1", "Open", None)];
+
+        let new_value = serde_json::json!({ "type": "doc", "version": 1, "content": [] });
+        apply_field_updated(&mut app, "PROJ-1", "description", &new_value);
+
+        let issue = app.issues[0].as_jira().expect("still a jira issue");
+        assert_eq!(issue.fields.description.as_ref(), Some(&new_value));
+        assert!(
+            !issue.fields.extra.contains_key("description"),
+            "the description must not be shadowed by an extras entry"
+        );
+    }
+
+    #[test]
+    fn a_custom_field_update_still_lands_in_the_extras_map() {
+        let teams = vec![resolved_team("platform", vec![jira_source("mine")])];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        app.issues = vec![make_item("PROJ-1", "Open", None)];
+
+        let new_value = serde_json::json!("7");
+        apply_field_updated(&mut app, "PROJ-1", "customfield_1", &new_value);
+
+        let issue = app.issues[0].as_jira().expect("still a jira issue");
+        assert_eq!(issue.fields.extra.get("customfield_1"), Some(&new_value));
+        assert!(issue.fields.description.is_none());
     }
 
     // ── search result ordering ───────────────────────────────────────────────

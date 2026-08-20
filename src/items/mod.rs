@@ -4,6 +4,11 @@ use crate::confluence::types::{Task, TaskStatus};
 use crate::gitlab::types::MergeRequest;
 use crate::jira::types::{Issue, PriorityField, UserField};
 
+/// Field id of the Jira issue description. Unlike every other renderable
+/// field it is a *typed* field on `IssueFields`, not an entry in the flattened
+/// `extra` map, so `field()` resolves it specially.
+pub const FIELD_DESCRIPTION: &str = "description";
+
 /// A single unit of work from any configured source.
 ///
 /// Sources produce concrete payloads; the TUI operates on this enum through
@@ -124,7 +129,16 @@ impl WorkItem {
         }
     }
 
+    /// Value of a renderable field. `description` is a typed field on a Jira
+    /// issue rather than an `extra` entry, so it is resolved before the map
+    /// lookup; `extra` can never carry that key (it is `#[serde(flatten)]`
+    /// alongside the named field), so the order is unambiguous.
     pub fn field(&self, field_id: &str) -> Option<&serde_json::Value> {
+        if field_id == FIELD_DESCRIPTION
+            && let Self::Jira(issue) = self
+        {
+            return issue.fields.description.as_ref();
+        }
         self.fields_map().get(field_id)
     }
 

@@ -425,7 +425,7 @@ fn handle_pending_field_edit(
                 // No change — skip Jira update
             } else {
                 let schema = app.field_schemas.get(&field_id);
-                let new_value = shape_field_value(&new_text, &original_json, schema);
+                let new_value = shape_field_value(&new_text, &original_json, schema, &field_id);
                 app.action_state = ActionState::ConfirmingFieldEdit {
                     issue_key: key,
                     field_id,
@@ -1808,20 +1808,26 @@ fn spawn_load_all_field_names(client: JiraClient, tx: UnboundedSender<AppEvent>)
 
 /// Shape the user's edited text into the correct JSON value for a Jira field update.
 ///
-/// - ADF fields (detected either from the existing value's `type: "doc"` or
-///   from the field schema) get the markdown re-converted to ADF.
+/// - ADF fields (detected from the existing value's `type: "doc"`, from the
+///   field schema, or from the field id) get the markdown re-converted to ADF.
 /// - Select-style object fields (`{"value": "..."}`) get wrapped accordingly.
 /// - Everything else is sent as a plain string.
 ///
 /// `schema` is needed because a currently-empty rich-text field has `original`
-/// set to `Null`, so the value-based check alone can't recognize it.
+/// set to `Null`, so the value-based check alone can't recognize it. `field_id`
+/// covers the case where even the schema is missing: the default view fetches
+/// names through the global field registry, which carries no schemas, so an
+/// empty description would otherwise be sent to API v3 as a bare string and
+/// rejected.
 fn shape_field_value(
     user_text: &str,
     original: &serde_json::Value,
     schema: Option<&crate::jira::types::FieldSchema>,
+    field_id: &str,
 ) -> serde_json::Value {
     let is_adf = original.get("type").and_then(|t| t.as_str()) == Some("doc")
-        || schema.is_some_and(crate::jira::types::FieldSchema::is_adf);
+        || schema.is_some_and(crate::jira::types::FieldSchema::is_adf)
+        || crate::jira::types::is_adf_system_field(field_id);
     if is_adf {
         return crate::jira::adf::markdown_to_adf(user_text);
     }
@@ -1869,6 +1875,7 @@ mod tests {
             "hello",
             &serde_json::Value::Null,
             Some(&adf_description_schema()),
+            "description",
         );
         assert_eq!(result.get("type").and_then(|t| t.as_str()), Some("doc"));
     }
@@ -1879,6 +1886,7 @@ mod tests {
             "# Title\n\nbody",
             &serde_json::Value::Null,
             Some(&adf_paragraph_custom_schema()),
+            "customfield_10050",
         );
         assert_eq!(result.get("type").and_then(|t| t.as_str()), Some("doc"));
     }
@@ -1886,14 +1894,14 @@ mod tests {
     #[test]
     fn existing_adf_value_still_produces_adf_without_schema() {
         let original = json!({ "type": "doc", "version": 1, "content": [] });
-        let result = shape_field_value("hello", &original, None);
+        let result = shape_field_value("hello", &original, None, "customfield_10050");
         assert_eq!(result.get("type").and_then(|t| t.as_str()), Some("doc"));
     }
 
     #[test]
     fn select_field_wraps_value() {
         let original = json!({ "value": "old" });
-        let result = shape_field_value("new", &original, None);
+        let result = shape_field_value("new", &original, None, "customfield_10051");
         assert_eq!(result, json!({ "value": "new" }));
     }
 
@@ -1903,14 +1911,26 @@ mod tests {
             "plain text",
             &serde_json::Value::Null,
             Some(&plain_string_schema()),
+            "customfield_10052",
         );
         assert_eq!(result, json!("plain text"));
     }
 
     #[test]
     fn unknown_schema_and_empty_original_falls_back_to_string() {
-        let result = shape_field_value("plain", &serde_json::Value::Null, None);
+        let result =
+            shape_field_value("plain", &serde_json::Value::Null, None, "customfield_10053");
         assert_eq!(result, json!("plain"));
+    }
+
+    /// The default view never loads field schemas, so writing the *first*
+    /// description on an issue has neither a `doc`-shaped original nor a
+    /// schema to go on — the field id has to carry it, or API v3 rejects the
+    /// bare string.
+    #[test]
+    fn empty_description_without_schema_still_produces_adf() {
+        let result = shape_field_value("hello", &serde_json::Value::Null, None, "description");
+        assert_eq!(result.get("type").and_then(|t| t.as_str()), Some("doc"));
     }
 }
 

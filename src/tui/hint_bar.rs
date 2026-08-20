@@ -243,7 +243,12 @@ pub fn render_hints(f: &mut Frame, area: Rect, app: &AppState) {
                 let field_cfg =
                     crate::tui::views::custom::view_field_cfg(view_cfg, selected_item, field_idx);
                 let is_readonly = field_cfg.as_ref().and_then(|f| f.readonly).unwrap_or(false)
-                    || selected_item.is_some_and(|i| !i.supports_field_edit());
+                    || selected_item.is_some_and(|i| !i.supports_field_edit())
+                    || field_cfg.as_ref().is_some_and(|f| {
+                        selected_item.is_some_and(|i| {
+                            crate::tui::views::custom::field_awaiting_detail(i, &f.field_id)
+                        })
+                    });
                 if is_readonly {
                     let field_id = field_cfg
                         .as_ref()

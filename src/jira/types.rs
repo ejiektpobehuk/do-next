@@ -564,10 +564,18 @@ pub struct FieldSchema {
     pub system: Option<String>,
 }
 
+/// Returns true for the system fields whose value is an Atlassian Document,
+/// identified by field id alone. Needed where no schema is available: the
+/// default view never fetches editmeta, so an *empty* description arrives with
+/// neither a `doc`-shaped current value nor a `FieldSchema` to consult.
+pub fn is_adf_system_field(field_id: &str) -> bool {
+    matches!(field_id, "description" | "environment")
+}
+
 impl FieldSchema {
     /// Returns true when this field's value is an Atlassian Document.
     pub fn is_adf(&self) -> bool {
-        matches!(self.system.as_deref(), Some("description" | "environment"))
+        self.system.as_deref().is_some_and(is_adf_system_field)
             || self.custom.as_deref().is_some_and(is_adf_custom_field_type)
     }
 
