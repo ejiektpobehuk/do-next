@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -1263,6 +1264,13 @@ pub struct CustomViewConfig {
     /// Display timezone, e.g. "+03" or "-05". Defaults to system local timezone.
     pub timezone: Option<String>,
     pub sections: Vec<CustomViewSectionConfig>,
+    /// Directory the view's template paths resolve against. Not a config key:
+    /// stamped in during loading. Unset for a view declared in a team config
+    /// (its own directory is the base); set to the company repo root for a
+    /// view shared through `company.json5`, whose templates live there rather
+    /// than in whichever team borrowed the view.
+    #[serde(skip)]
+    pub base_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

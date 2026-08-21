@@ -102,9 +102,10 @@ fn report_offline(loaded: &config::LoadedConfig) -> usize {
             );
         }
         if !team.config.views.is_empty() {
-            let mut views: Vec<&str> = team.config.views.keys().map(String::as_str).collect();
-            views.sort_unstable();
-            println!("  views:      {}", views.join(", "));
+            println!(
+                "  views:      {}",
+                view_labels(&team.config.views).join(", ")
+            );
         }
 
         print_sources("sources", &team.normal_sources);
@@ -320,7 +321,7 @@ fn team_problems(team: &ResolvedTeam) -> Vec<String> {
             && !team.config.views.contains_key(view)
         {
             problems.push(format!(
-                "{at}: view_mode '{view}' is not defined in this team's `views`"
+                "{at}: view_mode '{view}' is not defined in this team's `views`                  nor shared by the company manifest"
             ));
         }
     }
@@ -333,6 +334,26 @@ fn team_problems(team: &ResolvedTeam) -> Vec<String> {
     }
 
     problems
+}
+
+/// A team's view names in display order. A view shared through the company
+/// manifest is marked as such: that is where to go to change it, not the
+/// team's own file.
+fn view_labels(
+    views: &std::collections::HashMap<String, config::types::CustomViewConfig>,
+) -> Vec<String> {
+    let mut labels: Vec<String> = views
+        .iter()
+        .map(|(id, view)| {
+            if view.base_dir.is_some() {
+                format!("{id} (shared)")
+            } else {
+                id.clone()
+            }
+        })
+        .collect();
+    labels.sort_unstable();
+    labels
 }
 
 const fn or_unset(value: &str) -> &str {
@@ -484,5 +505,25 @@ fn report(label: &str, outcome: Result<&str, &anyhow::Error>) {
     match outcome {
         Ok(detail) => println!("    {label:<28} {detail}"),
         Err(e) => println!("    {label:<28} ERROR {e:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::types::CustomViewConfig;
+
+    #[test]
+    fn view_labels_mark_the_shared_ones_and_sort() {
+        let mut views = std::collections::HashMap::new();
+        views.insert("triage".to_string(), CustomViewConfig::default());
+        views.insert(
+            "postmortem".to_string(),
+            CustomViewConfig {
+                base_dir: Some(std::path::PathBuf::from("/co")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(view_labels(&views), ["postmortem (shared)", "triage"]);
     }
 }

@@ -23,6 +23,7 @@ All notable changes to `do-next` are documented here.
 - `inspect` command to make configuration easier
 - GitLab oauth sign-in: **Web** and **Device** for headless sessions.
 - `do-next auth` is now a menu of integrations
+- Shared views in a company config
 
 ### Renames
 

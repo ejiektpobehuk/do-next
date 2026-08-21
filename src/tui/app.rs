@@ -4898,12 +4898,14 @@ fn key_edit_detail_field(app: &mut AppState) {
         }
     }
 
+    // A view shared through the company manifest carries its own base: its
+    // templates sit in the company repo, not in whichever team borrowed it.
+    let template_base: std::path::PathBuf = view_cfg
+        .and_then(|v| v.base_dir.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from(&app.resolved_teams[app.active_team_idx].path));
     let templates = field_cfg
         .as_ref()
-        .map(|f| {
-            let team_path = &app.resolved_teams[app.active_team_idx].path;
-            resolve_templates(team_path, &f.effective_templates())
-        })
+        .map(|f| resolve_templates(&template_base, &f.effective_templates()))
         .unwrap_or_default();
 
     if use_editor {
@@ -5365,13 +5367,13 @@ fn handle_confirm_field_edit_input(app: &mut AppState, event: &crossterm::event:
 }
 
 fn resolve_templates(
-    team_path: &str,
+    base_dir: &std::path::Path,
     entries: &[crate::config::types::TemplateEntry],
 ) -> Vec<LoadedTemplate> {
     entries
         .iter()
         .filter_map(|entry| {
-            let path = std::path::Path::new(team_path).join(&entry.path);
+            let path = base_dir.join(&entry.path);
             let content = std::fs::read_to_string(path).ok()?;
             let trimmed = content.trim().to_string();
             if trimmed.is_empty() {
@@ -5940,6 +5942,73 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// A board source whose cards should open in the named view.
+    fn board_source_with_view(id: &str, view: &str) -> cfg::SourceConfig {
+        cfg::SourceConfig {
+            view_mode: Some(view.into()),
+            ..board_source(id)
+        }
+    }
+
+    /// A team holding one view under `id`, shared (company-level) or its own.
+    fn team_with_view(sources: Vec<cfg::SourceConfig>, id: &str, shared: bool) -> TeamConfig {
+        let view = cfg::CustomViewConfig {
+            base_dir: shared.then(|| std::path::PathBuf::from("/co")),
+            ..Default::default()
+        };
+        TeamConfig {
+            sources,
+            views: std::iter::once((id.to_string(), view)).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_board_card_opens_in_the_view_its_source_names() {
+        let team = team_with_view(
+            vec![board_source_with_view("inc_board", "postmortem")],
+            "postmortem",
+            false,
+        );
+        let item = make_item("INC-1", "To Do", Some("inc_board"));
+        assert_eq!(
+            auto_view_mode(&item, &team),
+            ViewMode::Custom("postmortem".into())
+        );
+    }
+
+    #[test]
+    fn a_board_card_reaches_a_view_shared_by_the_company() {
+        let team = team_with_view(
+            vec![board_source_with_view("inc_board", "postmortem")],
+            "postmortem",
+            true,
+        );
+        let item = make_item("INC-1", "Mitigated", Some("inc_board"));
+        assert_eq!(
+            auto_view_mode(&item, &team),
+            ViewMode::Custom("postmortem".into())
+        );
+    }
+
+    #[test]
+    fn a_view_mode_naming_nothing_falls_back_to_the_default_view() {
+        let team = team_with_view(
+            vec![board_source_with_view("inc_board", "typo")],
+            "postmortem",
+            true,
+        );
+        let item = make_item("INC-1", "To Do", Some("inc_board"));
+        assert_eq!(auto_view_mode(&item, &team), ViewMode::Default);
+    }
+
+    #[test]
+    fn a_board_without_a_view_mode_keeps_the_default_view() {
+        let team = team_with_view(vec![board_source("inc_board")], "postmortem", true);
+        let item = make_item("INC-1", "To Do", Some("inc_board"));
+        assert_eq!(auto_view_mode(&item, &team), ViewMode::Default);
     }
 
     fn jira_source(id: &str) -> cfg::SourceConfig {

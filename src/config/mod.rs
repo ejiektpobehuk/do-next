@@ -5,6 +5,7 @@ pub mod types;
 pub mod updates;
 
 use anyhow::{Context, Result, anyhow};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use types::{
@@ -39,12 +40,14 @@ pub fn load() -> Result<LoadedConfig> {
     let raw = config.clone();
     let mut teams = Vec::new();
     let mut load_errors = Vec::new();
-    let mut team_refs = resolve_company(&mut config, &mut load_errors);
+    let company = resolve_company(&mut config, &mut load_errors);
+    let mut team_refs = company.team_refs;
     team_refs.extend(config.teams.iter().cloned());
     for team_ref in &team_refs {
         match load_team_config(team_ref) {
             Ok((mut team_config, warnings)) => {
                 apply_backlog_choice(team_ref, &mut team_config);
+                apply_shared_views(&company.shared_views, &mut team_config);
                 for w in warnings {
                     load_errors.push(format!("team '{}': {w}", team_ref.id));
                 }
@@ -106,16 +109,16 @@ pub fn load() -> Result<LoadedConfig> {
 /// (in memory only — the user's file is never rewritten), and synthesize
 /// `TeamRef`s for the selected catalog teams. All failures are non-fatal:
 /// they land in `load_errors` and manually-configured teams keep working.
-fn resolve_company(config: &mut Config, load_errors: &mut Vec<String>) -> Vec<TeamRef> {
+fn resolve_company(config: &mut Config, load_errors: &mut Vec<String>) -> ResolvedCompany {
     let Some(company_ref) = config.company.clone() else {
-        return Vec::new();
+        return ResolvedCompany::default();
     };
     let dir = expand_tilde(&company_ref.path);
     let manifest = match company::load_manifest(&dir) {
         Ok(m) => m,
         Err(e) => {
             load_errors.push(format!("company '{}': {e:#}", company_ref.path));
-            return Vec::new();
+            return ResolvedCompany::default();
         }
     };
     config.atlassian = company::apply_company_defaults(&config.atlassian, &manifest);
@@ -134,7 +137,49 @@ fn resolve_company(config: &mut Config, load_errors: &mut Vec<String>) -> Vec<Te
     apply_gitlab_defaults(&mut config.gitlab, manifest.defaults.gitlab.as_ref());
     let (refs, errors) = company::company_team_refs(&dir, &manifest, &company_ref.teams);
     load_errors.extend(errors);
-    refs
+    // Reported once, against the repo root the templates actually live in,
+    // rather than once per team that borrows the view.
+    load_errors.extend(
+        collect_view_warnings(&manifest.views, &dir)
+            .into_iter()
+            .map(|w| format!("company '{}': {w}", company_ref.path)),
+    );
+    ResolvedCompany {
+        team_refs: refs,
+        shared_views: shared_views(&dir, manifest.views),
+    }
+}
+
+/// What the company block contributes to team resolution.
+#[derive(Default)]
+struct ResolvedCompany {
+    team_refs: Vec<TeamRef>,
+    /// Manifest `views`, each stamped with the repo root so its templates
+    /// resolve there whichever team ends up borrowing it.
+    shared_views: HashMap<String, types::CustomViewConfig>,
+}
+
+/// Stamp the company repo root onto each shared view as its template base.
+fn shared_views(
+    dir: &Path,
+    views: HashMap<String, types::CustomViewConfig>,
+) -> HashMap<String, types::CustomViewConfig> {
+    views
+        .into_iter()
+        .map(|(id, mut view)| {
+            view.base_dir = Some(dir.to_path_buf());
+            (id, view)
+        })
+        .collect()
+}
+
+/// Add the company's shared views to a team, leaving any same-named view the
+/// team declared itself in place: a team can override a shared view by
+/// spelling out its own.
+fn apply_shared_views(shared: &HashMap<String, types::CustomViewConfig>, team: &mut TeamConfig) {
+    for (id, view) in shared {
+        team.views.entry(id.clone()).or_insert_with(|| view.clone());
+    }
 }
 
 /// Fill unset user Grafana fields from the company defaults, field by field:
@@ -378,7 +423,15 @@ fn validate_team_config(team: &TeamConfig) -> Result<()> {
             }
         }
     }
-    for (view_id, view) in &team.views {
+    validate_views(&team.views)?;
+    Ok(())
+}
+
+/// Shape checks for a set of named views, shared by team configs and the
+/// company manifest's `views` block — a view is validated the same way
+/// wherever it was declared.
+pub fn validate_views(views: &HashMap<String, types::CustomViewConfig>) -> Result<()> {
+    for (view_id, view) in views {
         for section in &view.sections {
             for field in &section.fields {
                 if field.template.is_some() && field.templates.is_some() {
@@ -437,17 +490,81 @@ mod tests {
 
     fn team_with_field(field: CustomViewFieldConfig) -> TeamConfig {
         let view = CustomViewConfig {
-            timezone: None,
             sections: vec![CustomViewSectionConfig {
                 title: "Section".into(),
                 description: None,
                 fields: vec![field],
             }],
+            ..Default::default()
         };
         TeamConfig {
             views: std::iter::once(("view".to_string(), view)).collect(),
             ..Default::default()
         }
+    }
+
+    fn named_view(id: &str) -> HashMap<String, CustomViewConfig> {
+        let view = CustomViewConfig {
+            timezone: Some("+03".into()),
+            ..Default::default()
+        };
+        std::iter::once((id.to_string(), view)).collect()
+    }
+
+    // ── shared views ──────────────────────────────────────────────────────
+
+    #[test]
+    fn shared_views_stamp_the_company_repo_as_their_template_base() {
+        let dir = Path::new("/home/u/.config/do-next/company/acme");
+        let stamped = shared_views(dir, named_view("postmortem"));
+        assert_eq!(stamped["postmortem"].base_dir.as_deref(), Some(dir));
+    }
+
+    #[test]
+    fn shared_views_fill_a_team_that_declares_none() {
+        let mut team = TeamConfig::default();
+        apply_shared_views(
+            &shared_views(Path::new("/co"), named_view("postmortem")),
+            &mut team,
+        );
+        assert_eq!(team.views.len(), 1);
+        assert_eq!(
+            team.views["postmortem"].base_dir.as_deref(),
+            Some(Path::new("/co"))
+        );
+    }
+
+    #[test]
+    fn a_team_own_view_wins_over_the_shared_one_of_the_same_name() {
+        let mut team = TeamConfig {
+            views: named_view("postmortem"),
+            ..Default::default()
+        };
+        team.views.get_mut("postmortem").expect("seeded").timezone = Some("-05".into());
+        apply_shared_views(
+            &shared_views(Path::new("/co"), named_view("postmortem")),
+            &mut team,
+        );
+        assert_eq!(team.views.len(), 1);
+        let kept = &team.views["postmortem"];
+        assert_eq!(kept.timezone.as_deref(), Some("-05"));
+        // No base_dir: the team's own copy resolves templates in its own dir.
+        assert!(kept.base_dir.is_none());
+    }
+
+    #[test]
+    fn sharing_leaves_unrelated_team_views_alone() {
+        let mut team = TeamConfig {
+            views: named_view("triage"),
+            ..Default::default()
+        };
+        apply_shared_views(
+            &shared_views(Path::new("/co"), named_view("postmortem")),
+            &mut team,
+        );
+        assert_eq!(team.views.len(), 2);
+        assert!(team.views["triage"].base_dir.is_none());
+        assert!(team.views["postmortem"].base_dir.is_some());
     }
 
     #[test]
@@ -1234,7 +1351,8 @@ mod tests {
         let fixture = company_fixture();
         let mut config = config_with_company(&fixture, &["platform"]);
         let mut errors = Vec::new();
-        let refs = resolve_company(&mut config, &mut errors);
+        let company = resolve_company(&mut config, &mut errors);
+        let refs = &company.team_refs;
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].id, "platform");
@@ -1255,8 +1373,9 @@ mod tests {
         let empty = tempfile::tempdir().expect("tempdir");
         let mut config = config_with_company(&empty, &["platform"]);
         let mut errors = Vec::new();
-        let refs = resolve_company(&mut config, &mut errors);
-        assert!(refs.is_empty());
+        let company = resolve_company(&mut config, &mut errors);
+        assert!(company.team_refs.is_empty());
+        assert!(company.shared_views.is_empty());
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("company"));
         // No merge happened — user config untouched.
@@ -1268,10 +1387,83 @@ mod tests {
         let fixture = company_fixture();
         let mut config = config_with_company(&fixture, &["platform", "gone"]);
         let mut errors = Vec::new();
-        let refs = resolve_company(&mut config, &mut errors);
-        assert_eq!(refs.len(), 1);
+        let company = resolve_company(&mut config, &mut errors);
+        assert_eq!(company.team_refs.len(), 1);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("gone"));
+    }
+
+    /// A company clone whose manifest shares one view with a template at the
+    /// repo root, plus a team that declares no views of its own.
+    fn shared_view_fixture(template: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("company.json5"),
+            r#"{
+                name: "Acme",
+                jira: { base_url: "https://acme.atlassian.net" },
+                views: {
+                    postmortem: {
+                        sections: [{
+                            title: "Postmortem",
+                            fields: [{ field_id: "customfield_1", template: "views/postmortem.md" }],
+                        }],
+                    },
+                },
+                teams: [{ id: "inc-board" }],
+            }"#,
+        )
+        .expect("write manifest");
+        let team_dir = dir.path().join("teams/inc-board");
+        std::fs::create_dir_all(&team_dir).expect("team dir");
+        std::fs::write(
+            team_dir.join("do-next.json5"),
+            r#"{ sources: [{ id: "inc", kind: "board", board: { board_id: 288 },
+                             view_mode: "postmortem" }] }"#,
+        )
+        .expect("write team config");
+        if let Some(body) = template {
+            std::fs::create_dir_all(dir.path().join("views")).expect("views dir");
+            std::fs::write(dir.path().join("views/postmortem.md"), body).expect("write template");
+        }
+        dir
+    }
+
+    #[test]
+    fn a_shared_view_reaches_a_team_that_declares_none() {
+        let fixture = shared_view_fixture(Some("## What happened\n"));
+        let mut config = config_with_company(&fixture, &["inc-board"]);
+        let mut errors = Vec::new();
+        let company = resolve_company(&mut config, &mut errors);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(company.shared_views.len(), 1);
+
+        let (mut team, warnings) = load_team_config(&company.team_refs[0]).expect("team loads");
+        // The team's own file declares no views, so nothing to warn about.
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(team.views.is_empty());
+        apply_shared_views(&company.shared_views, &mut team);
+
+        let view = team.views.get("postmortem").expect("borrowed view");
+        // Templates resolve in the company repo, not in teams/inc-board.
+        assert_eq!(view.base_dir.as_deref(), Some(fixture.path()));
+        let entries = view.sections[0].fields[0].effective_templates();
+        let full = fixture.path().join(&entries[0].path);
+        assert!(full.exists(), "{} should exist", full.display());
+    }
+
+    #[test]
+    fn an_unreadable_shared_template_is_reported_once_against_the_repo() {
+        let fixture = shared_view_fixture(None);
+        let mut config = config_with_company(&fixture, &["inc-board"]);
+        let mut errors = Vec::new();
+        let company = resolve_company(&mut config, &mut errors);
+        // Reported at the company, not repeated for every borrowing team.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].contains("cannot read template"));
+        assert!(errors[0].contains("views/postmortem.md"));
+        // Still shared: a missing template does not withdraw the view.
+        assert_eq!(company.shared_views.len(), 1);
     }
 
     #[test]
@@ -1349,10 +1541,11 @@ mod tests {
             ))
             .expect("valid config");
             let mut errors = Vec::new();
-            let refs = resolve_company(&mut config, &mut errors);
+            let company = resolve_company(&mut config, &mut errors);
             assert!(errors.is_empty(), "unexpected errors: {errors:?}");
-            let (mut team, _) = load_team_config(&refs[0]).expect("team loads");
-            apply_backlog_choice(&refs[0], &mut team);
+            let team_ref = &company.team_refs[0];
+            let (mut team, _) = load_team_config(team_ref).expect("team loads");
+            apply_backlog_choice(team_ref, &mut team);
             team
         };
 
@@ -2104,8 +2297,17 @@ fn apply_confluence_override(base: &mut AtlassianConfig, overlay: &AtlassianOver
 /// template paths that can't be read or are empty. These surface as warnings
 /// instead of failing the team load.
 fn collect_team_warnings(team: &TeamConfig, dir: &Path) -> Vec<String> {
+    collect_view_warnings(&team.views, dir)
+}
+
+/// The view half of `collect_team_warnings`, split out so the company
+/// manifest's shared views get the same checks against the repo root.
+fn collect_view_warnings(
+    views: &HashMap<String, types::CustomViewConfig>,
+    dir: &Path,
+) -> Vec<String> {
     let mut warnings = Vec::new();
-    for (view_id, view) in &team.views {
+    for (view_id, view) in views {
         for section in &view.sections {
             for field in &section.fields {
                 if field.uses_legacy_date_flags() {

@@ -4,13 +4,15 @@
 //! synthesized into ordinary `TeamRef`s so the existing resolution pipeline
 //! applies unchanged.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use super::types::{
-    AtlassianConfig, AtlassianOverride, CompanyTeamSelection, GitlabConfig, GrafanaConfig, TeamRef,
+    AtlassianConfig, AtlassianOverride, CompanyTeamSelection, CustomViewConfig, GitlabConfig,
+    GrafanaConfig, TeamRef,
 };
 
 /// Manifest file name at the root of a company config repo.
@@ -33,6 +35,13 @@ pub struct CompanyManifest {
     pub oauth: Option<CompanyOAuth>,
     #[serde(default)]
     pub defaults: CompanyDefaults,
+    /// Views shared by every team, keyed by the name a source's `view_mode`
+    /// refers to. A team that declares a view under the same name keeps its
+    /// own — sharing fills gaps, it never overrides. Template paths inside
+    /// these resolve against the repo root, not the borrowing team's
+    /// directory, so one definition serves teams that hold no copy of it.
+    #[serde(default)]
+    pub views: HashMap<String, CustomViewConfig>,
     /// Curated team catalog (explicit — the repo is not scanned).
     #[serde(default)]
     pub teams: Vec<CompanyTeamEntry>,
@@ -116,6 +125,7 @@ fn validate_manifest(manifest: &CompanyManifest) -> Result<()> {
             bail!("company manifest: `oauth.client_secret` must not be empty");
         }
     }
+    super::validate_views(&manifest.views).context("company manifest")?;
     let mut seen = std::collections::HashSet::new();
     for team in &manifest.teams {
         if team.id.trim().is_empty() {
@@ -321,6 +331,47 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_shared_views() {
+        let m = parse_manifest(
+            r#"{ name: "Acme", jira: { base_url: "https://a.example" },
+                 views: {
+                   postmortem: {
+                     timezone: "+03",
+                     sections: [{
+                       title: "Timeline",
+                       fields: [{ field_id: "customfield_1", type: "datetime" }],
+                     }],
+                   },
+                 } }"#,
+        )
+        .expect("valid manifest");
+        let view = m.views.get("postmortem").expect("shared view");
+        assert_eq!(view.timezone.as_deref(), Some("+03"));
+        assert_eq!(view.sections[0].fields[0].field_id, "customfield_1");
+        // The base is stamped in during loading, not read from the manifest.
+        assert!(view.base_dir.is_none());
+    }
+
+    #[test]
+    fn manifest_without_views_shares_none() {
+        let m = parse_manifest(r#"{ name: "Acme", jira: { base_url: "https://a.example" } }"#)
+            .expect("valid manifest");
+        assert!(m.views.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_malformed_shared_view() {
+        let err = parse_manifest(
+            r#"{ name: "Acme", jira: { base_url: "https://a.example" },
+                 views: { pm: { sections: [{ title: "S", fields: [
+                   { field_id: "f", template: "a.md", templates: [{ name: "b", path: "b.md" }] },
+                 ] }] } } }"#,
+        )
+        .expect_err("a view that sets both template forms must be rejected");
+        assert!(err.to_string().contains("company manifest"));
     }
 
     #[test]
