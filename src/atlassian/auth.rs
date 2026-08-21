@@ -28,8 +28,8 @@ pub async fn maybe_refresh(auth: &RwLock<Auth>) -> Result<()> {
             && o.expires_at - Utc::now() < chrono::Duration::seconds(60)
         {
             log::debug!("OAuth token expiring soon, refreshing");
-            let refreshed = crate::jira::oauth::refresh_access_token(o).await?;
-            crate::jira::oauth::save_oauth_tokens(&refreshed)?;
+            let refreshed = crate::atlassian::oauth::refresh_access_token(o).await?;
+            crate::atlassian::oauth::save_oauth_tokens(&refreshed)?;
             *auth = Auth::OAuth(refreshed);
         }
     }

@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use super::types::{
-    CompanyTeamSelection, ConfluenceConfig, GitlabConfig, GrafanaConfig, JiraConfig, TeamRef,
+    AtlassianConfig, AtlassianOverride, CompanyTeamSelection, GitlabConfig, GrafanaConfig, TeamRef,
 };
 
 /// Manifest file name at the root of a company config repo.
@@ -21,7 +21,13 @@ pub const MANIFEST_FILE: &str = "company.json5";
 pub struct CompanyManifest {
     /// Human-readable company name.
     pub name: String,
-    pub jira: CompanyJira,
+    /// The company's Atlassian site.
+    ///
+    /// `alias = "jira"` is **permanent, not transitional**: manifests are
+    /// authored by someone else in a repo this tool may not control, so the
+    /// old spelling can never stop being accepted. Do not remove it.
+    #[serde(alias = "jira")]
+    pub atlassian: CompanyAtlassian,
     /// Shared Atlassian OAuth app. Presence implies `auth_method: "oauth"`
     /// for users who haven't chosen an auth method themselves.
     pub oauth: Option<CompanyOAuth>,
@@ -33,7 +39,7 @@ pub struct CompanyManifest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CompanyJira {
+pub struct CompanyAtlassian {
     pub base_url: String,
     pub default_project: Option<String>,
 }
@@ -48,7 +54,7 @@ pub struct CompanyOAuth {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CompanyDefaults {
-    pub confluence: Option<ConfluenceConfig>,
+    pub confluence: Option<AtlassianOverride>,
     pub slack_team_id: Option<String>,
     pub open_slack_in_app: Option<bool>,
     /// Grafana `OnCall` connection defaults (e.g. the company's API URL).
@@ -99,7 +105,7 @@ fn validate_manifest(manifest: &CompanyManifest) -> Result<()> {
     if manifest.name.trim().is_empty() {
         bail!("company manifest: `name` must not be empty");
     }
-    if manifest.jira.base_url.trim().is_empty() {
+    if manifest.atlassian.base_url.trim().is_empty() {
         bail!("company manifest: `jira.base_url` must not be empty");
     }
     if let Some(oauth) = &manifest.oauth {
@@ -133,13 +139,16 @@ pub fn load_manifest(clone_dir: &Path) -> Result<CompanyManifest> {
 /// Overlay company values onto the user's Jira config, filling only fields
 /// the user left unset/empty. Precedence stays: team override > user config
 /// > company manifest > built-in default.
-pub fn apply_company_defaults(user: &JiraConfig, manifest: &CompanyManifest) -> JiraConfig {
+pub fn apply_company_defaults(
+    user: &AtlassianConfig,
+    manifest: &CompanyManifest,
+) -> AtlassianConfig {
     let mut jira = user.clone();
     if jira.base_url.is_empty() {
-        jira.base_url.clone_from(&manifest.jira.base_url);
+        jira.base_url.clone_from(&manifest.atlassian.base_url);
     }
     if jira.default_project.is_empty()
-        && let Some(project) = &manifest.jira.default_project
+        && let Some(project) = &manifest.atlassian.default_project
     {
         jira.default_project.clone_from(project);
     }
@@ -265,8 +274,8 @@ mod tests {
     fn parses_full_manifest() {
         let m = parse_manifest(FULL_MANIFEST).expect("valid manifest");
         assert_eq!(m.name, "Acme Corp");
-        assert_eq!(m.jira.base_url, "https://acme.atlassian.net");
-        assert_eq!(m.jira.default_project.as_deref(), Some("CORE"));
+        assert_eq!(m.atlassian.base_url, "https://acme.atlassian.net");
+        assert_eq!(m.atlassian.default_project.as_deref(), Some("CORE"));
         let oauth = m.oauth.as_ref().expect("oauth block");
         assert_eq!(oauth.client_id, "cid-123");
         assert_eq!(oauth.client_secret, "sec-456");
@@ -338,7 +347,7 @@ mod tests {
 
     #[test]
     fn empty_user_config_takes_all_company_values() {
-        let jira = apply_company_defaults(&JiraConfig::default(), &manifest());
+        let jira = apply_company_defaults(&AtlassianConfig::default(), &manifest());
         assert_eq!(jira.base_url, "https://acme.atlassian.net");
         assert_eq!(jira.default_project, "CORE");
         assert_eq!(jira.auth_method.as_deref(), Some("oauth"));
@@ -348,7 +357,7 @@ mod tests {
 
     #[test]
     fn user_set_fields_win_over_company() {
-        let user = JiraConfig {
+        let user = AtlassianConfig {
             base_url: "https://mine.atlassian.net".into(),
             default_project: "MINE".into(),
             auth_method: Some("basic".into()),
@@ -367,7 +376,7 @@ mod tests {
     #[test]
     fn company_oauth_creds_fill_in_even_when_user_chose_oauth() {
         // User opted into oauth but relies on the company app for credentials.
-        let user = JiraConfig {
+        let user = AtlassianConfig {
             auth_method: Some("oauth".into()),
             ..Default::default()
         };
@@ -380,7 +389,7 @@ mod tests {
     fn manifest_without_oauth_leaves_auth_untouched() {
         let m = parse_manifest(r#"{ name: "Acme", jira: { base_url: "https://a.example" } }"#)
             .expect("valid manifest");
-        let jira = apply_company_defaults(&JiraConfig::default(), &m);
+        let jira = apply_company_defaults(&AtlassianConfig::default(), &m);
         assert_eq!(jira.auth_method, None);
         assert_eq!(jira.oauth_client_id, None);
     }

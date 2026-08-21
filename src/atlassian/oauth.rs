@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use chrono::{Duration as ChronoDuration, Utc};
 
-use crate::jira::auth::{OAuthCredentials, OAuthStore};
+use crate::atlassian::auth::{OAuthCredentials, OAuthStore};
 use crate::oauth::{self, LoopbackServer, percent_encode};
 
 /// Fixed callback port. Must match the URI registered in the Atlassian
@@ -307,6 +307,12 @@ pub async fn refresh_access_token(creds: &OAuthCredentials) -> Result<OAuthCrede
     })
 }
 
+/// Keyring entry pointing at the `cloud_id` whose tokens are stored.
+///
+/// Named so a status probe can ask whether the store is *readable* — the
+/// loaders below deliberately swallow keyring errors into "no tokens", which is
+/// right for a credential path and a lie for a display.
+pub const KEYRING_INDEX_KEY: &str = "oauth:_index";
 /// Save OAuth tokens using the store indicated by `creds.store`.
 pub fn save_oauth_tokens(creds: &OAuthCredentials) -> Result<()> {
     let data = StoredTokens {
@@ -328,7 +334,7 @@ pub fn save_oauth_tokens(creds: &OAuthCredentials) -> Result<()> {
                 .set_password(&json)
                 .context("Failed to store OAuth tokens in keyring")?;
             // Store an index entry so load_oauth_tokens can find the cloud_id.
-            let index = keyring::Entry::new("do-next", "oauth:_index")
+            let index = keyring::Entry::new("do-next", KEYRING_INDEX_KEY)
                 .context("Failed to access keyring for OAuth index")?;
             index
                 .set_password(&creds.cloud_id)
@@ -370,7 +376,7 @@ fn load_oauth_from_keyring() -> Result<Option<OAuthCredentials>> {
     // Since keyring 4 the platform store is initialized on the first `Entry::new`,
     // so a keyring that isn't available fails here. Treat that like a missing
     // entry so the file store still gets a chance.
-    let index_entry = match keyring::Entry::new("do-next", "oauth:_index") {
+    let index_entry = match keyring::Entry::new("do-next", KEYRING_INDEX_KEY) {
         Ok(entry) => entry,
         Err(e) => {
             log::debug!("keyring unavailable for OAuth index lookup: {e}");

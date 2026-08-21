@@ -107,13 +107,13 @@ async fn run_inner(
         if app.flags.pending_team_fetch {
             app.flags.pending_team_fetch = false;
             if let Some(team) = app.resolved_teams.get(app.active_team_idx)
-                && let Some(team_client) = clients_map.jira.get(&team.jira.base_url)
+                && let Some(team_client) = clients_map.jira.get(&team.atlassian.base_url)
             {
                 let team_clients = TeamClients {
                     jira: team_client,
                     confluence: clients_map.confluence.get(&team.confluence.base_url),
                     gitlab: clients_map.gitlab.get(&team.gitlab.base_url),
-                    jira_site_url: &team.jira.base_url,
+                    jira_site_url: &team.atlassian.base_url,
                 };
                 spawn_fetches(
                     team_clients,
@@ -161,11 +161,11 @@ async fn run_inner(
         let active_site_url = app
             .resolved_teams
             .get(app.active_team_idx)
-            .map_or_else(String::new, |t| t.jira.base_url.clone());
+            .map_or_else(String::new, |t| t.atlassian.base_url.clone());
         let active_team = app.resolved_teams.get(app.active_team_idx);
         let active_clients = TeamClients {
             jira: active_team
-                .and_then(|t| clients_map.jira.get(&t.jira.base_url))
+                .and_then(|t| clients_map.jira.get(&t.atlassian.base_url))
                 .unwrap_or(&client),
             confluence: active_team
                 .and_then(|t| clients_map.confluence.get(&t.confluence.base_url)),
@@ -224,7 +224,7 @@ fn spawn_initial_tasks(
     let active_client = app
         .resolved_teams
         .first()
-        .and_then(|t| clients.jira.get(&t.jira.base_url))
+        .and_then(|t| clients.jira.get(&t.atlassian.base_url))
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("No teams configured. Run do-next to set up a team."))?;
     let first_team = app.resolved_teams.first();
@@ -232,7 +232,7 @@ fn spawn_initial_tasks(
         jira: &active_client,
         confluence: first_team.and_then(|t| clients.confluence.get(&t.confluence.base_url)),
         gitlab: first_team.and_then(|t| clients.gitlab.get(&t.gitlab.base_url)),
-        jira_site_url: first_team.map_or("", |t| t.jira.base_url.as_str()),
+        jira_site_url: first_team.map_or("", |t| t.atlassian.base_url.as_str()),
     };
 
     // Fetch current user (best-effort; subsource sorting depends on it)
@@ -1103,8 +1103,8 @@ fn maybe_dispatch_search(app: &mut AppState, client: &JiraClient, tx: &Unbounded
 pub fn team_project_keys(app: &crate::tui::app::AppState) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     let team = &app.resolved_teams[app.active_team_idx];
-    if !team.jira.default_project.is_empty() {
-        keys.push(team.jira.default_project.clone());
+    if !team.atlassian.default_project.is_empty() {
+        keys.push(team.atlassian.default_project.clone());
     }
     for source in &team.config.sources {
         if let Some(p) = &source.expected_project

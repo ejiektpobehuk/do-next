@@ -952,8 +952,8 @@ impl AppState {
     }
 
     /// The active team's effective Jira config (user default + team override).
-    pub fn team_jira(&self) -> &crate::config::types::JiraConfig {
-        &self.resolved_teams[self.active_team_idx].jira
+    pub fn team_jira(&self) -> &crate::config::types::AtlassianConfig {
+        &self.resolved_teams[self.active_team_idx].atlassian
     }
 
     pub fn any_source_loading(&self) -> bool {
@@ -5920,8 +5920,8 @@ mod tests {
                 sources,
                 ..Default::default()
             },
-            jira: cfg::JiraConfig::default(),
-            confluence: cfg::JiraConfig::default(),
+            atlassian: cfg::AtlassianConfig::default(),
+            confluence: cfg::AtlassianConfig::default(),
             open_slack_in_app: true,
             slack_team_id: None,
             grafana: None,
@@ -6499,7 +6499,7 @@ mod tests {
     fn search_app() -> AppState {
         let teams = vec![resolved_team("platform", vec![jira_source("mine")])];
         let mut app = AppState::new(teams, &cfg::Config::default());
-        app.resolved_teams[0].jira.default_project = "PROJ".into();
+        app.resolved_teams[0].atlassian.default_project = "PROJ".into();
         app.sources.insert(
             "mine".into(),
             SourceState::Loaded(vec![make_item("M-1", "To Do", Some("mine"))]),

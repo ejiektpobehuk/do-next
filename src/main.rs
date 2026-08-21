@@ -1,3 +1,5 @@
+mod atlassian;
+mod auth;
 mod config;
 mod confluence;
 mod datetime;
@@ -57,8 +59,22 @@ enum Commands {
         #[command(subcommand)]
         what: subcommands::inspect::What,
     },
-    /// Reconfigure Jira authentication
-    Auth,
+    /// Sign in to an integration, or report what is configured
+    ///
+    /// With no argument this opens a menu of every integration and instance,
+    /// each showing its current credential state. Unlike `check`, this reads
+    /// your credential stores, so it may ask your keyring to unlock.
+    Auth {
+        /// Configure just this integration, skipping the menu
+        #[arg(value_enum)]
+        integration: Option<subcommands::auth::Integration>,
+        /// Print the credential state of every integration and exit
+        #[arg(long, conflicts_with = "integration")]
+        status: bool,
+        /// With --status, also call each API to confirm the credentials work
+        #[arg(long, requires = "status")]
+        online: bool,
+    },
     /// Manage the company config repo (shared connection + team catalog)
     Company {
         #[command(subcommand)]
@@ -82,27 +98,13 @@ enum CompanyAction {
 /// Pre-resolved Confluence credentials, keyed by base URL. A URL missing from
 /// the map shares its team's Jira auth handle instead (see
 /// [`confluence_shares_jira`]).
-type ConfluenceAuths = std::collections::HashMap<String, jira::auth::Auth>;
-
-/// True when a team's sources include Confluence. Normal *and* on-duty sources
-/// count: the duty view can be toggled on at runtime (`D`), so its clients must
-/// exist up front.
-fn needs_confluence(team: &config::types::ResolvedTeam) -> bool {
-    let duty_sources = team
-        .grafana
-        .iter()
-        .flat_map(|grafana| &grafana.on_duty_sources);
-    team.normal_sources
-        .iter()
-        .chain(duty_sources)
-        .any(|s| s.kind == config::types::SourceKind::Confluence)
-}
+type ConfluenceAuths = std::collections::HashMap<String, atlassian::auth::Auth>;
 
 /// True when a team's effective Confluence connection is its Jira one, so the
 /// two clients can share an auth handle — keeping OAuth refresh coordinated and
 /// saving a second credential lookup.
 fn confluence_shares_jira(team: &config::types::ResolvedTeam) -> bool {
-    team.confluence == team.jira && std::env::var("DO_NEXT_CONFLUENCE_API_TOKEN").is_err()
+    team.confluence == team.atlassian && std::env::var("DO_NEXT_CONFLUENCE_API_TOKEN").is_err()
 }
 
 /// The Jira connection an `inspect` lookup runs against, plus the project key
@@ -119,8 +121,8 @@ fn inspect_target(
 ) -> Result<(jira::JiraClient, String)> {
     let Some(wanted) = team else {
         let project = loaded.teams.first().map_or_else(
-            || loaded.config.jira.default_project.clone(),
-            |t| t.jira.default_project.clone(),
+            || loaded.config.atlassian.default_project.clone(),
+            |t| t.atlassian.default_project.clone(),
         );
         return Ok((default_client.clone(), project));
     };
@@ -135,10 +137,10 @@ fn inspect_target(
         })?;
     let client = clients
         .jira
-        .get(&team.jira.base_url)
+        .get(&team.atlassian.base_url)
         .cloned()
         .with_context(|| format!("No Jira client for team '{}'", team.id))?;
-    Ok((client, team.jira.default_project.clone()))
+    Ok((client, team.atlassian.default_project.clone()))
 }
 
 #[tokio::main]
@@ -197,44 +199,15 @@ async fn main() -> Result<()> {
         return subcommands::check::run(&loaded, *online).await;
     }
 
-    // Auth reset runs before credential resolution (auth may currently be broken).
-    if matches!(&cli.command, Some(Commands::Auth)) {
-        // Teams with confluence / board sources need the matching granular
-        // OAuth scopes (classic Jira scopes don't cover those APIs).
-        let extra_scopes = config::extra_scopes_for(loaded.teams.iter().map(|t| &t.config));
-        let effective_jira = loaded.config.jira.clone();
-        tui::onboarding::run_auth_reset(&effective_jira, &mut loaded.raw, extra_scopes)
-            .context("Auth reset failed")?;
-        // Teams using the on-call view also carry a Grafana OnCall token;
-        // offer to (re)configure it — this is the rotation path.
-        let grafana_teams = grafana::grafana_api_urls(&loaded.teams);
-        if !grafana_teams.is_empty()
-            && tui::onboarding::prompt_yes_no(
-                "\nAlso configure the Grafana OnCall token (on-call view)? [y/N]: ",
-                false,
-            )?
-        {
-            for target in &grafana_teams {
-                tui::onboarding::grafana::setup_grafana_token(target, &mut loaded.raw)
-                    .await
-                    .context("Grafana token setup failed")?;
-            }
-        }
-        // Same for teams with GitLab sources — the merge-request credentials.
-        let gitlab_teams = gitlab::gitlab_api_urls(&loaded.teams);
-        if !gitlab_teams.is_empty()
-            && tui::onboarding::prompt_yes_no(
-                "\nAlso set up GitLab sign-in (merge requests)? [y/N]: ",
-                false,
-            )?
-        {
-            for target in &gitlab_teams {
-                tui::onboarding::gitlab::setup_gitlab_token(target, &mut loaded.raw)
-                    .await
-                    .context("GitLab credential setup failed")?;
-            }
-        }
-        return Ok(());
+    // Auth runs before credential resolution: auth may currently be broken,
+    // which is the whole reason to be running this command.
+    if let Some(Commands::Auth {
+        integration,
+        status,
+        online,
+    }) = &cli.command
+    {
+        return subcommands::auth::run(&mut loaded, *integration, *status, *online).await;
     }
 
     // Company management also runs before credential resolution: joining sets
@@ -320,7 +293,7 @@ async fn main() -> Result<()> {
     // Run onboarding if no config at all (first run). A configured company
     // whose manifest failed to load must NOT fall into onboarding (it would
     // overwrite the user's config) — its errors surface via the bail below.
-    if loaded.config.jira.base_url.is_empty()
+    if loaded.config.atlassian.base_url.is_empty()
         && loaded.config.teams.is_empty()
         && loaded.config.company.is_none()
     {
@@ -481,22 +454,22 @@ async fn main() -> Result<()> {
             loaded
                 .teams
                 .iter()
-                .any(needs_confluence)
+                .any(config::types::ResolvedTeam::uses_confluence)
                 .then_some("resolving Confluence credentials"),
             needs_gitlab.then_some("resolving GitLab credentials"),
         ]);
         let teams = &loaded.teams;
         let resolved = std::thread::scope(|scope| {
             // One auth per unique Jira base_url across all teams.
-            let jira = scope.spawn(|| -> Result<Vec<(String, String, jira::auth::Auth)>> {
-                let mut auths: Vec<(String, String, jira::auth::Auth)> = Vec::new();
+            let jira = scope.spawn(|| -> Result<Vec<(String, String, atlassian::auth::Auth)>> {
+                let mut auths: Vec<(String, String, atlassian::auth::Auth)> = Vec::new();
                 for team in teams {
-                    let url = &team.jira.base_url;
+                    let url = &team.atlassian.base_url;
                     if auths.iter().any(|(seen, _, _)| seen == url) {
                         continue;
                     }
-                    let auth =
-                        config::credentials::resolve_auth(&team.jira).with_context(|| {
+                    let auth = config::credentials::resolve_atlassian_auth(&team.atlassian)
+                        .with_context(|| {
                             format!("Failed to resolve auth for team '{}'", team.id)
                         })?;
                     auths.push((url.clone(), team.id.clone(), auth));
@@ -516,10 +489,10 @@ async fn main() -> Result<()> {
             // loop below, so the same team wins each URL.
             let confluence = scope.spawn(|| -> Result<ConfluenceAuths> {
                 let mut needed: Vec<String> = Vec::new();
-                let mut own: std::collections::HashMap<String, jira::auth::Auth> =
+                let mut own: std::collections::HashMap<String, atlassian::auth::Auth> =
                     std::collections::HashMap::new();
                 for team in teams {
-                    if !needs_confluence(team) {
+                    if !team.uses_confluence() {
                         continue;
                     }
                     let url = team.confluence.base_url.clone();
@@ -619,7 +592,7 @@ async fn main() -> Result<()> {
     }
 
     for team in &loaded.teams {
-        if !needs_confluence(team) {
+        if !team.uses_confluence() {
             continue;
         }
         let url = team.confluence.base_url.clone();
@@ -634,7 +607,7 @@ async fn main() -> Result<()> {
         } else {
             let jira_client = clients
                 .jira
-                .get(&team.jira.base_url)
+                .get(&team.atlassian.base_url)
                 .context("No Jira client for shared Confluence auth")?;
             confluence::ConfluenceClient::from_shared(&url, jira_client.auth_handle())
         }
@@ -656,14 +629,14 @@ async fn main() -> Result<()> {
     let default_client = if let Some(first_team) = loaded.teams.first() {
         clients
             .jira
-            .get(&first_team.jira.base_url)
+            .get(&first_team.atlassian.base_url)
             .cloned()
             .context("No Jira client available")?
     } else {
         // No teams at all — use default jira config
-        let auth = config::credentials::resolve_auth(&loaded.config.jira)
+        let auth = config::credentials::resolve_atlassian_auth(&loaded.config.atlassian)
             .context("Failed to resolve Jira authentication")?;
-        jira::JiraClient::new(loaded.config.jira.base_url.clone(), auth)
+        jira::JiraClient::new(loaded.config.atlassian.base_url.clone(), auth)
             .context("Failed to create Jira client")?
     };
 
@@ -680,7 +653,7 @@ async fn main() -> Result<()> {
             subcommands::inspect::run(&client, &project, json, &what).await?;
         }
         Some(
-            Commands::Auth
+            Commands::Auth { .. }
             | Commands::Check { .. }
             | Commands::Company { .. }
             | Commands::Completions { .. },

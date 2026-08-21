@@ -22,6 +22,12 @@ All notable changes to `do-next` are documented here.
 - Labels support for the new issue form
 - `inspect` command to make configuration easier
 - GitLab oauth sign-in: **Web** and **Device** for headless sessions.
+- `do-next auth` is now a menu of integrations
+
+### Renames
+
+- `jira` → `atlassian`. Atlassian site serves Jira, Confluence and boards
+  behind a single set of credentials.
 
 ### Fixes
 

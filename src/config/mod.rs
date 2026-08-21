@@ -8,9 +8,9 @@ use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
 use types::{
-    Config, ConfluenceConfig, GitlabConfig, GrafanaConfig, JiraConfig, ResolvedGitlab,
-    ResolvedGrafana, ResolvedTeam, SourceKind, TeamConfig, TeamGrafanaConfig, TeamJiraOverride,
-    TeamRef,
+    AtlassianConfig, AtlassianOverride, Config, GitlabConfig, GrafanaConfig, ResolvedGitlab,
+    ResolvedGrafana, ResolvedTeam, SourceKind, TeamAtlassianOverride, TeamConfig,
+    TeamGrafanaConfig, TeamRef,
 };
 
 /// Result of loading user config + all team configs.
@@ -48,9 +48,9 @@ pub fn load() -> Result<LoadedConfig> {
                 for w in warnings {
                     load_errors.push(format!("team '{}': {w}", team_ref.id));
                 }
-                let jira = resolve_team_jira(&config.jira, &team_config);
+                let atlassian = resolve_team_atlassian(&config.atlassian, &team_config);
                 let confluence = resolve_team_confluence(
-                    &jira,
+                    &atlassian,
                     config.confluence.as_ref(),
                     team_config.confluence.as_ref(),
                 );
@@ -77,7 +77,7 @@ pub fn load() -> Result<LoadedConfig> {
                     id: team_ref.id.clone(),
                     path: team_ref.path.clone(),
                     config: team_config,
-                    jira,
+                    atlassian,
                     confluence,
                     open_slack_in_app,
                     slack_team_id,
@@ -118,7 +118,7 @@ fn resolve_company(config: &mut Config, load_errors: &mut Vec<String>) -> Vec<Te
             return Vec::new();
         }
     };
-    config.jira = company::apply_company_defaults(&config.jira, &manifest);
+    config.atlassian = company::apply_company_defaults(&config.atlassian, &manifest);
     if config.confluence.is_none() {
         config.confluence.clone_from(&manifest.defaults.confluence);
     }
@@ -300,7 +300,23 @@ pub fn load_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
     json5::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("{}{}", e, alias_collision_hint(&e.to_string())))
         .with_context(|| format!("Failed to parse config file: {}", path.display()))
+}
+
+/// Extra explanation for a duplicate-field error caused by a renamed key.
+///
+/// `atlassian:` accepts `jira:` as a serde alias, so a file carrying both
+/// fails — but serde names only the canonical spelling, which may not even
+/// appear in the user's file. Say what the two keys have to do with each other.
+fn alias_collision_hint(message: &str) -> String {
+    if message.contains("duplicate field `atlassian`") {
+        "\n\nhint: `atlassian:` and `jira:` are the same key — `jira:` is the \
+         old spelling, still accepted. Keep one of them."
+            .to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// The backlog tab is a per-user choice: when the team ref opts out, its
@@ -1167,7 +1183,7 @@ mod tests {
 
     #[test]
     fn confluence_defaults_to_effective_jira() {
-        let jira = JiraConfig {
+        let jira = AtlassianConfig {
             base_url: "https://acme.atlassian.net".into(),
             email: Some("me@acme.com".into()),
             ..Default::default()
@@ -1224,9 +1240,9 @@ mod tests {
         assert_eq!(refs[0].id, "platform");
         assert!(refs[0].path.ends_with("teams/platform"));
         // Company values landed in the in-memory global config.
-        assert_eq!(config.jira.base_url, "https://acme.atlassian.net");
-        assert_eq!(config.jira.default_project, "CORE");
-        assert_eq!(config.jira.auth_method.as_deref(), Some("oauth"));
+        assert_eq!(config.atlassian.base_url, "https://acme.atlassian.net");
+        assert_eq!(config.atlassian.default_project, "CORE");
+        assert_eq!(config.atlassian.auth_method.as_deref(), Some("oauth"));
         assert_eq!(config.slack_team_id.as_deref(), Some("T0123"));
         // The synthesized ref resolves through the normal team loader.
         let (team, warnings) = load_team_config(&refs[0]).expect("team loads");
@@ -1244,7 +1260,7 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("company"));
         // No merge happened — user config untouched.
-        assert!(config.jira.base_url.is_empty());
+        assert!(config.atlassian.base_url.is_empty());
     }
 
     #[test]
@@ -1262,11 +1278,11 @@ mod tests {
     fn resolve_company_user_values_win() {
         let fixture = company_fixture();
         let mut config = config_with_company(&fixture, &[]);
-        config.jira.base_url = "https://mine.atlassian.net".into();
+        config.atlassian.base_url = "https://mine.atlassian.net".into();
         config.slack_team_id = Some("TMINE".into());
         let mut errors = Vec::new();
         resolve_company(&mut config, &mut errors);
-        assert_eq!(config.jira.base_url, "https://mine.atlassian.net");
+        assert_eq!(config.atlassian.base_url, "https://mine.atlassian.net");
         assert_eq!(config.slack_team_id.as_deref(), Some("TMINE"));
     }
 
@@ -1624,17 +1640,17 @@ mod tests {
 
     #[test]
     fn confluence_override_precedence_is_team_over_user_over_jira() {
-        let jira = JiraConfig {
+        let jira = AtlassianConfig {
             base_url: "https://acme.atlassian.net".into(),
             email: Some("me@acme.com".into()),
             ..Default::default()
         };
-        let user = ConfluenceConfig {
+        let user = AtlassianOverride {
             base_url: Some("https://wiki.acme.com".into()),
             credential_key: Some("user-key".into()),
             ..Default::default()
         };
-        let team = ConfluenceConfig {
+        let team = AtlassianOverride {
             credential_key: Some("team-key".into()),
             ..Default::default()
         };
@@ -1642,6 +1658,68 @@ mod tests {
         assert_eq!(conf.base_url, "https://wiki.acme.com");
         assert_eq!(conf.credential_key.as_deref(), Some("team-key"));
         assert_eq!(conf.email.as_deref(), Some("me@acme.com"));
+    }
+
+    // ── Atlassian rename: on-disk compatibility ──────────────────────────
+
+    #[test]
+    fn a_config_written_before_the_atlassian_rename_still_loads() {
+        // This is the regression that would lock every existing user out.
+        let cfg: types::Config = json5::from_str(
+            r#"{ jira: { base_url: "https://acme.atlassian.net", default_project: "PROJ" } }"#,
+        )
+        .expect("legacy `jira:` key parses");
+        assert_eq!(cfg.atlassian.base_url, "https://acme.atlassian.net");
+        assert_eq!(cfg.atlassian.default_project, "PROJ");
+    }
+
+    #[test]
+    fn the_new_atlassian_key_loads() {
+        let cfg: types::Config = json5::from_str(
+            r#"{ atlassian: { base_url: "https://acme.atlassian.net", default_project: "P" } }"#,
+        )
+        .expect("`atlassian:` key parses");
+        assert_eq!(cfg.atlassian.base_url, "https://acme.atlassian.net");
+    }
+
+    #[test]
+    fn a_config_carrying_both_keys_is_rejected_with_a_hint() {
+        // Failing loudly beats silently picking one: a file with both is a
+        // half-finished hand-migration, and guessing would hide it.
+        let err = json5::from_str::<types::Config>(
+            r#"{ atlassian: { base_url: "a", default_project: "P" },
+                 jira: { base_url: "b", default_project: "Q" } }"#,
+        )
+        .expect_err("both keys must not parse");
+        let message = err.to_string();
+        assert!(
+            message.contains("duplicate field"),
+            "expected a duplicate-field error, got: {message}"
+        );
+        // serde names only the canonical spelling, which may not appear in the
+        // user's file at all — hence the hint.
+        assert!(
+            alias_collision_hint(&message).contains("old spelling"),
+            "the hint must explain that `jira:` is the old spelling"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_parse_error_gets_no_alias_hint() {
+        assert!(alias_collision_hint("expected `,` or `}`").is_empty());
+    }
+
+    #[test]
+    fn a_team_config_written_before_the_rename_still_loads() {
+        let team: types::TeamConfig = json5::from_str(r#"{ jira: { default_project: "TEAM" } }"#)
+            .expect("legacy team `jira:` override parses");
+        assert_eq!(
+            team.atlassian
+                .expect("override present")
+                .default_project
+                .as_deref(),
+            Some("TEAM")
+        );
     }
 }
 
@@ -1980,12 +2058,12 @@ fn validate_confluence_filters(source_id: &str, filters: &types::ConfluenceFilte
 
 /// Merge the effective Confluence connection config: team confluence override
 /// → user confluence config → the team's effective Jira config. Expressed as
-/// a `JiraConfig` so `credentials::resolve_auth` applies unchanged.
+/// a `AtlassianConfig` so `credentials::resolve_atlassian_auth` applies unchanged.
 fn resolve_team_confluence(
-    effective_jira: &JiraConfig,
-    user: Option<&ConfluenceConfig>,
-    team: Option<&ConfluenceConfig>,
-) -> JiraConfig {
+    effective_jira: &AtlassianConfig,
+    user: Option<&AtlassianOverride>,
+    team: Option<&AtlassianOverride>,
+) -> AtlassianConfig {
     let mut conf = effective_jira.clone();
     for overlay in [user, team].into_iter().flatten() {
         apply_confluence_override(&mut conf, overlay);
@@ -1993,7 +2071,7 @@ fn resolve_team_confluence(
     conf
 }
 
-fn apply_confluence_override(base: &mut JiraConfig, overlay: &ConfluenceConfig) {
+fn apply_confluence_override(base: &mut AtlassianConfig, overlay: &AtlassianOverride) {
     if let Some(ref v) = overlay.base_url {
         base.base_url.clone_from(v);
     }
@@ -2012,6 +2090,13 @@ fn apply_confluence_override(base: &mut JiraConfig, overlay: &ConfluenceConfig) 
     }
     if overlay.auth_method.is_some() {
         base.auth_method.clone_from(&overlay.auth_method);
+    }
+    if overlay.oauth_client_id.is_some() {
+        base.oauth_client_id.clone_from(&overlay.oauth_client_id);
+    }
+    if overlay.oauth_client_secret.is_some() {
+        base.oauth_client_secret
+            .clone_from(&overlay.oauth_client_secret);
     }
 }
 
@@ -2068,18 +2153,18 @@ fn collect_team_warnings(team: &TeamConfig, dir: &Path) -> Vec<String> {
 }
 
 /// Merge team Jira override on top of user default.
-fn resolve_team_jira(default: &JiraConfig, team: &TeamConfig) -> JiraConfig {
-    let Some(ref overlay) = team.jira else {
+fn resolve_team_atlassian(default: &AtlassianConfig, team: &TeamConfig) -> AtlassianConfig {
+    let Some(ref overlay) = team.atlassian else {
         return default.clone();
     };
     let mut jira = default.clone();
-    apply_team_jira_override(&mut jira, overlay);
+    apply_team_atlassian_override(&mut jira, overlay);
     jira
 }
 
-/// Apply a partial team Jira override onto a full `JiraConfig`.
+/// Apply a partial team Jira override onto a full `AtlassianConfig`.
 /// Only `Some` fields override the base.
-pub fn apply_team_jira_override(base: &mut JiraConfig, overlay: &TeamJiraOverride) {
+pub fn apply_team_atlassian_override(base: &mut AtlassianConfig, overlay: &TeamAtlassianOverride) {
     if let Some(ref v) = overlay.base_url {
         base.base_url.clone_from(v);
     }
@@ -2115,8 +2200,8 @@ pub fn apply_team_jira_override(base: &mut JiraConfig, overlay: &TeamJiraOverrid
 /// these teams use (Confluence tasks, Agile boards).
 pub fn extra_scopes_for<'a>(
     teams: impl IntoIterator<Item = &'a TeamConfig>,
-) -> crate::jira::oauth::ExtraScopes {
-    let mut extra = crate::jira::oauth::ExtraScopes::default();
+) -> crate::atlassian::oauth::ExtraScopes {
+    let mut extra = crate::atlassian::oauth::ExtraScopes::default();
     for team in teams {
         // Duty sources count too: scopes are minted at `do-next auth` time,
         // but on-call status changes daily.

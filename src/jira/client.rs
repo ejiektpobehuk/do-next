@@ -6,7 +6,7 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::json;
 use tokio::sync::RwLock;
 
-use crate::jira::auth::Auth;
+use crate::atlassian::auth::Auth;
 use crate::jira::jql::escape_string as escape_jql_string;
 use crate::jira::types::{
     AgileIssuesResponse, AgilePage, Attachment, BoardConfiguration, ChangelogEntry, ChangelogPage,
@@ -47,11 +47,11 @@ impl JiraClient {
     }
 
     async fn maybe_refresh(&self) -> Result<()> {
-        crate::jira::auth::maybe_refresh(&self.auth).await
+        crate::atlassian::auth::maybe_refresh(&self.auth).await
     }
 
     async fn apply_auth(&self, req: RequestBuilder) -> RequestBuilder {
-        crate::jira::auth::apply(&self.auth, req).await
+        crate::atlassian::auth::apply(&self.auth, req).await
     }
 
     /// Fetch all issues matching a JQL query, paginating automatically.

@@ -23,7 +23,6 @@ pub async fn setup_grafana_token(
     target: &crate::grafana::TokenSetupTarget,
     raw: &mut Config,
 ) -> Result<SetupOutcome> {
-    let oncall_api_url = target.oncall_api_url.as_str();
     let teams = target.team_ids.join("', '");
     println!();
     println!("Team '{teams}' switches its sources while you are on call (Grafana OnCall).");
@@ -34,6 +33,16 @@ pub async fn setup_grafana_token(
         return Ok(SetupOutcome::Declined);
     }
 
+    configure_grafana_token(target, raw).await
+}
+
+/// The token flow with no "do you want to?" gate — see
+/// [`crate::tui::onboarding::gitlab::configure_gitlab_token`] for why.
+pub async fn configure_grafana_token(
+    target: &crate::grafana::TokenSetupTarget,
+    raw: &mut Config,
+) -> Result<SetupOutcome> {
+    let oncall_api_url = target.oncall_api_url.as_str();
     print_grafana_token_instructions(target);
     let storage = prompt_token_storage(None, None, "DO_NEXT_GRAFANA_TOKEN")?;
 

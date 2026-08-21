@@ -5,12 +5,16 @@ use serde::{Deserialize, Serialize};
 /// Top-level user config (personal settings + team references).
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Config {
+    /// The Atlassian site connection: Jira, Confluence and boards all
+    /// authenticate against it with one credential.
+    ///
+    /// `alias = "jira"` keeps configs written before the rename working.
+    #[serde(default, alias = "jira")]
+    pub atlassian: AtlassianConfig,
+    /// Confluence connection override. Anything unset falls back to the
+    /// effective Atlassian config (same site: one API token covers both).
     #[serde(default)]
-    pub jira: JiraConfig,
-    /// Confluence connection settings. Anything unset falls back to the
-    /// effective Jira config (same Atlassian site: one API token covers both).
-    #[serde(default)]
-    pub confluence: Option<ConfluenceConfig>,
+    pub confluence: Option<AtlassianOverride>,
     /// Grafana `OnCall` connection settings. Teams with a `grafana` block use
     /// these for anything they leave unset.
     #[serde(default)]
@@ -126,7 +130,7 @@ pub struct TeamRef {
 /// Partial Jira overrides for team configs. All fields optional — only set fields
 /// override the user's default Jira config.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct TeamJiraOverride {
+pub struct TeamAtlassianOverride {
     pub base_url: Option<String>,
     pub default_project: Option<String>,
     pub email: Option<String>,
@@ -141,9 +145,10 @@ pub struct TeamJiraOverride {
 /// Team-level config: shareable across team members via a git repo.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct TeamConfig {
-    /// Optional Jira overrides. If absent, inherits the user's default `jira`.
-    #[serde(default)]
-    pub jira: Option<TeamJiraOverride>,
+    /// Optional Atlassian overrides. If absent, inherits the user's default
+    /// `atlassian` block.
+    #[serde(default, alias = "jira")]
+    pub atlassian: Option<TeamAtlassianOverride>,
     /// Sources in priority order (position = priority, first = highest).
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
@@ -155,7 +160,7 @@ pub struct TeamConfig {
     /// fall back to the user's `confluence` config, then the effective Jira
     /// config.
     #[serde(default)]
-    pub confluence: Option<ConfluenceConfig>,
+    pub confluence: Option<AtlassianOverride>,
     /// Named custom views. Source `view_mode` references a key in this map.
     #[serde(default)]
     pub views: HashMap<String, CustomViewConfig>,
@@ -180,12 +185,14 @@ pub struct ResolvedTeam {
     pub id: String,
     pub path: String,
     pub config: TeamConfig,
-    /// Effective Jira config (team override merged on top of user default).
-    pub jira: JiraConfig,
-    /// Effective Confluence connection config (team confluence override →
-    /// user confluence → effective Jira). Expressed as a `JiraConfig` so the
-    /// same credential resolution applies.
-    pub confluence: JiraConfig,
+    /// Effective Atlassian connection (team override merged on top of the
+    /// user default).
+    pub atlassian: AtlassianConfig,
+    /// Effective Confluence connection (team confluence override → user
+    /// confluence → effective Atlassian). Also an `AtlassianConfig`, because
+    /// it is the same kind of connection and resolves the same way — usually
+    /// the very same site.
+    pub confluence: AtlassianConfig,
     /// Effective setting: open `*.slack.com` links in the Slack desktop app.
     pub open_slack_in_app: bool,
     /// Effective Slack workspace (team) ID for deep links.
@@ -208,18 +215,30 @@ pub struct ResolvedTeam {
 }
 
 impl ResolvedTeam {
-    /// True when any of the team's sources — normal or on-duty — fetches from
-    /// GitLab. Duty sources count: the `D` toggle can splice them in at
-    /// runtime, so the client and its token must exist up front.
-    pub fn uses_gitlab(&self) -> bool {
-        let duty = self
-            .grafana
-            .iter()
-            .flat_map(|grafana| &grafana.on_duty_sources);
+    /// Every source the team can fetch from: its normal set plus its on-duty
+    /// set. Duty sources always count — the `D` toggle can splice them in at
+    /// runtime, so whatever they need (a client, a token, an OAuth scope) has
+    /// to exist up front.
+    pub fn sources_and_duty(&self) -> impl Iterator<Item = &SourceConfig> {
         self.normal_sources
             .iter()
-            .chain(duty)
-            .any(|s| s.kind == SourceKind::Gitlab)
+            .chain(self.grafana.iter().flat_map(|g| g.on_duty_sources.iter()))
+    }
+
+    /// True when any of the team's sources — normal or on-duty — fetches from
+    /// GitLab.
+    pub fn uses_gitlab(&self) -> bool {
+        self.uses_kind(SourceKind::Gitlab)
+    }
+
+    /// True when any of the team's sources — normal or on-duty — reads
+    /// Confluence.
+    pub fn uses_confluence(&self) -> bool {
+        self.uses_kind(SourceKind::Confluence)
+    }
+
+    fn uses_kind(&self, kind: SourceKind) -> bool {
+        self.sources_and_duty().any(|s| s.kind == kind)
     }
 
     /// Switch `config.sources` between the normal and on-duty source sets.
@@ -263,7 +282,7 @@ fn combine_on_duty_sources(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub struct JiraConfig {
+pub struct AtlassianConfig {
     pub base_url: String,
     pub default_project: String,
     /// Jira account email used for API authentication.
@@ -691,13 +710,17 @@ impl StandupFilters {
 /// Partial Confluence connection overrides. All fields optional — anything
 /// unset falls back to the effective Jira config (same site, same token).
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct ConfluenceConfig {
+pub struct AtlassianOverride {
     pub base_url: Option<String>,
     pub email: Option<String>,
     pub credential_command: Option<String>,
     pub credential_store: Option<String>,
     pub credential_key: Option<String>,
     pub auth_method: Option<String>,
+    /// OAuth app for this site, when it is a different site than the primary
+    /// one and so needs its own. Unset means the primary's app.
+    pub oauth_client_id: Option<String>,
+    pub oauth_client_secret: Option<String>,
 }
 
 /// Whose merge requests a GitLab source lists.
@@ -1427,8 +1450,8 @@ mod tests {
                 sources: normal.clone(),
                 ..Default::default()
             },
-            jira: JiraConfig::default(),
-            confluence: JiraConfig::default(),
+            atlassian: AtlassianConfig::default(),
+            confluence: AtlassianConfig::default(),
             open_slack_in_app: true,
             slack_team_id: None,
             grafana,

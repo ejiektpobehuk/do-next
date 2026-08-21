@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use chrono::{Duration as ChronoDuration, Utc};
 
-use crate::jira::auth::OAuthStore;
+use crate::atlassian::auth::OAuthStore;
 use crate::oauth::{self, LoopbackServer, percent_encode};
 
 use super::auth::GitlabOAuthCredentials;

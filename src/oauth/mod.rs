@@ -2,7 +2,7 @@
 //! loopback callback listener, and the bridge that lets a synchronous flow
 //! make HTTP calls from inside a Tokio runtime.
 //!
-//! Both the Atlassian flow (`crate::jira::oauth`) and the GitLab flow
+//! Both the Atlassian flow (`crate::atlassian::oauth`) and the GitLab flow
 //! (`crate::gitlab::oauth`) build on this, so the security-sensitive parts —
 //! verifier generation, exact `state` comparison, single-shot listener — exist
 //! once and are tested once.

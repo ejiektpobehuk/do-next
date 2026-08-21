@@ -1,6 +1,7 @@
 mod company;
 pub mod gitlab;
 pub mod grafana;
+pub mod menu;
 
 pub use company::{run_company_join_command, run_company_teams_command};
 
@@ -12,9 +13,11 @@ use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use std::io;
 use std::io::Write;
 
+use crate::atlassian::auth::OAuthStore;
 use crate::config::LoadedConfig;
-use crate::config::types::{Config, JiraConfig, ResolvedTeam, TeamConfig, TeamRef};
-use crate::jira::auth::OAuthStore;
+use crate::config::types::{
+    AtlassianConfig, AtlassianOverride, Config, ResolvedTeam, TeamConfig, TeamRef,
+};
 
 // ── Step 1: auth method ─────────────────────────────────────────────────────
 
@@ -32,6 +35,20 @@ const AUTH_METHOD_DESCRIPTIONS: [&str; AUTH_METHOD_COUNT] = [
     "create a token at id.atlassian.com (recommended)",
     "requires an app registered by you at developer.atlassian.com",
 ];
+
+/// The user backed out of a prompt (Esc, `q`, Ctrl-C).
+///
+/// A typed error so a caller can tell "went back" from "went wrong" without
+/// matching on message text. The auth menu needs that distinction: a nested Esc
+/// means "return to the menu", not `error: Cancelled`.
+#[derive(Debug, thiserror::Error)]
+#[error("Cancelled")]
+pub struct Cancelled;
+
+/// True when `e` is a [`Cancelled`] — the user backed out rather than failed.
+pub fn is_cancelled(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Cancelled>().is_some()
+}
 
 /// Result of one interactive side-service token setup (Grafana `OnCall`,
 /// GitLab). Both flows share it so `main` can treat them alike.
@@ -170,7 +187,9 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
     println!();
     let storage = match auth_method {
         AuthMethod::OAuth => prompt_oauth_storage(None)?,
-        AuthMethod::PersonalToken => prompt_token_storage(None, None, "DO_NEXT_JIRA_API_TOKEN")?,
+        AuthMethod::PersonalToken => {
+            prompt_token_storage(None, None, "DO_NEXT_ATLASSIAN_API_TOKEN")?
+        }
     };
 
     // Step 3: email (only for personal token).
@@ -180,7 +199,7 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
         None
     };
 
-    let mut jira_config = JiraConfig {
+    let mut jira_config = AtlassianConfig {
         base_url: base_url.clone(),
         default_project: default_project.clone(),
         email,
@@ -200,11 +219,11 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
                 _ => OAuthStore::File,
             };
             // First run: no team sources exist yet, so no granular scopes.
-            crate::jira::oauth::run_oauth_flow(
+            crate::atlassian::oauth::run_oauth_flow(
                 &client_id,
                 &client_secret,
                 store,
-                crate::jira::oauth::ExtraScopes::default(),
+                crate::atlassian::oauth::ExtraScopes::default(),
             )?;
             jira_config.auth_method = Some("oauth".into());
             jira_config.oauth_client_id = Some(client_id);
@@ -230,7 +249,7 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
     };
 
     let config = Config {
-        jira: jira_config.clone(),
+        atlassian: jira_config.clone(),
         teams: vec![team_ref],
         ..Default::default()
     };
@@ -263,7 +282,7 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
         normal_sources: team_config.sources.clone(),
         config: team_config,
         confluence: jira_config.clone(),
-        jira: jira_config,
+        atlassian: jira_config,
         open_slack_in_app: true,
         slack_team_id: None,
         grafana: None,
@@ -288,101 +307,121 @@ pub fn run_onboarding() -> Result<LoadedConfig> {
 /// `raw` — the on-disk config — so manifest values are never baked into the
 /// user's file.
 #[allow(clippy::too_many_lines)]
+/// Reconfigure authentication for one Atlassian site.
+///
+/// `slot` decides which config block the result is written to: the user's
+/// primary `atlassian:` block, or their `confluence:` override when the row is
+/// a second site. Routing an override at the primary slot would rewrite the
+/// wrong connection, so the caller must be explicit.
+///
+/// Writes land in a scratch config first and are applied to the slot at the
+/// end. That keeps one copy of the write logic, and it means the keyring key is
+/// derived from the *effective* base URL — company users have an empty one on
+/// disk, which this used to work around by swapping the value in and out.
 pub fn run_auth_reset(
-    effective_jira: &JiraConfig,
+    effective: &AtlassianConfig,
     raw: &mut Config,
-    extra_scopes: crate::jira::oauth::ExtraScopes,
+    slot: &crate::auth::SlotRef,
+    extra_scopes: crate::atlassian::oauth::ExtraScopes,
 ) -> Result<()> {
-    if effective_jira.base_url.is_empty() {
+    if effective.base_url.is_empty() {
         return Err(anyhow::anyhow!(
             "No configuration found. Run do-next first to complete initial setup."
         ));
     }
+    if let crate::auth::SlotRef::Team(team) = slot {
+        return Err(anyhow::anyhow!(
+            "This site comes from team '{team}'\u{2019}s own config, which may live in a \
+             shared repository — do-next will not rewrite it.\n\
+             Set its credentials there, or through the environment."
+        ));
+    }
 
     println!(
-        "Reconfiguring Jira authentication for {}",
-        effective_jira.base_url
+        "Reconfiguring Atlassian authentication for {}",
+        effective.base_url
     );
     println!();
 
-    let current_auth = detect_auth_method(effective_jira);
+    let current_auth = detect_auth_method(effective);
     let auth_method = prompt_auth_method(Some(&current_auth))?;
 
     println!();
-    let status = probe_credential_status(effective_jira);
-    let current_storage = detect_storage_method(effective_jira);
+    let status = probe_credential_status(effective);
+    let current_storage = detect_storage_method(effective);
     let storage = match auth_method {
         AuthMethod::OAuth => prompt_oauth_storage(Some(&current_storage))?,
         AuthMethod::PersonalToken => prompt_token_storage(
             Some(&current_storage),
             Some(&status),
-            "DO_NEXT_JIRA_API_TOKEN",
+            "DO_NEXT_ATLASSIAN_API_TOKEN",
         )?,
     };
 
     // The company manifest supplies the OAuth app when the user hasn't set
     // one; those creds must not be copied into the user's file, or rotation
     // in the config repo would stop propagating.
-    let company_supplies_oauth = raw.company.is_some() && raw.jira.oauth_client_id.is_none();
-
-    // Clear existing auth fields; each branch sets only what it needs.
-    raw.jira.credential_command = None;
-    raw.jira.credential_store = None;
-    raw.jira.auth_method = None;
+    let company_supplies_oauth = raw.company.is_some() && raw.atlassian.oauth_client_id.is_none();
 
     let config_dir = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?
         .join("do-next");
 
+    // Scratch: the site's identity, none of its auth. Each branch fills in
+    // only what it needs, and anything left unset is cleared on the slot.
+    let mut draft = AtlassianConfig {
+        base_url: effective.base_url.clone(),
+        credential_key: effective.credential_key.clone(),
+        ..Default::default()
+    };
+
     match auth_method {
         AuthMethod::OAuth => {
-            let (client_id, client_secret) = resolve_oauth_client_credentials(effective_jira)?;
+            let (client_id, client_secret) = resolve_oauth_client_credentials(effective)?;
             let store = match storage {
                 StorageChoice::Keyring => OAuthStore::Keyring,
                 _ => OAuthStore::File,
             };
-            crate::jira::oauth::run_oauth_flow(&client_id, &client_secret, store, extra_scopes)?;
+            crate::atlassian::oauth::run_oauth_flow(
+                &client_id,
+                &client_secret,
+                store,
+                extra_scopes,
+            )?;
             let reused_company_app = company_supplies_oauth
-                && effective_jira.oauth_client_id.as_deref() == Some(client_id.as_str())
-                && effective_jira.oauth_client_secret.as_deref() == Some(client_secret.as_str());
+                && effective.oauth_client_id.as_deref() == Some(client_id.as_str())
+                && effective.oauth_client_secret.as_deref() == Some(client_secret.as_str());
             if !reused_company_app {
-                raw.jira.auth_method = Some("oauth".into());
-                raw.jira.oauth_client_id = Some(client_id);
-                raw.jira.oauth_client_secret = Some(client_secret);
+                draft.auth_method = Some("oauth".into());
+                draft.oauth_client_id = Some(client_id);
+                draft.oauth_client_secret = Some(client_secret);
             }
-            raw.jira.email = None;
             if matches!(storage, StorageChoice::Keyring) {
-                raw.jira.credential_store = Some("keyring".into());
+                draft.credential_store = Some("keyring".into());
             }
         }
         AuthMethod::PersonalToken => {
-            let current_email = effective_jira.email.as_deref().unwrap_or("");
+            let current_email = effective.email.as_deref().unwrap_or("");
             let email_prompt = if current_email.is_empty() {
-                "Jira account email: ".to_string()
+                "Atlassian account email: ".to_string()
             } else {
-                format!("Jira account email [{current_email}]: ")
+                format!("Atlassian account email [{current_email}]: ")
             };
-            let email = prompt(&email_prompt, Some(current_email))?;
-            raw.jira.email = Some(email);
+            draft.email = Some(prompt(&email_prompt, Some(current_email))?);
             println!();
 
-            // The keyring entry key defaults to the base URL; company users
-            // have an empty base_url on disk, so storage must use the
-            // effective one. Restore afterwards so it isn't persisted.
-            let disk_base_url = raw.jira.base_url.clone();
-            raw.jira.base_url.clone_from(&effective_jira.base_url);
-            let stored = apply_token_storage(&storage, &mut raw.jira, &config_dir);
-            raw.jira.base_url = disk_base_url;
-            stored?;
+            apply_token_storage(&storage, &mut draft, &config_dir)?;
 
             // A company manifest with an OAuth app implies `oauth` for users
             // without an explicit method — switching to a token needs an
             // explicit override.
             if raw.company.is_some() {
-                raw.jira.auth_method = Some("basic".into());
+                draft.auth_method = Some("basic".into());
             }
         }
     }
+
+    apply_auth_to_slot(raw, slot, &draft);
 
     // Write updated config back.
     let config_path = config_dir.join("config.json5");
@@ -395,6 +434,53 @@ pub fn run_auth_reset(
     println!("Config updated at {}", config_path.display());
 
     Ok(())
+}
+
+/// Copy the freshly chosen auth settings onto the config block `slot` names.
+///
+/// Fields the draft leaves unset are cleared, so switching from a token to
+/// OAuth (or the reverse) does not strand the previous method's settings. The
+/// OAuth app is the exception: it is only written when the draft carries one,
+/// because reusing a company manifest's app deliberately leaves it out.
+fn apply_auth_to_slot(raw: &mut Config, slot: &crate::auth::SlotRef, draft: &AtlassianConfig) {
+    match slot {
+        crate::auth::SlotRef::Primary => {
+            let target = &mut raw.atlassian;
+            target.email.clone_from(&draft.email);
+            target
+                .credential_command
+                .clone_from(&draft.credential_command);
+            target.credential_store.clone_from(&draft.credential_store);
+            target.auth_method.clone_from(&draft.auth_method);
+            if draft.oauth_client_id.is_some() {
+                target.oauth_client_id.clone_from(&draft.oauth_client_id);
+                target
+                    .oauth_client_secret
+                    .clone_from(&draft.oauth_client_secret);
+            }
+        }
+        crate::auth::SlotRef::Override => {
+            let target = raw
+                .confluence
+                .get_or_insert_with(AtlassianOverride::default);
+            // Pin the site: this block exists precisely to point elsewhere.
+            target.base_url = Some(draft.base_url.clone());
+            target.email.clone_from(&draft.email);
+            target
+                .credential_command
+                .clone_from(&draft.credential_command);
+            target.credential_store.clone_from(&draft.credential_store);
+            target.auth_method.clone_from(&draft.auth_method);
+            if draft.oauth_client_id.is_some() {
+                target.oauth_client_id.clone_from(&draft.oauth_client_id);
+                target
+                    .oauth_client_secret
+                    .clone_from(&draft.oauth_client_secret);
+            }
+        }
+        // Refused up front in `run_auth_reset`.
+        crate::auth::SlotRef::Team(_) => {}
+    }
 }
 
 // ── Team setup (no teams configured) ────────────────────────────────────────
@@ -446,7 +532,7 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
         let team_dir = config_dir.join("teams").join("personal");
         std::fs::create_dir_all(&team_dir)?;
 
-        let default_project = &config.jira.default_project;
+        let default_project = &config.atlassian.default_project;
         let team_config_path = team_dir.join("do-next.json5");
         let tc = if team_config_path.exists() {
             // Reuse existing team config
@@ -471,7 +557,7 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
             file: None,
             backlog: None,
         };
-        (tr, tc, config.jira.clone())
+        (tr, tc, config.atlassian.clone())
     } else {
         // Use existing path
         println!();
@@ -493,12 +579,12 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
         let raw = std::fs::read_to_string(&config_path)?;
         let tc: TeamConfig = json5::from_str(&raw)?;
 
-        let jira = if let Some(ref overlay) = tc.jira {
-            let mut j = config.jira.clone();
-            crate::config::apply_team_jira_override(&mut j, overlay);
+        let jira = if let Some(ref overlay) = tc.atlassian {
+            let mut j = config.atlassian.clone();
+            crate::config::apply_team_atlassian_override(&mut j, overlay);
             j
         } else {
-            config.jira.clone()
+            config.atlassian.clone()
         };
 
         let tr = TeamRef {
@@ -525,7 +611,7 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
         normal_sources: team_config.sources.clone(),
         config: team_config,
         confluence: team_jira.clone(),
-        jira: team_jira,
+        atlassian: team_jira,
         open_slack_in_app: true,
         slack_team_id: None,
         grafana: None,
@@ -545,15 +631,15 @@ pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
 
 pub(super) fn apply_token_storage(
     storage: &StorageChoice,
-    jira_config: &mut JiraConfig,
+    atlassian: &mut AtlassianConfig,
     config_dir: &std::path::Path,
 ) -> Result<()> {
     match storage {
         StorageChoice::Keyring => {
-            let key = jira_config
+            let key = atlassian
                 .credential_key
                 .as_deref()
-                .unwrap_or(&jira_config.base_url)
+                .unwrap_or(&atlassian.base_url)
                 .to_string();
             check_keyring_available(&key)?;
             let entry = keyring::Entry::new("do-next", &key)
@@ -585,7 +671,7 @@ pub(super) fn apply_token_storage(
                 println!("API token stored in system keyring.");
             }
 
-            jira_config.credential_store = Some("keyring".into());
+            atlassian.credential_store = Some("keyring".into());
         }
 
         StorageChoice::File => {
@@ -593,7 +679,18 @@ pub(super) fn apply_token_storage(
             let token = prompt_masked("API token: ")?;
 
             let creds_path = config_dir.join("credentials.json5");
-            let creds_content = format!("{{ jira: {{ api_token: \"{token}\" }} }}\n");
+            // Merge, never overwrite: the file also holds the GitLab and
+            // Grafana tokens, and writing it whole used to destroy them.
+            let existing = match std::fs::read_to_string(&creds_path) {
+                Ok(content) => Some(content),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            };
+            let creds_content = crate::config::credentials::merge_token_into_credentials(
+                existing.as_deref(),
+                crate::config::credentials::ATLASSIAN_CREDENTIALS_SECTION,
+                &token,
+            )?;
             std::fs::create_dir_all(config_dir)?;
             std::fs::write(&creds_path, &creds_content)?;
             #[cfg(unix)]
@@ -605,19 +702,19 @@ pub(super) fn apply_token_storage(
         }
 
         StorageChoice::Command => {
-            println!("Enter the shell command whose stdout is your Jira API token.");
-            println!("Examples:  pass show jira/do-next");
+            println!("Enter the shell command whose stdout is your Atlassian API token.");
+            println!("Examples:  pass show atlassian/do-next");
             println!("           op read 'op://Private/Jira/credential'");
             println!();
             let cmd = prompt("Credential command: ", None)?;
-            jira_config.credential_command = Some(cmd);
+            atlassian.credential_command = Some(cmd);
         }
 
         StorageChoice::Env => {
             println!();
             println!("Set the following environment variables before running do-next:");
-            println!("  DO_NEXT_JIRA_EMAIL=<your-email>");
-            println!("  DO_NEXT_JIRA_API_TOKEN=<your-api-token>");
+            println!("  DO_NEXT_ATLASSIAN_EMAIL=<your-email>");
+            println!("  DO_NEXT_ATLASSIAN_API_TOKEN=<your-api-token>");
             println!();
         }
     }
@@ -632,7 +729,7 @@ pub(super) fn apply_token_storage(
 /// 1. Environment variables (`DO_NEXT_OAUTH_CLIENT_ID` + `DO_NEXT_OAUTH_CLIENT_SECRET`)
 /// 2. Config fields (`jira.oauth_client_id` + `jira.oauth_client_secret`)
 /// 3. Interactive prompt with setup instructions
-fn resolve_oauth_client_credentials(jira: &JiraConfig) -> Result<(String, String)> {
+fn resolve_oauth_client_credentials(jira: &AtlassianConfig) -> Result<(String, String)> {
     // 1. Environment variables.
     if let (Ok(id), Ok(secret)) = (
         std::env::var("DO_NEXT_OAUTH_CLIENT_ID"),
@@ -689,7 +786,7 @@ fn print_oauth_app_instructions() {
 
 // ── Detection helpers ───────────────────────────────────────────────────────
 
-fn detect_auth_method(jira: &JiraConfig) -> AuthMethod {
+fn detect_auth_method(jira: &AtlassianConfig) -> AuthMethod {
     if jira.auth_method.as_deref() == Some("oauth") {
         AuthMethod::OAuth
     } else {
@@ -697,7 +794,7 @@ fn detect_auth_method(jira: &JiraConfig) -> AuthMethod {
     }
 }
 
-fn detect_storage_method(jira: &JiraConfig) -> StorageChoice {
+fn detect_storage_method(jira: &AtlassianConfig) -> StorageChoice {
     if jira.credential_command.is_some() {
         StorageChoice::Command
     } else if jira.credential_store.as_deref() == Some("keyring") {
@@ -707,11 +804,16 @@ fn detect_storage_method(jira: &JiraConfig) -> StorageChoice {
     }
 }
 
-fn probe_credential_status(jira: &JiraConfig) -> CredentialStatus {
-    let env_set = std::env::var("DO_NEXT_JIRA_API_TOKEN").is_ok();
+fn probe_credential_status(jira: &AtlassianConfig) -> CredentialStatus {
+    let env_set =
+        crate::config::credentials::pick_env_var(&crate::config::credentials::ATLASSIAN_TOKEN_VARS)
+            .is_some();
 
-    let file_exists =
-        dirs::config_dir().is_some_and(|d| d.join("do-next").join("credentials.json5").exists());
+    // Section-aware: a file holding only a gitlab token is not an Atlassian
+    // credential, though the old existence check reported it as one.
+    let file_exists = crate::config::credentials::stored_token_present(
+        crate::config::credentials::ATLASSIAN_CREDENTIALS_SECTION,
+    );
 
     let keyring_key = jira.credential_key.as_deref().unwrap_or(&jira.base_url);
     let keyring_found = keyring::Entry::new("do-next", keyring_key)
@@ -729,51 +831,215 @@ fn probe_credential_status(jira: &JiraConfig) -> CredentialStatus {
 // ── Generic selection UI ────────────────────────────────────────────────────
 
 /// Render a vertical selection list and return the chosen index.
-pub(super) fn run_selection(
-    title: &str,
-    labels: &[&str],
-    descriptions: &[&str],
-    tags: &[String],
-    default: usize,
-    current_idx: Option<usize>,
-) -> Result<usize> {
-    let count = labels.len();
+/// One row of a single-select list.
+///
+/// `sublabel` renders as an indented second line — used for the Atlassian
+/// product list, where the row's identity is the site and its detail is what
+/// that site serves. `selectable: false` is a dimmed row the cursor skips:
+/// separators, and headings that exist only to group.
+pub(super) struct SelectRow {
+    pub label: String,
+    pub description: String,
+    pub tag: String,
+    pub sublabel: Option<String>,
+    pub selectable: bool,
+}
+
+impl SelectRow {
+    /// A normal, choosable row.
+    pub fn new(
+        label: impl Into<String>,
+        description: impl Into<String>,
+        tag: impl Into<String>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            description: description.into(),
+            tag: tag.into(),
+            sublabel: None,
+            selectable: true,
+        }
+    }
+
+    /// An inert divider. The cursor jumps over it in both directions.
+    pub fn separator() -> Self {
+        Self {
+            label: "\u{2500}".repeat(8),
+            description: String::new(),
+            tag: String::new(),
+            sublabel: None,
+            selectable: false,
+        }
+    }
+
+    pub fn with_sublabel(mut self, sublabel: impl Into<String>) -> Self {
+        self.sublabel = Some(sublabel.into());
+        self
+    }
+}
+
+/// Lines the list occupies on screen — the distance the redraw moves back up.
+///
+/// Rows with a sublabel take two. Getting this wrong smears the menu on every
+/// keypress, which is why it is a separate, tested function.
+fn rendered_height(rows: &[SelectRow]) -> u16 {
+    let lines = rows.len() + rows.iter().filter(|r| r.sublabel.is_some()).count();
+    u16::try_from(lines).unwrap_or(u16::MAX)
+}
+
+/// Width of the label column: the widest label, in characters.
+///
+/// Counted in `char`s rather than bytes so a non-ASCII label still lines up.
+fn label_width(rows: &[SelectRow]) -> usize {
+    rows.iter()
+        .filter(|r| r.selectable)
+        .map(|r| r.label.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The next selectable row in direction `delta`, clamped at both ends.
+///
+/// Returns `from` when there is nowhere to go — including the degenerate case
+/// where no row is selectable, which must terminate rather than spin.
+fn next_selectable(rows: &[SelectRow], from: usize, delta: isize) -> usize {
+    let mut i = from;
+    loop {
+        let Some(next) = i.checked_add_signed(delta) else {
+            return from;
+        };
+        if next >= rows.len() {
+            return from;
+        }
+        if rows[next].selectable {
+            return next;
+        }
+        i = next;
+    }
+}
+
+/// The starting cursor: `wanted` if it is selectable, else the nearest
+/// selectable row after it, else before it.
+///
+/// Guards a stale cursor — the row set is rebuilt between menu passes and can
+/// shrink, leaving a remembered index past the end or sitting on a separator.
+fn normalize_default(rows: &[SelectRow], wanted: usize) -> usize {
+    if rows.get(wanted).is_some_and(|r| r.selectable) {
+        return wanted;
+    }
+    let clamped = wanted.min(rows.len().saturating_sub(1));
+    let forward = next_selectable(rows, clamped, 1);
+    if rows.get(forward).is_some_and(|r| r.selectable) {
+        return forward;
+    }
+    let back = next_selectable(rows, clamped, -1);
+    if rows.get(back).is_some_and(|r| r.selectable) {
+        return back;
+    }
+    0
+}
+
+fn render_rows(rows: &[SelectRow], selected: usize, confirmed: bool) -> Result<()> {
+    let width = label_width(rows);
+    for (i, row) in rows.iter().enumerate() {
+        let label = format!("{:<width$}", row.label, width = width);
+        let text = format!("{label}   {}{}", row.description, row.tag);
+        if !row.selectable {
+            crossterm::execute!(
+                io::stdout(),
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!("    {}\r\n", row.label)),
+                ResetColor,
+            )?;
+        } else if i == selected && confirmed {
+            crossterm::execute!(
+                io::stdout(),
+                SetForegroundColor(Color::Green),
+                Print("  \u{2713} "),
+                ResetColor,
+                Print(format!("{text}\r\n")),
+            )?;
+        } else if i == selected {
+            print!("  > {text}\r\n");
+        } else {
+            print!("    {text}\r\n");
+        }
+        if let Some(sublabel) = &row.sublabel {
+            // Indented under the label column so it reads as detail, not a row.
+            crossterm::execute!(
+                io::stdout(),
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!(
+                    "    {:<width$}   {sublabel}\r\n",
+                    "",
+                    width = width
+                )),
+                ResetColor,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Render a single-select list and return the chosen index.
+///
+/// `Ok(None)` means the user backed out (Esc, `q`, Ctrl-C) — a looping menu
+/// needs that as an answer rather than an error. Labels are padded here, so
+/// callers building rows at runtime never have to.
+pub(super) fn run_menu(title: &str, rows: &[SelectRow], default: usize) -> Result<Option<usize>> {
+    if !rows.iter().any(|r| r.selectable) {
+        return Ok(None);
+    }
 
     println!("{title}");
     println!();
-    render_options(labels, descriptions, tags, default, current_idx, false)?;
+    let mut selected = normalize_default(rows, default);
+    render_rows(rows, selected, false)?;
     io::stdout().flush()?;
 
     enable_raw_mode()?;
+    let lines = rendered_height(rows);
 
-    let mut selected = default;
-    #[allow(clippy::cast_possible_truncation)]
-    let lines = count as u16;
+    // Leaving raw mode on every exit path, including the error one, is what
+    // keeps a failure from handing back an unusable terminal.
+    let outcome = menu_loop(rows, &mut selected, lines);
+    disable_raw_mode()?;
+    println!();
 
+    match outcome? {
+        MenuExit::Chosen => {
+            // Repaint with the green check now that raw mode is off.
+            Ok(Some(selected))
+        }
+        MenuExit::Cancelled => Ok(None),
+    }
+}
+
+enum MenuExit {
+    Chosen,
+    Cancelled,
+}
+
+fn menu_loop(rows: &[SelectRow], selected: &mut usize, lines: u16) -> Result<MenuExit> {
     loop {
         match crossterm::event::read() {
             Ok(Event::Key(KeyEvent {
                 code, modifiers, ..
             })) => {
-                let nav = match code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        selected = selected.saturating_sub(1);
-                        true
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        selected = (selected + 1).min(count - 1);
-                        true
-                    }
-                    _ => false,
+                let delta = match code {
+                    KeyCode::Up | KeyCode::Char('k') => Some(-1),
+                    KeyCode::Down | KeyCode::Char('j') => Some(1),
+                    _ => None,
                 };
 
-                if nav {
+                if let Some(delta) = delta {
+                    *selected = next_selectable(rows, *selected, delta);
                     crossterm::execute!(
                         io::stdout(),
                         MoveUp(lines),
                         Clear(ClearType::FromCursorDown)
                     )?;
-                    render_options(labels, descriptions, tags, selected, current_idx, false)?;
+                    render_rows(rows, *selected, false)?;
                     io::stdout().flush()?;
                     continue;
                 }
@@ -785,33 +1051,55 @@ pub(super) fn run_selection(
                             MoveUp(lines),
                             Clear(ClearType::FromCursorDown)
                         )?;
-                        render_options(labels, descriptions, tags, selected, current_idx, true)?;
+                        render_rows(rows, *selected, true)?;
                         io::stdout().flush()?;
-                        disable_raw_mode()?;
-                        println!();
-                        return Ok(selected);
+                        return Ok(MenuExit::Chosen);
                     }
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        disable_raw_mode()?;
-                        println!();
-                        return Err(anyhow::anyhow!("Cancelled"));
-                    }
+                    KeyCode::Esc | KeyCode::Char('q') => return Ok(MenuExit::Cancelled),
                     KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        disable_raw_mode()?;
-                        println!();
-                        return Err(anyhow::anyhow!("Cancelled"));
+                        return Ok(MenuExit::Cancelled);
                     }
                     _ => {}
                 }
             }
             Ok(_) => {}
-            Err(e) => {
-                disable_raw_mode()?;
-                println!();
-                return Err(e.into());
-            }
+            Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// Single-select over borrowed parallel slices, for the fixed-size menus.
+///
+/// A thin adapter over [`run_menu`]: every row is selectable, the `← current`
+/// marker folds into the row's tag, and backing out stays an error because
+/// these callers are wizard steps with nowhere to go back to.
+pub(super) fn run_selection(
+    title: &str,
+    labels: &[&str],
+    descriptions: &[&str],
+    tags: &[String],
+    default: usize,
+    current_idx: Option<usize>,
+) -> Result<usize> {
+    let rows: Vec<SelectRow> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let tag = tags.get(i).map_or("", String::as_str);
+            let marker = if current_idx == Some(i) {
+                "  \u{2190} current"
+            } else {
+                ""
+            };
+            SelectRow::new(
+                (*label).to_string(),
+                descriptions.get(i).copied().unwrap_or("").to_string(),
+                format!("{tag}{marker}"),
+            )
+        })
+        .collect();
+
+    run_menu(title, &rows, default)?.ok_or_else(|| Cancelled.into())
 }
 
 /// One row of a multi-select list. `parent` links a dependent sub-row to an
@@ -922,12 +1210,12 @@ pub(super) fn run_multi_selection(
                 KeyCode::Esc | KeyCode::Char('q') => {
                     disable_raw_mode()?;
                     println!();
-                    return Err(anyhow::anyhow!("Cancelled"));
+                    return Err(Cancelled.into());
                 }
                 KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                     disable_raw_mode()?;
                     println!();
-                    return Err(anyhow::anyhow!("Cancelled"));
+                    return Err(Cancelled.into());
                 }
                 _ => {}
             },
@@ -1011,47 +1299,6 @@ fn render_multi_hint() -> Result<()> {
         ResetColor,
         Print(" cancel\r\n"),
     )?;
-    Ok(())
-}
-
-fn render_options(
-    labels: &[&str],
-    descriptions: &[&str],
-    tags: &[String],
-    selected: usize,
-    current_idx: Option<usize>,
-    confirmed: bool,
-) -> Result<()> {
-    for i in 0..labels.len() {
-        let marker = if current_idx == Some(i) {
-            "  \u{2190} current"
-        } else {
-            ""
-        };
-        let tag = tags.get(i).map_or("", String::as_str);
-        if i == selected && confirmed {
-            crossterm::execute!(
-                io::stdout(),
-                SetForegroundColor(Color::Green),
-                Print("  \u{2713} "),
-                ResetColor,
-                Print(format!(
-                    "{}   {}{}{}\r\n",
-                    labels[i], descriptions[i], tag, marker
-                )),
-            )?;
-        } else if i == selected {
-            print!(
-                "  > {}   {}{}{}\r\n",
-                labels[i], descriptions[i], tag, marker
-            );
-        } else {
-            print!(
-                "    {}   {}{}{}\r\n",
-                labels[i], descriptions[i], tag, marker
-            );
-        }
-    }
     Ok(())
 }
 
@@ -1209,7 +1456,7 @@ fn prompt_config_style() -> Result<ConfigStyle> {
                 if c == 'c' && modifiers.contains(KeyModifiers::CONTROL) {
                     disable_raw_mode()?;
                     println!();
-                    return Err(anyhow::anyhow!("Cancelled"));
+                    return Err(Cancelled.into());
                 }
                 match c {
                     '1' => {
@@ -1241,7 +1488,7 @@ fn prompt_config_style() -> Result<ConfigStyle> {
 fn template_user_config(
     base_url: &str,
     default_project: &str,
-    jira_config: &crate::config::types::JiraConfig,
+    jira_config: &crate::config::types::AtlassianConfig,
 ) -> String {
     let email = jira_config.email.as_deref().unwrap_or("you@example.com");
 
@@ -1270,7 +1517,7 @@ fn template_user_config(
     } else if jira_config.credential_store.as_deref() == Some("keyring") {
         "    // credential_key: \"jira.example.com\",  // optional label\n    // credential_command: \"pass show jira/do-next\",\n".to_string()
     } else {
-        "    // credential_store: \"keyring\",\n    // credential_command: \"pass show jira/do-next\",\n    // Env: DO_NEXT_JIRA_API_TOKEN=<your-api-token>\n".to_string()
+        "    // credential_store: \"keyring\",\n    // credential_command: \"pass show atlassian/do-next\",\n    // Env: DO_NEXT_ATLASSIAN_API_TOKEN=<your-api-token>\n".to_string()
     };
 
     let config_dir = dirs::config_dir()
@@ -1286,12 +1533,12 @@ fn template_user_config(
     email: "{email}",
 
     // Authentication — API token resolution (first found wins):
-    //   1. Env:              DO_NEXT_JIRA_API_TOKEN=<api-token>
+    //   1. Env:              DO_NEXT_ATLASSIAN_API_TOKEN=<api-token>
     //   2. External command: credential_command: "..."
     //   3. System keyring:   credential_store: "keyring"
     //   4. Credentials file: ~/.config/do-next/credentials.json5
     //   Or use OAuth:        auth_method: "oauth"
-    // Email override:        DO_NEXT_JIRA_EMAIL=<email>
+    // Email override:        DO_NEXT_ATLASSIAN_EMAIL=<email>
 {cred_line}{cred_comments}  }},
 
   // Teams — each team has its own sources, views, and display config.
@@ -1353,8 +1600,9 @@ fn template_team_config(default_project: &str) -> String {
 
 fn print_api_token_instructions() {
     println!();
-    println!("Jira API Token");
-    println!("  An API token lets do-next read and act on Jira issues on your behalf.");
+    println!("Atlassian API Token");
+    println!("  One token covers this Atlassian site: Jira issues, Confluence");
+    println!("  pages and boards alike.");
     println!("  To create one, go to:");
     println!("    https://id.atlassian.com/manage-profile/security/api-tokens");
     println!("  Click \"Create API token\", give it a label, and copy the value.");
@@ -1419,7 +1667,7 @@ pub(super) fn prompt_masked(message: &str) -> Result<String> {
             })) if modifiers.contains(KeyModifiers::CONTROL) => {
                 disable_raw_mode()?;
                 println!();
-                return Err(anyhow::anyhow!("Cancelled"));
+                return Err(Cancelled.into());
             }
             Ok(Event::Key(KeyEvent {
                 code: KeyCode::Char(c),
@@ -1461,6 +1709,107 @@ pub(super) fn prompt_masked(message: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{SelectRow, label_width, next_selectable, normalize_default, rendered_height};
+
+    fn rows(spec: &[bool]) -> Vec<SelectRow> {
+        spec.iter()
+            .map(|&selectable| {
+                if selectable {
+                    SelectRow::new("row", "desc", "")
+                } else {
+                    SelectRow::separator()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rendered_height_counts_sublabels_as_their_own_line() {
+        // This is the redraw's MoveUp distance: undercount and the menu smears.
+        let plain = rows(&[true, true, true]);
+        assert_eq!(rendered_height(&plain), 3);
+
+        let mut with_sub = rows(&[true, true, true]);
+        with_sub[0] = SelectRow::new("a", "", "").with_sublabel("Jira \u{b7} Confluence");
+        with_sub[2] = SelectRow::new("c", "", "").with_sublabel("Confluence");
+        assert_eq!(rendered_height(&with_sub), 5);
+
+        assert_eq!(rendered_height(&[]), 0);
+    }
+
+    #[test]
+    fn navigation_steps_over_separators() {
+        // rows: 0 pick, 1 sep, 2 sep, 3 pick
+        let r = rows(&[true, false, false, true]);
+        assert_eq!(next_selectable(&r, 0, 1), 3, "down skips both separators");
+        assert_eq!(next_selectable(&r, 3, -1), 0, "up skips them too");
+    }
+
+    #[test]
+    fn navigation_clamps_at_both_ends_without_wrapping() {
+        let r = rows(&[true, true]);
+        assert_eq!(next_selectable(&r, 0, -1), 0, "up at the top stays put");
+        assert_eq!(next_selectable(&r, 1, 1), 1, "down at the bottom stays put");
+    }
+
+    #[test]
+    fn navigation_terminates_when_the_tail_is_all_separators() {
+        // Walking off the end past a run of separators must return, not spin.
+        let r = rows(&[true, false, false]);
+        assert_eq!(next_selectable(&r, 0, 1), 0);
+    }
+
+    #[test]
+    fn navigation_terminates_when_nothing_is_selectable() {
+        let r = rows(&[false, false]);
+        assert_eq!(next_selectable(&r, 0, 1), 0);
+        assert_eq!(next_selectable(&r, 1, -1), 1);
+    }
+
+    #[test]
+    fn a_default_landing_on_a_separator_moves_to_a_real_row() {
+        let r = rows(&[true, false, true]);
+        assert_eq!(normalize_default(&r, 1), 2, "forward first");
+        assert_eq!(normalize_default(&r, 0), 0, "already selectable: unchanged");
+    }
+
+    #[test]
+    fn a_stale_default_past_the_end_falls_back_to_a_real_row() {
+        // The row set is rebuilt between menu passes and can shrink.
+        let r = rows(&[true, true]);
+        assert_eq!(normalize_default(&r, 99), 1);
+
+        // Trailing separator: nothing forward, so it walks back.
+        let r = rows(&[true, false]);
+        assert_eq!(normalize_default(&r, 1), 0);
+    }
+
+    #[test]
+    fn the_label_column_is_measured_in_characters_not_bytes() {
+        // A multi-byte label must not widen the column past what it displays.
+        let r = vec![
+            SelectRow::new("Grafana", "", ""),
+            SelectRow::new("Atlassián", "", ""),
+        ];
+        assert_eq!(label_width(&r), 9, "9 chars, though 10 bytes");
+    }
+
+    #[test]
+    fn separators_do_not_widen_the_label_column() {
+        let r = vec![SelectRow::new("Jira", "", ""), SelectRow::separator()];
+        assert_eq!(label_width(&r), 4);
+    }
+
+    #[test]
+    fn backing_out_of_a_prompt_is_a_typed_error_not_a_message_match() {
+        // The menu tells "went back" from "went wrong" by type; the rendered
+        // text stays what users have always seen.
+        let e: anyhow::Error = super::Cancelled.into();
+        assert!(super::is_cancelled(&e));
+        assert_eq!(e.to_string(), "Cancelled");
+        assert!(!super::is_cancelled(&anyhow::anyhow!("keyring locked")));
+    }
+
     use super::*;
 
     fn row(selectable: bool, parent: Option<usize>) -> MultiRow {

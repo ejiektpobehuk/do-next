@@ -7,8 +7,8 @@ use reqwest::Client;
 use serde_json::json;
 use tokio::sync::RwLock;
 
+use crate::atlassian::auth::{self, Auth};
 use crate::config::types::ConfluenceFilters;
-use crate::jira::auth::{self, Auth};
 
 use super::types::{
     ApiPageSummary, ApiPageVersion, ApiTask, PageMeta, PageSummariesPage, PageVersionsPage,

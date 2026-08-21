@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::atlassian::auth::OAuthStore;
 use crate::config::company as company_cfg;
 use crate::config::company::CompanyManifest;
 use crate::config::types::{
-    CompanyRef, CompanyTeamSelection, Config, JiraConfig, SourceKind, TeamConfig,
+    AtlassianConfig, CompanyRef, CompanyTeamSelection, Config, SourceKind, TeamConfig,
 };
 use crate::config::{LoadedConfig, extra_scopes_for};
-use crate::jira::auth::OAuthStore;
 
 use super::{
     MultiRow, StorageChoice, apply_token_storage, prompt, prompt_oauth_storage,
@@ -76,7 +76,7 @@ pub fn run_company_teams_command(raw: &mut Config) -> Result<()> {
     write_user_config(raw)?;
     println!("Active company teams: {}", describe_selections(&selections));
 
-    let effective = company_cfg::apply_company_defaults(&raw.jira, &manifest);
+    let effective = company_cfg::apply_company_defaults(&raw.atlassian, &manifest);
     let needs_more_scopes =
         (new_extra.confluence && !old_extra.confluence) || (new_extra.board && !old_extra.board);
     if needs_more_scopes && effective.auth_method.as_deref() == Some("oauth") {
@@ -94,7 +94,7 @@ pub(super) fn join_company_into(config: &mut Config, source: &str) -> Result<()>
     println!();
     println!(
         "Found company config: {} ({})",
-        manifest.name, manifest.jira.base_url
+        manifest.name, manifest.atlassian.base_url
     );
     println!();
 
@@ -138,7 +138,7 @@ fn load_selected_team_configs(
 /// backlog tab off (they would otherwise force the `board` scope for nothing).
 fn selection_scopes(
     picked: &[(CompanyTeamSelection, TeamConfig)],
-) -> crate::jira::oauth::ExtraScopes {
+) -> crate::atlassian::oauth::ExtraScopes {
     let effective: Vec<TeamConfig> = picked
         .iter()
         .map(|(selection, config)| {
@@ -306,13 +306,13 @@ fn pick_teams(
 /// token flow. Returns the credential fields to persist in the user config.
 fn run_company_auth(
     manifest: &CompanyManifest,
-    extra: crate::jira::oauth::ExtraScopes,
-) -> Result<JiraConfig> {
-    let mut jira = JiraConfig::default();
+    extra: crate::atlassian::oauth::ExtraScopes,
+) -> Result<AtlassianConfig> {
+    let mut jira = AtlassianConfig::default();
     if let Some(oauth) = &manifest.oauth {
         println!(
             "Authenticating with {} via {}'s shared OAuth app.",
-            manifest.jira.base_url, manifest.name
+            manifest.atlassian.base_url, manifest.name
         );
         println!();
         let storage = prompt_oauth_storage(None)?;
@@ -320,14 +320,19 @@ fn run_company_auth(
             StorageChoice::Keyring => OAuthStore::Keyring,
             _ => OAuthStore::File,
         };
-        crate::jira::oauth::run_oauth_flow(&oauth.client_id, &oauth.client_secret, store, extra)?;
+        crate::atlassian::oauth::run_oauth_flow(
+            &oauth.client_id,
+            &oauth.client_secret,
+            store,
+            extra,
+        )?;
         if matches!(storage, StorageChoice::Keyring) {
             jira.credential_store = Some("keyring".into());
         }
     } else {
         println!("The company manifest defines no OAuth app — using a personal API token.");
         println!();
-        let storage = prompt_token_storage(None, None, "DO_NEXT_JIRA_API_TOKEN")?;
+        let storage = prompt_token_storage(None, None, "DO_NEXT_ATLASSIAN_API_TOKEN")?;
         let email = prompt("Jira account email: ", None)?;
         let config_dir = dirs::config_dir()
             .context("Cannot determine config directory")?
@@ -336,7 +341,7 @@ fn run_company_auth(
         // The keyring entry key defaults to the base URL at resolution time;
         // storage must use the same base so the entry matches. The value is
         // not persisted — the manifest provides it at load time.
-        jira.base_url.clone_from(&manifest.jira.base_url);
+        jira.base_url.clone_from(&manifest.atlassian.base_url);
         apply_token_storage(&storage, &mut jira, &config_dir)?;
         jira.base_url = String::new();
         jira.email = Some(email);
@@ -347,15 +352,15 @@ fn run_company_auth(
 /// Land the join flow's credential choices in the user config. With a shared
 /// OAuth app the manifest implies `auth_method: "oauth"` at load time, so
 /// stale token-auth fields are cleared rather than copied over.
-fn apply_auth_fields(config: &mut Config, manifest: &CompanyManifest, auth: JiraConfig) {
-    config.jira.auth_method = None;
-    config.jira.credential_store = auth.credential_store;
+fn apply_auth_fields(config: &mut Config, manifest: &CompanyManifest, auth: AtlassianConfig) {
+    config.atlassian.auth_method = None;
+    config.atlassian.credential_store = auth.credential_store;
     if manifest.oauth.is_some() {
-        config.jira.credential_command = None;
-        config.jira.email = None;
+        config.atlassian.credential_command = None;
+        config.atlassian.email = None;
     } else {
-        config.jira.email = auth.email;
-        config.jira.credential_command = auth.credential_command;
+        config.atlassian.email = auth.email;
+        config.atlassian.credential_command = auth.credential_command;
     }
 }
 

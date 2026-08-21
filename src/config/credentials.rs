@@ -1,38 +1,81 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::process::Command;
 
-use crate::config::types::{JiraConfig, ResolvedGitlab, ResolvedGrafana};
+use crate::atlassian::auth::{Auth, BasicCredentials};
+use crate::atlassian::oauth;
+use crate::config::types::{AtlassianConfig, ResolvedGitlab, ResolvedGrafana};
 use crate::gitlab::auth::GitlabAuth;
-use crate::jira::auth::{Auth, BasicCredentials};
-use crate::jira::oauth;
 
-/// Resolve Jira authentication (basic auth or OAuth).
+/// Atlassian API-token variables, most preferred first. The `DO_NEXT_JIRA_*`
+/// spellings predate the Atlassian rename and are read forever: one Atlassian
+/// site serves Jira, Confluence and boards, so the credential was never
+/// Jira-specific, only its name was.
+pub const ATLASSIAN_TOKEN_VARS: [&str; 2] =
+    ["DO_NEXT_ATLASSIAN_API_TOKEN", "DO_NEXT_JIRA_API_TOKEN"];
+
+/// Atlassian account-email variables, most preferred first. See
+/// [`ATLASSIAN_TOKEN_VARS`] for why the legacy spelling stays.
+pub const ATLASSIAN_EMAIL_VARS: [&str; 2] = ["DO_NEXT_ATLASSIAN_EMAIL", "DO_NEXT_JIRA_EMAIL"];
+
+/// The section `credentials.json5` stores the Atlassian token under.
+///
+/// Deliberately still `jira`: renaming it would orphan the token in every
+/// existing file for no gain, since the key is internal and never displayed.
+/// Reads accept `atlassian` too, via the alias on [`CredentialsFile`].
+pub const ATLASSIAN_CREDENTIALS_SECTION: &str = "jira";
+
+/// The first variable that is set and non-empty, with the name it came from.
+///
+/// Returning the name is what lets a status display say *which* variable is in
+/// play rather than a bare "env". An empty value is skipped: `VAR=` is someone
+/// unsetting it awkwardly, not a credential — the same rule
+/// [`gitlab_auth_source`] applies to `DO_NEXT_GITLAB_TOKEN`.
+///
+/// The lookup is injected so tests never touch the process environment, which
+/// is `unsafe` to mutate and races across parallel test threads.
+pub fn pick_env<'a>(
+    names: &[&'a str],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<(&'a str, String)> {
+    names.iter().find_map(|name| {
+        lookup(name)
+            .filter(|value| !value.is_empty())
+            .map(|value| (*name, value))
+    })
+}
+
+/// [`pick_env`] against the real process environment.
+pub fn pick_env_var<'a>(names: &[&'a str]) -> Option<(&'a str, String)> {
+    pick_env(names, |name| std::env::var(name).ok())
+}
+
+/// Resolve Atlassian authentication (basic auth or OAuth).
 ///
 /// If `auth_method` is `"oauth"`, loads saved OAuth tokens.
 /// Otherwise falls back to basic auth (email + API token).
 ///
-/// Email precedence: `DO_NEXT_JIRA_EMAIL` env → `config.jira.email`.
+/// Email precedence: [`ATLASSIAN_EMAIL_VARS`] → `config.atlassian.email`.
 ///
 /// API token precedence:
-/// 1. `DO_NEXT_JIRA_API_TOKEN` env
+/// 1. [`ATLASSIAN_TOKEN_VARS`] env
 /// 2. `credential_command` (shell exec, stdout = API token)
 /// 3. OS keyring
 /// 4. credentials file (`~/.config/do-next/credentials.json5`)
-pub fn resolve_auth(jira: &JiraConfig) -> Result<Auth> {
+pub fn resolve_atlassian_auth(jira: &AtlassianConfig) -> Result<Auth> {
     if jira.auth_method.as_deref() == Some("oauth") {
-        return resolve_oauth(jira);
+        return resolve_atlassian_oauth(jira);
     }
-    resolve_basic(jira)
+    resolve_atlassian_basic(jira)
 }
 
 /// Resolve Confluence authentication from the effective Confluence connection
-/// config (a `JiraConfig`-shaped value). Same resolution as [`resolve_auth`],
+/// config (a `AtlassianConfig`-shaped value). Same resolution as [`resolve_atlassian_auth`],
 /// except `DO_NEXT_CONFLUENCE_API_TOKEN` takes precedence over everything.
-pub fn resolve_confluence_auth(conf: &JiraConfig) -> Result<Auth> {
+pub fn resolve_confluence_auth(conf: &AtlassianConfig) -> Result<Auth> {
     if conf.auth_method.as_deref() == Some("oauth") {
-        return resolve_oauth(conf);
+        return resolve_atlassian_oauth(conf);
     }
-    let email = resolve_email(conf)?;
+    let email = resolve_atlassian_email(conf)?;
     if let Ok(token) = std::env::var("DO_NEXT_CONFLUENCE_API_TOKEN") {
         log::debug!("credentials: using DO_NEXT_CONFLUENCE_API_TOKEN env var");
         return Ok(Auth::Basic(BasicCredentials {
@@ -40,11 +83,11 @@ pub fn resolve_confluence_auth(conf: &JiraConfig) -> Result<Auth> {
             api_token: token,
         }));
     }
-    let api_token = resolve_api_token(conf)?;
+    let api_token = resolve_atlassian_api_token(conf)?;
     Ok(Auth::Basic(BasicCredentials { email, api_token }))
 }
 
-fn resolve_oauth(jira: &JiraConfig) -> Result<Auth> {
+fn resolve_atlassian_oauth(jira: &AtlassianConfig) -> Result<Auth> {
     match oauth::load_oauth_tokens()? {
         Some(mut creds) => {
             // Stored tokens embed the client id/secret they were minted with.
@@ -64,15 +107,15 @@ fn resolve_oauth(jira: &JiraConfig) -> Result<Auth> {
     }
 }
 
-fn resolve_basic(jira: &JiraConfig) -> Result<Auth> {
-    let email = resolve_email(jira)?;
-    let api_token = resolve_api_token(jira)?;
+fn resolve_atlassian_basic(jira: &AtlassianConfig) -> Result<Auth> {
+    let email = resolve_atlassian_email(jira)?;
+    let api_token = resolve_atlassian_api_token(jira)?;
     Ok(Auth::Basic(BasicCredentials { email, api_token }))
 }
 
-fn resolve_email(jira: &JiraConfig) -> Result<String> {
-    if let Ok(email) = std::env::var("DO_NEXT_JIRA_EMAIL") {
-        log::debug!("credentials: using DO_NEXT_JIRA_EMAIL env var");
+fn resolve_atlassian_email(jira: &AtlassianConfig) -> Result<String> {
+    if let Some((name, email)) = pick_env_var(&ATLASSIAN_EMAIL_VARS) {
+        log::debug!("credentials: using {name} env var");
         return Ok(email);
     }
     if let Some(email) = &jira.email {
@@ -81,15 +124,15 @@ fn resolve_email(jira: &JiraConfig) -> Result<String> {
     }
     bail!(
         "No Jira email configured.\n\
-         Set DO_NEXT_JIRA_EMAIL env var or add `email` to your Jira config.\n\
+         Set DO_NEXT_ATLASSIAN_EMAIL env var or add `email` to your atlassian config.\n\
          Run `do-next auth` to reconfigure."
     )
 }
 
-fn resolve_api_token(jira: &JiraConfig) -> Result<String> {
+fn resolve_atlassian_api_token(jira: &AtlassianConfig) -> Result<String> {
     // 1. Environment variable
-    if let Ok(token) = std::env::var("DO_NEXT_JIRA_API_TOKEN") {
-        log::debug!("credentials: using DO_NEXT_JIRA_API_TOKEN env var");
+    if let Some((name, token)) = pick_env_var(&ATLASSIAN_TOKEN_VARS) {
+        log::debug!("credentials: using {name} env var");
         return Ok(token);
     }
 
@@ -102,7 +145,7 @@ fn resolve_api_token(jira: &JiraConfig) -> Result<String> {
     if jira.credential_store.as_deref() == Some("keyring") {
         let key = jira.credential_key.as_deref().unwrap_or(&jira.base_url);
         let hints = KeyringHints {
-            env_var: "DO_NEXT_JIRA_API_TOKEN",
+            env_var: "DO_NEXT_ATLASSIAN_API_TOKEN",
             refresh: "Re-run `do-next auth` to store a fresh API token",
         };
         if let Some(secret) = keyring_lookup(key, &hints)? {
@@ -113,7 +156,7 @@ fn resolve_api_token(jira: &JiraConfig) -> Result<String> {
     // 4. Credentials file
     log::debug!("credentials: checking credentials file");
     if let Some(token) = read_credentials_file()?
-        .and_then(|f| f.jira)
+        .and_then(|f| f.atlassian)
         .and_then(|j| j.api_token)
     {
         log::debug!("credentials: loaded from credentials file");
@@ -122,7 +165,7 @@ fn resolve_api_token(jira: &JiraConfig) -> Result<String> {
 
     bail!(
         "No Jira API token found.\n\
-         Set DO_NEXT_JIRA_API_TOKEN env var or run `do-next auth` to configure credentials."
+         Set DO_NEXT_ATLASSIAN_API_TOKEN env var or run `do-next auth` to configure credentials."
     )
 }
 
@@ -260,7 +303,7 @@ fn gitlab_auth_source(env_token: Option<String>, uses_oauth: bool) -> GitlabAuth
 ///
 /// The config's client id/secret override whatever the stored tokens were
 /// minted with, so a rotated company app heals token refresh without a manual
-/// re-auth — the same trick [`resolve_oauth`] plays for Jira.
+/// re-auth — the same trick [`resolve_atlassian_oauth`] plays for Jira.
 fn resolve_gitlab_oauth(gitlab: &ResolvedGitlab) -> Result<Option<GitlabAuth>> {
     // No stored tokens is "not set up yet", not a failure: the caller offers
     // an interactive sign-in, exactly as it does for a missing token.
@@ -407,7 +450,10 @@ fn keyring_failure(key: &str, hints: &KeyringHints, err: &keyring::Error) -> any
 
 #[derive(serde::Deserialize)]
 struct CredentialsFile {
-    jira: Option<CredentialsFileToken>,
+    /// Aliased so files written before the rename keep resolving. Writes still
+    /// target the `jira` section — see `ATLASSIAN_CREDENTIALS_SECTION`.
+    #[serde(alias = "jira")]
+    atlassian: Option<CredentialsFileToken>,
     grafana: Option<CredentialsFileToken>,
     gitlab: Option<CredentialsFileToken>,
 }
@@ -415,6 +461,28 @@ struct CredentialsFile {
 #[derive(serde::Deserialize)]
 struct CredentialsFileToken {
     api_token: Option<String>,
+}
+
+/// True when the credentials file actually holds a token for `section`.
+///
+/// Distinct from "the file exists": a file holding only a `gitlab` token is not
+/// an Atlassian credential. Any read or parse failure reads as "no token" —
+/// this backs a status display, not a credential path, so it must never fail
+/// the caller.
+#[must_use]
+pub fn stored_token_present(section: &str) -> bool {
+    let Ok(Some(file)) = read_credentials_file() else {
+        return false;
+    };
+    let token = match section {
+        ATLASSIAN_CREDENTIALS_SECTION | "atlassian" => file.atlassian,
+        "gitlab" => file.gitlab,
+        "grafana" => file.grafana,
+        _ => None,
+    };
+    token
+        .and_then(|t| t.api_token)
+        .is_some_and(|t| !t.is_empty())
 }
 
 fn read_credentials_file() -> Result<Option<CredentialsFile>> {
@@ -434,6 +502,92 @@ fn read_credentials_file() -> Result<Option<CredentialsFile>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_new_env_var_wins_and_the_legacy_one_still_works() {
+        // The rename must not strip anyone of a working configuration.
+        let both = |n: &str| match n {
+            "DO_NEXT_ATLASSIAN_API_TOKEN" => Some("new".to_string()),
+            "DO_NEXT_JIRA_API_TOKEN" => Some("old".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            pick_env(&ATLASSIAN_TOKEN_VARS, both),
+            Some(("DO_NEXT_ATLASSIAN_API_TOKEN", "new".to_string()))
+        );
+
+        let legacy_only = |n: &str| (n == "DO_NEXT_JIRA_API_TOKEN").then(|| "old".to_string());
+        assert_eq!(
+            pick_env(&ATLASSIAN_TOKEN_VARS, legacy_only),
+            Some(("DO_NEXT_JIRA_API_TOKEN", "old".to_string())),
+            "a config predating the rename must keep resolving"
+        );
+
+        assert_eq!(pick_env(&ATLASSIAN_TOKEN_VARS, |_| None), None);
+    }
+
+    #[test]
+    fn an_empty_env_var_is_not_a_credential() {
+        // `DO_NEXT_ATLASSIAN_API_TOKEN=` is someone unsetting it awkwardly, and
+        // must not shadow the legacy variable that does hold a token.
+        let lookup = |n: &str| match n {
+            "DO_NEXT_ATLASSIAN_API_TOKEN" => Some(String::new()),
+            "DO_NEXT_JIRA_API_TOKEN" => Some("real".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            pick_env(&ATLASSIAN_TOKEN_VARS, lookup),
+            Some(("DO_NEXT_JIRA_API_TOKEN", "real".to_string()))
+        );
+        assert_eq!(
+            pick_env(&ATLASSIAN_TOKEN_VARS, |_| Some(String::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_env_reports_which_variable_it_used() {
+        // The status display names the variable, so the name must come back
+        // rather than just the value.
+        let (name, _) = pick_env(&ATLASSIAN_EMAIL_VARS, |n| {
+            (n == "DO_NEXT_JIRA_EMAIL").then(|| "me@example.com".to_string())
+        })
+        .expect("legacy email var resolves");
+        assert_eq!(name, "DO_NEXT_JIRA_EMAIL");
+    }
+
+    #[test]
+    fn a_credentials_file_written_before_the_rename_still_resolves() {
+        // The `jira` section is what every existing file on disk uses; reads
+        // must accept it under the new field name.
+        let file: CredentialsFile =
+            json5::from_str(r#"{ jira: { api_token: "legacy" } }"#).expect("legacy file parses");
+        assert_eq!(
+            file.atlassian.and_then(|a| a.api_token).as_deref(),
+            Some("legacy")
+        );
+
+        let file: CredentialsFile =
+            json5::from_str(r#"{ atlassian: { api_token: "new" } }"#).expect("new file parses");
+        assert_eq!(
+            file.atlassian.and_then(|a| a.api_token).as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn the_atlassian_token_still_writes_to_the_jira_section() {
+        // Renaming the section would orphan the token in every existing file,
+        // so writes deliberately keep the old key.
+        assert_eq!(ATLASSIAN_CREDENTIALS_SECTION, "jira");
+        let merged = merge_token_into_credentials(None, ATLASSIAN_CREDENTIALS_SECTION, "t0k3n")
+            .expect("merges");
+        let file: CredentialsFile = json5::from_str(&merged).expect("output parses");
+        assert_eq!(
+            file.atlassian.and_then(|a| a.api_token).as_deref(),
+            Some("t0k3n")
+        );
+    }
 
     #[test]
     fn an_env_token_wins_over_an_oauth_config() {
@@ -474,6 +628,27 @@ mod tests {
     }
 
     #[test]
+    fn a_section_with_no_token_is_not_a_credential() {
+        // `stored_token_present` replaced a check that only asked whether the
+        // file existed, which reported a gitlab-only file as an Atlassian one.
+        // Verify the section routing here; the filesystem read is exercised by
+        // the integration checks.
+        let file: CredentialsFile =
+            json5::from_str(r#"{ gitlab: { api_token: "glt" } }"#).expect("parses");
+        assert!(
+            file.atlassian.is_none(),
+            "a gitlab-only file has no atlassian token"
+        );
+        assert!(file.gitlab.is_some());
+
+        let file: CredentialsFile = json5::from_str(r#"{ jira: {} }"#).expect("parses");
+        assert!(
+            file.atlassian.expect("section present").api_token.is_none(),
+            "a section without api_token holds no credential"
+        );
+    }
+
+    #[test]
     fn credentials_file_parses_every_token_section() {
         let file: CredentialsFile = json5::from_str(
             r#"{
@@ -483,7 +658,10 @@ mod tests {
             }"#,
         )
         .expect("valid credentials file");
-        assert_eq!(file.jira.and_then(|j| j.api_token).as_deref(), Some("jt"));
+        assert_eq!(
+            file.atlassian.and_then(|j| j.api_token).as_deref(),
+            Some("jt")
+        );
         assert_eq!(
             file.grafana.and_then(|g| g.api_token).as_deref(),
             Some("gt")
@@ -495,7 +673,7 @@ mod tests {
 
         // Every section is optional.
         let file: CredentialsFile = json5::from_str("{}").expect("empty file is valid");
-        assert!(file.jira.is_none());
+        assert!(file.atlassian.is_none());
         assert!(file.grafana.is_none());
         assert!(file.gitlab.is_none());
     }
@@ -511,7 +689,10 @@ mod tests {
         let merged =
             merge_token_into_credentials(Some(existing), "grafana", "new-token").expect("merges");
         let file: CredentialsFile = json5::from_str(&merged).expect("output parses");
-        assert_eq!(file.jira.and_then(|j| j.api_token).as_deref(), Some("jt"));
+        assert_eq!(
+            file.atlassian.and_then(|j| j.api_token).as_deref(),
+            Some("jt")
+        );
         assert_eq!(
             file.grafana.and_then(|g| g.api_token).as_deref(),
             Some("new-token")
@@ -543,7 +724,7 @@ mod tests {
             let root: serde_json::Value = json5::from_str(&merged).expect("output parses");
             assert_eq!(root[section]["api_token"], "t0k3n");
             let file: CredentialsFile = json5::from_str(&merged).expect("output parses");
-            assert!(file.jira.is_none());
+            assert!(file.atlassian.is_none());
         }
     }
 

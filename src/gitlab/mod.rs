@@ -41,6 +41,7 @@ pub async fn validate_auth(base_url: &str, auth: GitlabAuth) -> Result<ApiUser> 
 /// The OAuth fields are the *effective* ones — team override merged over the
 /// user config and the company manifest — so a shared application id reaches
 /// the setup flow without the user retyping it.
+#[derive(Debug, Clone)]
 pub struct TokenSetupTarget {
     pub base_url: String,
     pub team_ids: Vec<String>,
@@ -88,7 +89,9 @@ pub fn teams_missing_token(teams: &[ResolvedTeam]) -> Vec<TokenSetupTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::{JiraConfig, ResolvedGitlab, SourceConfig, SourceKind, TeamConfig};
+    use crate::config::types::{
+        AtlassianConfig, ResolvedGitlab, SourceConfig, SourceKind, TeamConfig,
+    };
 
     fn team(id: &str, base_url: &str, kinds: &[SourceKind]) -> ResolvedTeam {
         let sources: Vec<SourceConfig> = kinds
@@ -107,8 +110,8 @@ mod tests {
                 sources: sources.clone(),
                 ..Default::default()
             },
-            jira: JiraConfig::default(),
-            confluence: JiraConfig::default(),
+            atlassian: AtlassianConfig::default(),
+            confluence: AtlassianConfig::default(),
             open_slack_in_app: true,
             slack_team_id: None,
             grafana: None,

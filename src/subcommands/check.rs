@@ -65,20 +65,20 @@ fn report_offline(loaded: &config::LoadedConfig) -> usize {
         println!();
         println!("team '{}' — {}", team.id, team.path);
         println!(
-            "  jira:       {} (project {}, auth {})",
-            or_unset(&team.jira.base_url),
-            or_unset(&team.jira.default_project),
-            team.jira.auth_method.as_deref().unwrap_or("basic"),
+            "  atlassian:  {} (project {}, auth {})",
+            or_unset(&team.atlassian.base_url),
+            or_unset(&team.atlassian.default_project),
+            team.atlassian.auth_method.as_deref().unwrap_or("basic"),
         );
         // Duty sources count as well: the on-call view can be toggled on at
         // runtime, so its Confluence connection has to hold up too.
-        if sources_and_duty(team).any(|s| s.kind == SourceKind::Confluence) {
-            let shared = team.confluence == team.jira;
+        if team.uses_confluence() {
+            let shared = team.confluence == team.atlassian;
             println!(
                 "  confluence: {}{}",
                 or_unset(&team.confluence.base_url),
                 if shared {
-                    " (shares the Jira auth)"
+                    " (shares the Atlassian auth)"
                 } else {
                     ""
                 }
@@ -335,14 +335,6 @@ fn team_problems(team: &ResolvedTeam) -> Vec<String> {
     problems
 }
 
-/// A team's normal sources followed by its on-duty ones — the full set any
-/// "does this team use X?" question has to look at.
-fn sources_and_duty(team: &ResolvedTeam) -> impl Iterator<Item = &SourceConfig> {
-    team.normal_sources
-        .iter()
-        .chain(team.grafana.iter().flat_map(|g| g.on_duty_sources.iter()))
-}
-
 const fn or_unset(value: &str) -> &str {
     if value.is_empty() { "<unset>" } else { value }
 }
@@ -362,16 +354,16 @@ async fn report_online(loaded: &config::LoadedConfig) -> usize {
     for team in &loaded.teams {
         println!("  team '{}'", team.id);
 
-        let url = team.jira.base_url.clone();
+        let url = team.atlassian.base_url.clone();
         if !clients.contains_key(&url) {
-            match config::credentials::resolve_auth(&team.jira)
+            match config::credentials::resolve_atlassian_auth(&team.atlassian)
                 .and_then(|auth| JiraClient::new(url.clone(), auth))
             {
                 Ok(client) => {
                     clients.insert(url.clone(), client);
                 }
                 Err(e) => {
-                    println!("    ! Jira auth unavailable: {e:#}");
+                    println!("    ! Atlassian auth unavailable: {e:#}");
                     failures += 1;
                     continue;
                 }

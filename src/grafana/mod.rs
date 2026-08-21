@@ -26,6 +26,7 @@ pub async fn validate_token(oncall_api_url: &str, token: String) -> Result<OnCal
 
 /// One token-setup target: the teams behind a single `OnCall` API URL (one
 /// token covers every team on the same stack).
+#[derive(Debug, Clone)]
 pub struct TokenSetupTarget {
     pub oncall_api_url: String,
     /// Grafana web UI URL for "create your token here" guidance, when any

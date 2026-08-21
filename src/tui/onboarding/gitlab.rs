@@ -9,12 +9,12 @@
 
 use anyhow::{Context, Result};
 
+use crate::atlassian::auth::OAuthStore;
 use crate::config::credentials::{
     credentials_file_path, merge_token_into_credentials, run_credential_command,
 };
 use crate::config::types::{Config, GitlabConfig};
 use crate::gitlab::oauth::{PREFERRED_PORT, REGISTERED_REDIRECT_URI, SCOPES};
-use crate::jira::auth::OAuthStore;
 
 use super::{
     SetupOutcome, StorageChoice, check_keyring_available, prompt, prompt_masked,
@@ -78,6 +78,18 @@ pub async fn setup_gitlab_token(
         return Ok(SetupOutcome::Declined);
     }
 
+    configure_gitlab_token(target, raw).await
+}
+
+/// The sign-in flow with no "do you want to?" gate.
+///
+/// The gate above belongs to the startup offer, where the user asked to launch
+/// the app rather than to configure anything. Choosing a row in `do-next auth`
+/// *is* the consent, so asking again is noise.
+pub async fn configure_gitlab_token(
+    target: &crate::gitlab::TokenSetupTarget,
+    raw: &mut Config,
+) -> Result<SetupOutcome> {
     match prompt_login_type()? {
         LoginType::Web => setup_oauth(target, raw, false),
         LoginType::Device => setup_oauth(target, raw, true),

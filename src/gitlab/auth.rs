@@ -1,7 +1,7 @@
 //! GitLab authentication: a personal access token or OAuth credentials, behind
 //! one handle the client can refresh through.
 //!
-//! Mirrors [`crate::jira::auth`]. The header differs per mode and cannot be
+//! Mirrors [`crate::atlassian::auth`]. The header differs per mode and cannot be
 //! unified: GitLab's `PRIVATE-TOKEN` looks tokens up in the personal-access
 //! token table, so it rejects an OAuth token outright.
 
@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use reqwest::RequestBuilder;
 use tokio::sync::RwLock;
 
-use crate::jira::auth::OAuthStore;
+use crate::atlassian::auth::OAuthStore;
 
 /// Refresh once the access token is this close to expiring.
 const REFRESH_SKEW: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
