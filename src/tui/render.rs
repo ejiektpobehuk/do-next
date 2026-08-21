@@ -322,11 +322,13 @@ fn render_title(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
     f.render_widget(block, area);
 }
 
-fn render_tab_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
+pub fn render_tab_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
     use crate::tui::app::source_config_for;
 
     let tabs = app.tab_list();
     let active = app.active_tab_index();
+    let frame =
+        usize::try_from(app.tick_count).unwrap_or(0) % crate::tui::list::SPINNER_FRAMES.len();
     let mut spans = Vec::new();
     for (i, (team_idx, board)) in tabs.iter().enumerate() {
         if i > 0 {
@@ -335,24 +337,36 @@ fn render_tab_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
         let team = &app.resolved_teams[*team_idx];
         // Board/backlog tabs are labelled by the source's display name and
         // prefixed to read as a distinct kind of tab (▤ board, ≡ backlog).
-        let label = board.as_ref().map_or_else(
+        let (idle_marker, text) = board.as_ref().map_or_else(
             || {
-                if team.on_duty {
-                    format!(" {} (on-call) ", team.id)
+                let text = if team.on_duty {
+                    format!("{} (on-call)", team.id)
                 } else {
-                    format!(" {} ", team.id)
-                }
+                    team.id.clone()
+                };
+                // A list tab has no kind glyph, so it reserves a blank marker
+                // column: the bar keeps its width when a spinner appears.
+                (" ", text)
             },
             |src_id| {
                 let src = source_config_for(&team.config, src_id);
                 let name = src.map_or(src_id.as_str(), |s| s.display_name());
-                let prefix = match src.map(|s| s.kind) {
+                let marker = match src.map(|s| s.kind) {
                     Some(crate::config::types::SourceKind::Backlog) => "≡",
                     _ => "▤",
                 };
-                format!(" {prefix} {name} ")
+                (marker, name.to_owned())
             },
         );
+        // While the tab is fetching, the spinner takes over the marker column
+        // rather than adding one — the same trade the title bar makes with the
+        // version string, and it keeps every tab's width fixed.
+        let marker = if app.tab_loading(*team_idx, board.as_deref()) {
+            crate::tui::list::SPINNER_FRAMES[frame]
+        } else {
+            idle_marker
+        };
+        let label = format!(" {marker} {text} ");
         if i == active {
             spans.push(Span::styled(
                 label,

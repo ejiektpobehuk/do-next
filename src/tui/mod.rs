@@ -31,7 +31,7 @@ use crate::config::hidden::{HiddenState, hidden_path};
 use crate::events::{ActionResult, AppEvent};
 use crate::jira::JiraClient;
 use crate::sources::{
-    Clients, TeamClients,
+    Clients, SourceTx, TeamClients,
     fetcher::{
         spawn_all_statuses_fetch, spawn_jira_search, spawn_preload_details, spawn_projects_fetch,
         spawn_refresh_issue, spawn_team_statuses_fetch,
@@ -115,26 +115,43 @@ async fn run_inner(
                     gitlab: clients_map.gitlab.get(&team.gitlab.base_url),
                     jira_site_url: &team.atlassian.base_url,
                 };
-                spawn_fetches(
-                    team_clients,
-                    app.team_config(),
-                    app.detail_load,
-                    &app.cache,
-                    &tx,
-                );
-                for state in app.sources.values_mut() {
-                    if matches!(state, crate::tui::app::SourceState::Pending) {
+                // Only the sources that were never spawned: a tab left
+                // mid-fetch keeps its requests, and they still land here.
+                let pending: Vec<crate::config::types::SourceConfig> = app
+                    .team_config()
+                    .sources
+                    .iter()
+                    .filter(|s| {
+                        matches!(
+                            app.sources.get(&s.id),
+                            Some(crate::tui::app::SourceState::Pending)
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                let source_tx = SourceTx::new(&tx, app.active_team_idx);
+                for source_cfg in &pending {
+                    crate::sources::spawn_source_fetch(
+                        team_clients,
+                        source_cfg,
+                        app.detail_load,
+                        &app.cache,
+                        &source_tx,
+                    );
+                    if let Some(state) = app.sources.get_mut(&source_cfg.id) {
                         *state = crate::tui::app::SourceState::Loading;
                     }
                 }
             }
         }
 
-        // Manage tick task lifecycle: run while sources are loading or any
+        // Manage tick task lifecycle: run while any team is loading or any
         // single-issue refresh is in flight (so the spinner animates), while
         // the search popup is open (to drive the debounced Jira dispatch), or
-        // while a rank move waits out its debounce window.
-        if app.any_source_loading()
+        // while a rank move waits out its debounce window. `any_team_loading`
+        // spans the tabs in the background too: their fetches keep running
+        // after a switch, and their tab markers spin until they land.
+        if app.any_team_loading()
             || !app.refreshing_issues.is_empty()
             || app.pending_rank.is_some()
             || !app.rank_flush_queue.is_empty()
@@ -250,7 +267,7 @@ fn spawn_initial_tasks(
         app.team_config(),
         app.detail_load,
         &app.cache,
-        tx,
+        &SourceTx::new(tx, app.active_team_idx),
     );
     for state in app.sources.values_mut() {
         *state = crate::tui::app::SourceState::Loading;
@@ -674,6 +691,39 @@ fn dispatch_action(
     Ok(())
 }
 
+/// The standup window widened past what was fetched, so the coverage has to
+/// grow. Narrowing never lands here — it is served by filtering locally.
+fn dispatch_standup_refetch(
+    app: &mut AppState,
+    clients: TeamClients<'_>,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let Some(id) = app.pending_standup_refetch.take() else {
+        return;
+    };
+    let Some(src_cfg) = crate::tui::app::source_config_for(app.team_config(), &id).cloned() else {
+        return;
+    };
+    // Called directly rather than through `spawn_source_fetch` so the requested
+    // coverage floor can be passed; the generic entry point has no notion of a
+    // window.
+    let wanted = app.standup_window();
+    app.standup_data
+        .insert(id, crate::tui::app::CacheState::Loading);
+    crate::sources::fetcher::spawn_standup_fetch(
+        crate::sources::fetcher::StandupFetch {
+            jira: clients.jira.clone(),
+            confluence: clients.confluence.cloned(),
+            gitlab: clients.gitlab.cloned(),
+            jira_site_url: clients.jira_site_url.to_owned(),
+            source_cfg: src_cfg,
+            cache: app.cache.clone(),
+            coverage_floor: Some(wanted.start),
+        },
+        SourceTx::new(tx, app.active_team_idx),
+    );
+}
+
 fn dispatch_background_tasks(
     app: &mut AppState,
     clients: TeamClients<'_>,
@@ -695,7 +745,13 @@ fn dispatch_background_tasks(
             *state = crate::tui::app::SourceState::Loading;
         }
         app.subsource_errors.clear();
-        spawn_fetches(clients, app.team_config(), app.detail_load, &app.cache, tx);
+        spawn_fetches(
+            clients,
+            app.team_config(),
+            app.detail_load,
+            &app.cache,
+            &SourceTx::new(tx, app.active_team_idx),
+        );
     }
 
     // Duty sources just spliced in by the `D` toggle (prepend mode): fetch
@@ -711,35 +767,18 @@ fn dispatch_background_tasks(
             if let Some(state) = app.sources.get_mut(id) {
                 *state = crate::tui::app::SourceState::Loading;
             }
-            crate::sources::spawn_source_fetch(clients, &src_cfg, app.detail_load, &app.cache, tx);
+            crate::sources::spawn_source_fetch(
+                clients,
+                &src_cfg,
+                app.detail_load,
+                &app.cache,
+                &SourceTx::new(tx, app.active_team_idx),
+            );
         }
         hydrate_from_cache(app, &ids);
     }
 
-    // The standup window widened past what was fetched, so the coverage has to
-    // grow. Narrowing never lands here — it is served by filtering locally.
-    if let Some(id) = app.pending_standup_refetch.take()
-        && let Some(src_cfg) = crate::tui::app::source_config_for(app.team_config(), &id).cloned()
-    {
-        // Called directly rather than through `spawn_source_fetch` so the
-        // requested coverage floor can be passed; the generic entry point has no
-        // notion of a window.
-        let wanted = app.standup_window();
-        app.standup_data
-            .insert(id, crate::tui::app::CacheState::Loading);
-        crate::sources::fetcher::spawn_standup_fetch(
-            crate::sources::fetcher::StandupFetch {
-                jira: clients.jira.clone(),
-                confluence: clients.confluence.cloned(),
-                gitlab: clients.gitlab.cloned(),
-                jira_site_url: clients.jira_site_url.to_owned(),
-                source_cfg: src_cfg,
-                cache: app.cache.clone(),
-                coverage_floor: Some(wanted.start),
-            },
-            tx.clone(),
-        );
-    }
+    dispatch_standup_refetch(app, clients, tx);
 
     // Single-issue refresh requested via `r` (detail focus).
     if let Some(req) = app.pending_refresh_issue.take() {
@@ -1038,7 +1077,7 @@ fn dispatch_pending_ranks(app: &mut AppState, client: &JiraClient, tx: &Unbounde
             src_cfg,
             detail_load,
             app.cache.clone(),
-            tx.clone(),
+            SourceTx::new(tx, app.active_team_idx),
         );
     }
 }

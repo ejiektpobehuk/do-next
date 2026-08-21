@@ -15,6 +15,41 @@ use fetcher::{
     spawn_gitlab_fetch, spawn_standup_fetch,
 };
 
+/// The event sender a source fetch is handed: it stamps everything the fetch
+/// emits with the team that owns it.
+///
+/// A fetch outlives the tab it was started from — switching tabs no longer
+/// throws away a request already in flight, because the stamp tells the handler
+/// which team's state to land the result in. Source ids are only unique within
+/// a team, so the team has to travel with the event; the id alone cannot say
+/// whose result this is.
+#[derive(Clone)]
+pub struct SourceTx {
+    tx: UnboundedSender<AppEvent>,
+    team_idx: usize,
+}
+
+impl SourceTx {
+    pub fn new(tx: &UnboundedSender<AppEvent>, team_idx: usize) -> Self {
+        Self {
+            tx: tx.clone(),
+            team_idx,
+        }
+    }
+
+    /// Send one event on behalf of this team. Returns whether it was queued —
+    /// a closed channel means the UI is already gone, which is why every
+    /// caller discards this.
+    pub fn send(&self, event: AppEvent) -> bool {
+        self.tx
+            .send(AppEvent::ForTeam {
+                team_idx: self.team_idx,
+                event: Box::new(event),
+            })
+            .is_ok()
+    }
+}
+
 /// Per-backend HTTP clients, keyed by base URL.
 pub struct Clients {
     pub jira: HashMap<String, JiraClient>,
@@ -46,7 +81,7 @@ pub fn spawn_fetches(
     team_config: &TeamConfig,
     default_detail_load: DetailLoad,
     cache: &CacheConfig,
-    tx: &UnboundedSender<AppEvent>,
+    tx: &SourceTx,
 ) {
     for source_cfg in &team_config.sources {
         spawn_source_fetch(clients, source_cfg, default_detail_load, cache, tx);
@@ -60,7 +95,7 @@ pub fn spawn_source_fetch(
     source_cfg: &SourceConfig,
     default_detail_load: DetailLoad,
     cache: &CacheConfig,
-    tx: &UnboundedSender<AppEvent>,
+    tx: &SourceTx,
 ) {
     match source_cfg.kind {
         SourceKind::Jira => {

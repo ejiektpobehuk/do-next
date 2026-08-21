@@ -11,6 +11,7 @@ use crate::gitlab::GitlabClient;
 use crate::items::WorkItem;
 use crate::jira::JiraClient;
 use crate::jira::types::{BoardSwimlanes, BoardType, Issue};
+use crate::sources::SourceTx;
 
 /// Spawn a background task that fetches issues for one source and sends
 /// an `AppEvent::SourceLoaded` or `AppEvent::SourceError` when done.
@@ -18,12 +19,7 @@ use crate::jira::types::{BoardSwimlanes, BoardType, Issue};
 /// If the source has subsources, one Jira search is run per subsource using
 /// combined JQL: `(parent jql) AND (subsource jql_filter)`.
 /// Issues are deduplicated within the source; first-matching subsource wins.
-pub fn spawn_fetch(
-    client: JiraClient,
-    source_cfg: SourceConfig,
-    cache: CacheConfig,
-    tx: UnboundedSender<AppEvent>,
-) {
+pub fn spawn_fetch(client: JiraClient, source_cfg: SourceConfig, cache: CacheConfig, tx: SourceTx) {
     let source_id = source_cfg.id.clone();
     tokio::spawn(async move {
         let items = if source_cfg.subsources.is_empty() {
@@ -90,7 +86,7 @@ pub fn spawn_board_fetch(
     source_cfg: SourceConfig,
     detail_load: DetailLoad,
     cache: CacheConfig,
-    tx: UnboundedSender<AppEvent>,
+    tx: SourceTx,
 ) {
     let source_id = source_cfg.id.clone();
     tokio::spawn(async move {
@@ -223,7 +219,7 @@ pub fn spawn_backlog_fetch(
     source_cfg: SourceConfig,
     detail_load: DetailLoad,
     cache: CacheConfig,
-    tx: UnboundedSender<AppEvent>,
+    tx: SourceTx,
 ) {
     let source_id = source_cfg.id.clone();
     tokio::spawn(async move {
@@ -438,7 +434,7 @@ pub fn spawn_confluence_fetch(
     client: ConfluenceClient,
     source_cfg: SourceConfig,
     cache: CacheConfig,
-    tx: UnboundedSender<AppEvent>,
+    tx: SourceTx,
 ) {
     let source_id = source_cfg.id.clone();
     tokio::spawn(async move {
@@ -474,7 +470,7 @@ pub fn spawn_gitlab_fetch(
     client: GitlabClient,
     source_cfg: SourceConfig,
     cache: CacheConfig,
-    tx: UnboundedSender<AppEvent>,
+    tx: SourceTx,
 ) {
     let source_id = source_cfg.id.clone();
     tokio::spawn(async move {
@@ -541,7 +537,7 @@ pub struct StandupFetch {
     pub coverage_floor: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-pub fn spawn_standup_fetch(req: StandupFetch, tx: UnboundedSender<AppEvent>) {
+pub fn spawn_standup_fetch(req: StandupFetch, tx: SourceTx) {
     let source_id = req.source_cfg.id.clone();
     tokio::spawn(async move {
         let filters = req.source_cfg.standup.clone().unwrap_or_default();
@@ -636,7 +632,7 @@ async fn collect_standup_jira(
     coverage: &crate::standup::window::Window,
     me: &str,
     source_id: &str,
-    tx: &UnboundedSender<AppEvent>,
+    tx: &SourceTx,
     data: &mut crate::standup::types::StandupData,
     items: &mut Vec<WorkItem>,
 ) {
@@ -672,7 +668,7 @@ async fn collect_standup_gitlab(
     filters: &crate::config::types::StandupFilters,
     coverage: &crate::standup::window::Window,
     source_id: &str,
-    tx: &UnboundedSender<AppEvent>,
+    tx: &SourceTx,
     data: &mut crate::standup::types::StandupData,
     items: &mut Vec<WorkItem>,
 ) {
@@ -711,7 +707,7 @@ async fn collect_standup_confluence(
     filters: &crate::config::types::StandupFilters,
     coverage: &crate::standup::window::Window,
     source_id: &str,
-    tx: &UnboundedSender<AppEvent>,
+    tx: &SourceTx,
     data: &mut crate::standup::types::StandupData,
     items: &mut Vec<WorkItem>,
 ) {

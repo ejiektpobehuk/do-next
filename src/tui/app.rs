@@ -766,7 +766,10 @@ impl AppState {
         if new_idx == self.active_team_idx || new_idx >= self.resolved_teams.len() {
             return;
         }
-        // Save current team state
+        // Save current team state. In-flight fetches are left as they are:
+        // they carry this team's stamp (see `crate::sources::SourceTx`) and keep
+        // landing in the snapshot below, so nothing already requested is thrown
+        // away and coming back finds it either done or still on its way.
         let current_state = PerTeamState {
             sources: std::mem::take(&mut self.sources),
             issues: std::mem::take(&mut self.issues),
@@ -857,7 +860,9 @@ impl AppState {
         // trust them; `sources` is the source of truth.
         self.rebuild_issues();
 
-        // Trigger source fetches if any sources are still pending
+        // Trigger source fetches for sources that were never spawned. A
+        // `Loading` source is already on its way — refetching it here would
+        // duplicate a request that is going to deliver anyway.
         if self
             .sources
             .values()
@@ -960,6 +965,80 @@ impl AppState {
         self.sources
             .values()
             .any(|s| matches!(s, SourceState::Pending | SourceState::Loading))
+    }
+
+    /// Whether a board source's swimlanes are still in flight. Lanes land
+    /// after their board's items, so this outlives `any_source_loading` and the
+    /// spinner clock has to stay awake for it.
+    pub(crate) fn any_lanes_loading(&self) -> bool {
+        self.board_lanes
+            .values()
+            .any(|s| matches!(s, LanesState::Loading))
+    }
+
+    /// Whether *any* team still has data in flight, including tabs sitting in
+    /// the background: their fetches survive a tab switch, so the spinner clock
+    /// has to keep running for their tab markers.
+    pub(crate) fn any_team_loading(&self) -> bool {
+        self.any_source_loading()
+            || self.any_lanes_loading()
+            || self.saved_team_states.values().any(|team| {
+                // `Pending` is not counted here: a background team's unspawned
+                // source waits for you to come back, so nothing is in flight.
+                team.sources
+                    .values()
+                    .any(|s| matches!(s, SourceState::Loading))
+                    || team
+                        .board_lanes
+                        .values()
+                        .any(|s| matches!(s, LanesState::Loading))
+            })
+    }
+
+    /// Whether the tab identified by `(team_idx, board)` still has data in
+    /// flight — the per-tab counterpart of [`Self::any_source_loading`].
+    ///
+    /// Background tabs report too: a fetch started before you switched away
+    /// keeps running and lands in that team's saved state, so its tab goes on
+    /// spinning until it does. A team you have never opened has nothing in
+    /// flight — its sources are not fetched until you switch to it.
+    pub(crate) fn tab_loading(&self, team_idx: usize, board: Option<&str>) -> bool {
+        let active = team_idx == self.active_team_idx;
+        let (sources, lanes) = if active {
+            (&self.sources, &self.board_lanes)
+        } else if let Some(saved) = self.saved_team_states.get(&team_idx) {
+            (&saved.sources, &saved.board_lanes)
+        } else {
+            return false;
+        };
+        // A dedicated tab is its one source, plus the board's swimlanes, which
+        // arrive after the items.
+        if let Some(id) = board {
+            return sources
+                .get(id)
+                .is_some_and(|s| Self::source_in_flight(s, active))
+                || matches!(lanes.get(id), Some(LanesState::Loading));
+        }
+        // The list tab covers every source that is not its own tab.
+        let Some(team) = self.resolved_teams.get(team_idx) else {
+            return false;
+        };
+        sources.iter().any(|(id, state)| {
+            Self::source_in_flight(state, active)
+                && source_config_for(&team.config, id)
+                    .is_some_and(|s| !Self::is_dedicated_tab_kind(s.kind))
+        })
+    }
+
+    /// Whether a source has a request outstanding. `Pending` counts only on the
+    /// active team, whose queued sources are spawned on the same event-loop
+    /// turn; on a background team it means "not asked for yet".
+    const fn source_in_flight(state: &SourceState, active_team: bool) -> bool {
+        match state {
+            SourceState::Loading => true,
+            SourceState::Pending => active_team,
+            SourceState::Loaded(_) | SourceState::Error(_) => false,
+        }
     }
 
     /// True iff any popup (sub-view or action overlay) is rendered on top of the main panels.
@@ -1228,6 +1307,8 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
             app.tick_count = app.tick_count.wrapping_add(1);
         }
 
+        AppEvent::ForTeam { team_idx, event } => apply_for_team(app, team_idx, *event),
+
         AppEvent::SourceLoaded(source_id, items) => apply_source_loaded(app, source_id, items),
 
         AppEvent::StandupLoaded(source_id, data) => apply_standup_loaded(app, source_id, *data),
@@ -1353,6 +1434,99 @@ pub fn update_state(app: &mut AppState, event: AppEvent) {
         AppEvent::CreateLabelsLoaded { result } => {
             apply_create_labels_loaded(app, result);
         }
+    }
+}
+
+/// Land a source fetch's event on the team that started it.
+///
+/// The active team goes through the normal handlers. A team left behind by a
+/// tab switch is updated in place inside `saved_team_states`: the request was
+/// already paid for, so returning to that tab finds the result instead of a
+/// spinner and a refetch. Only the events that carry per-team source state are
+/// routed this way; anything else a fetch emits is app-wide and handled as-is.
+fn apply_for_team(app: &mut AppState, team_idx: usize, event: AppEvent) {
+    if team_idx == app.active_team_idx {
+        update_state(app, event);
+        return;
+    }
+    // Same stale-fetch guard as the active path: a source the team no longer
+    // has (an on-duty toggle, a reloaded config) would be a phantom list row.
+    let known = |id: &str| {
+        app.resolved_teams
+            .get(team_idx)
+            .is_some_and(|t| source_config_for(&t.config, id).is_some())
+    };
+    match event {
+        AppEvent::SourceLoaded(source_id, items) => {
+            if known(&source_id)
+                && let Some(saved) = app.saved_team_states.get_mut(&team_idx)
+            {
+                saved.sources.insert(source_id, SourceState::Loaded(items));
+                // No rebuild: `switch_team` recomputes the flat list from
+                // `sources` when this tab comes back on screen.
+            }
+        }
+        AppEvent::SourceError(source_id, e) => {
+            if known(&source_id)
+                && let Some(saved) = app.saved_team_states.get_mut(&team_idx)
+            {
+                saved
+                    .sources
+                    .insert(source_id, SourceState::Error(Arc::new(e)));
+            }
+        }
+        AppEvent::SubsourceError(source_id, subsource_idx, e) => {
+            if let Some(saved) = app.saved_team_states.get_mut(&team_idx) {
+                saved
+                    .subsource_errors
+                    .entry(source_id)
+                    .or_default()
+                    .push((subsource_idx, Arc::new(e)));
+            }
+        }
+        AppEvent::BoardConfigLoaded(source_id, config) => {
+            let expects_lanes = app.resolved_teams.get(team_idx).is_some_and(|t| {
+                source_config_for(&t.config, &source_id)
+                    .and_then(|s| s.board.as_ref())
+                    .and_then(|b| b.swimlanes.as_ref())
+                    .is_some_and(|s| {
+                        matches!(
+                            s,
+                            crate::config::types::SwimlaneConfig::Auto
+                                | crate::config::types::SwimlaneConfig::Queries { .. }
+                        )
+                    })
+            });
+            if let Some(saved) = app.saved_team_states.get_mut(&team_idx) {
+                if expects_lanes {
+                    saved
+                        .board_lanes
+                        .insert(source_id.clone(), LanesState::Loading);
+                } else {
+                    saved.board_lanes.remove(&source_id);
+                }
+                saved.board_configs.insert(source_id, config);
+            }
+        }
+        AppEvent::BoardLanesLoaded(source_id, result) => {
+            if let Some(saved) = app.saved_team_states.get_mut(&team_idx) {
+                let state = match result {
+                    Ok(lanes) => LanesState::Loaded(lanes),
+                    Err(e) => LanesState::Error(format!("{e:#}")),
+                };
+                saved.board_lanes.insert(source_id, state);
+            }
+        }
+        // Standup timelines are keyed by source id in one app-wide map, so a
+        // background team's collection lands with no routing — but the cursor
+        // reset in `apply_standup_loaded` belongs to the on-screen tab only.
+        AppEvent::StandupLoaded(source_id, data) => {
+            if known(&source_id) {
+                app.standup_data
+                    .insert(source_id, CacheState::Loaded(*data));
+            }
+        }
+        other => update_state(app, other),
     }
 }
 
@@ -6452,6 +6626,321 @@ mod tests {
         app.activate_tab(0);
         assert_eq!(app.active_team_idx, 0);
         assert_eq!(app.board_view, None);
+    }
+
+    /// A team whose sources span both a list tab and a board tab, with every
+    /// source settled so each test can mark just the ones it cares about.
+    fn two_tab_app() -> AppState {
+        let teams = vec![resolved_team(
+            "platform",
+            vec![jira_source("mine"), board_source("inc")],
+        )];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        app.sources
+            .insert("mine".into(), SourceState::Loaded(vec![]));
+        app.sources
+            .insert("inc".into(), SourceState::Loaded(vec![]));
+        app
+    }
+
+    #[test]
+    fn list_tab_reports_only_its_own_sources() {
+        let mut app = two_tab_app();
+        app.sources.insert("mine".into(), SourceState::Loading);
+
+        assert!(
+            app.tab_loading(0, None),
+            "list tab spins for its own source"
+        );
+        assert!(
+            !app.tab_loading(0, Some("inc")),
+            "a settled board tab stays quiet"
+        );
+    }
+
+    /// The case the feature exists for: the board tab is still fetching while
+    /// you sit on the list tab, which the title-bar spinner alone can't express.
+    #[test]
+    fn board_tab_loading_leaves_the_list_tab_quiet() {
+        let mut app = two_tab_app();
+        app.sources.insert("inc".into(), SourceState::Loading);
+
+        assert!(app.tab_loading(0, Some("inc")));
+        assert!(
+            !app.tab_loading(0, None),
+            "a board source is its own tab, never a list row"
+        );
+    }
+
+    #[test]
+    fn a_pending_source_counts_as_loading() {
+        let mut app = two_tab_app();
+        app.sources.insert("mine".into(), SourceState::Pending);
+
+        assert!(app.tab_loading(0, None), "queued but not yet spawned");
+    }
+
+    #[test]
+    fn board_tab_spins_while_only_its_lanes_load() {
+        let mut app = two_tab_app();
+        app.board_lanes.insert("inc".into(), LanesState::Loading);
+
+        assert!(
+            app.tab_loading(0, Some("inc")),
+            "lanes land after the items"
+        );
+        assert!(!app.tab_loading(0, None));
+        assert!(
+            app.any_lanes_loading(),
+            "so the spinner clock stays awake for them"
+        );
+    }
+
+    #[test]
+    fn a_settled_tab_reports_nothing() {
+        let app = two_tab_app();
+        assert!(!app.tab_loading(0, None));
+        assert!(!app.tab_loading(0, Some("inc")));
+        assert!(!app.any_lanes_loading());
+    }
+
+    /// The marker column is load-bearing: the spinner has to *replace* a tab's
+    /// kind glyph, not push it aside, or the whole bar reflows every time one
+    /// tab settles. Nothing but a real frame proves the widths line up.
+    fn rendered_tab_bar(loading: Option<&str>) -> String {
+        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+        let mut app = two_tab_app();
+        if let Some(id) = loading {
+            app.sources.insert(id.into(), SourceState::Loading);
+        }
+        app.tick_count = 0;
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 1,
+        };
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test backend starts");
+        terminal
+            .draw(|f| crate::tui::render::render_tab_bar(f, area, &app))
+            .expect("frame draws");
+
+        let buf = terminal.backend().buffer().clone();
+        (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_owned())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn the_spinner_takes_over_the_loading_tabs_marker_column() {
+        let idle = rendered_tab_bar(None);
+        assert_eq!(idle, "   platform   ▤ inc");
+
+        // The list tab's blank marker column fills in...
+        let list_loading = rendered_tab_bar(Some("mine"));
+        assert_eq!(list_loading, " ⠋ platform   ▤ inc");
+
+        // ...and the board tab hands its ▤ over instead of growing.
+        let board_loading = rendered_tab_bar(Some("inc"));
+        assert_eq!(board_loading, "   platform   ⠋ inc");
+
+        assert_eq!(idle.chars().count(), list_loading.chars().count());
+        assert_eq!(idle.chars().count(), board_loading.chars().count());
+    }
+
+    #[test]
+    fn an_unopened_teams_tab_reports_nothing_in_flight() {
+        let teams = vec![
+            resolved_team("platform", vec![jira_source("mine")]),
+            resolved_team("other", vec![jira_source("theirs")]),
+        ];
+        let app = AppState::new(teams, &cfg::Config::default());
+
+        assert!(
+            app.tab_loading(0, None),
+            "the active team starts out pending"
+        );
+        assert!(
+            !app.tab_loading(1, None),
+            "another team is not fetched until you switch to it"
+        );
+    }
+
+    /// Two teams, both with a list and a board tab, sitting on the first.
+    fn two_team_app() -> AppState {
+        let teams = vec![
+            resolved_team("platform", vec![jira_source("mine"), board_source("inc")]),
+            resolved_team("other", vec![jira_source("theirs")]),
+        ];
+        AppState::new(teams, &cfg::Config::default())
+    }
+
+    /// Put team 0 mid-fetch, then leave for team 1.
+    fn left_mid_fetch() -> AppState {
+        let mut app = two_team_app();
+        app.sources.insert("mine".into(), SourceState::Loading);
+        app.sources.insert("inc".into(), SourceState::Loading);
+        app.board_lanes.insert("inc".into(), LanesState::Loading);
+
+        // What the event loop does on arrival: spawn the new team's queued
+        // sources and clear the request.
+        app.switch_team(1);
+        app.flags.pending_team_fetch = false;
+        for state in app.sources.values_mut() {
+            *state = SourceState::Loading;
+        }
+        app
+    }
+
+    /// The point of the team stamp: a switch used to abandon everything in
+    /// flight, so the request was paid for and thrown away.
+    #[test]
+    fn leaving_a_team_mid_fetch_keeps_its_requests() {
+        let app = left_mid_fetch();
+        let saved = app
+            .saved_team_states
+            .get(&0)
+            .expect("the team we left is parked");
+
+        assert!(matches!(
+            saved.sources.get("mine"),
+            Some(SourceState::Loading)
+        ));
+        assert!(matches!(
+            saved.board_lanes.get("inc"),
+            Some(LanesState::Loading)
+        ));
+        assert!(
+            app.tab_loading(0, None) && app.tab_loading(0, Some("inc")),
+            "a background tab goes on spinning for what it is still waiting on"
+        );
+        assert!(
+            app.any_team_loading(),
+            "so the spinner clock has to stay awake"
+        );
+    }
+
+    /// A result that lands while its tab is off screen is applied to that
+    /// team's saved state, and switching back finds it loaded rather than
+    /// spinning or refetching.
+    #[test]
+    fn a_background_teams_result_lands_in_its_saved_state() {
+        let mut app = left_mid_fetch();
+
+        for id in ["mine", "inc"] {
+            update_state(
+                &mut app,
+                AppEvent::ForTeam {
+                    team_idx: 0,
+                    event: Box::new(AppEvent::SourceLoaded(
+                        id.into(),
+                        vec![WorkItem::Jira(make_issue("PLAT-1", "Open", Some(id)))],
+                    )),
+                },
+            );
+        }
+        update_state(
+            &mut app,
+            AppEvent::ForTeam {
+                team_idx: 0,
+                event: Box::new(AppEvent::BoardLanesLoaded(
+                    "inc".into(),
+                    Ok(crate::jira::types::BoardSwimlanes {
+                        lane_names: vec!["Now".into()],
+                        assignment: HashMap::new(),
+                    }),
+                )),
+            },
+        );
+
+        assert!(
+            !app.tab_loading(0, None) && !app.tab_loading(0, Some("inc")),
+            "the background tab's markers settle where they stand"
+        );
+
+        app.switch_team(0);
+
+        assert!(matches!(
+            app.sources.get("mine"),
+            Some(SourceState::Loaded(items)) if items.len() == 1
+        ));
+        assert!(matches!(
+            app.board_lanes.get("inc"),
+            Some(LanesState::Loaded(_))
+        ));
+        assert!(
+            !app.flags.pending_team_fetch,
+            "the delivered fetch is not repeated on return"
+        );
+        assert_eq!(app.issues.len(), 1, "and the flat list is rebuilt from it");
+    }
+
+    /// A source that never got spawned still has to be fetched on return —
+    /// only in-flight ones are left to deliver on their own.
+    #[test]
+    fn returning_refetches_only_the_never_spawned_sources() {
+        let mut app = two_team_app();
+        app.sources.insert("mine".into(), SourceState::Loading);
+        // `inc` stays `Pending`: it was queued but no request went out.
+        app.switch_team(1);
+        app.flags.pending_team_fetch = false;
+        app.switch_team(0);
+
+        assert!(app.flags.pending_team_fetch);
+        assert!(matches!(
+            app.sources.get("mine"),
+            Some(SourceState::Loading)
+        ));
+    }
+
+    /// A stamped event for the tab still on screen takes the ordinary path,
+    /// list rebuild included.
+    #[test]
+    fn a_stamped_result_for_the_active_team_applies_normally() {
+        let mut app = two_team_app();
+        app.sources.insert("mine".into(), SourceState::Loading);
+
+        update_state(
+            &mut app,
+            AppEvent::ForTeam {
+                team_idx: 0,
+                event: Box::new(AppEvent::SourceLoaded(
+                    "mine".into(),
+                    vec![WorkItem::Jira(make_issue("PLAT-2", "Open", Some("mine")))],
+                )),
+            },
+        );
+
+        assert!(matches!(
+            app.sources.get("mine"),
+            Some(SourceState::Loaded(_))
+        ));
+        assert_eq!(app.issues.len(), 1);
+    }
+
+    /// A source the team no longer has (an on-duty toggle dropped it) must not
+    /// come back as a phantom row just because it was off screen.
+    #[test]
+    fn an_unknown_source_is_dropped_for_a_background_team_too() {
+        let mut app = left_mid_fetch();
+
+        update_state(
+            &mut app,
+            AppEvent::ForTeam {
+                team_idx: 0,
+                event: Box::new(AppEvent::SourceLoaded("gone".into(), vec![])),
+            },
+        );
+
+        assert!(
+            !app.saved_team_states[&0].sources.contains_key("gone"),
+            "an id outside the team's config is not a source of its own"
+        );
     }
 
     fn make_issue(key: &str, status: &str, source_id: Option<&str>) -> Issue {

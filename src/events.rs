@@ -10,6 +10,12 @@ use crate::jira::types::{
 pub enum AppEvent {
     /// Keyboard or mouse event from the terminal.
     Input(crossterm::event::Event),
+    /// A source fetch's event, stamped with the team whose sources it belongs
+    /// to by [`crate::sources::SourceTx`]. Fetches outlive a tab switch, so the
+    /// handler applies the inner event to that team's state — the tab on screen
+    /// or one parked in `saved_team_states` — instead of dropping work already
+    /// paid for. Boxed: the inner event is the whole enum.
+    ForTeam { team_idx: usize, event: Box<Self> },
     /// A background fetch completed successfully.
     SourceLoaded(String, Vec<WorkItem>),
     /// A whole-source fetch failed (no subsources).
