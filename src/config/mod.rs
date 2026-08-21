@@ -186,6 +186,16 @@ fn apply_gitlab_defaults(user: &mut Option<GitlabConfig>, company: Option<&Gitla
     if user.credential_key.is_none() {
         user.credential_key.clone_from(&company.credential_key);
     }
+    if user.auth_method.is_none() {
+        user.auth_method.clone_from(&company.auth_method);
+    }
+    if user.oauth_client_id.is_none() {
+        user.oauth_client_id.clone_from(&company.oauth_client_id);
+    }
+    if user.oauth_client_secret.is_none() {
+        user.oauth_client_secret
+            .clone_from(&company.oauth_client_secret);
+    }
 }
 
 /// Merge the effective GitLab connection: team override → company-merged user
@@ -210,6 +220,19 @@ fn resolve_team_gitlab(user: Option<&GitlabConfig>, team: Option<&GitlabConfig>)
         }
         if overlay.credential_key.is_some() {
             resolved.credential_key.clone_from(&overlay.credential_key);
+        }
+        if overlay.auth_method.is_some() {
+            resolved.auth_method.clone_from(&overlay.auth_method);
+        }
+        if overlay.oauth_client_id.is_some() {
+            resolved
+                .oauth_client_id
+                .clone_from(&overlay.oauth_client_id);
+        }
+        if overlay.oauth_client_secret.is_some() {
+            resolved
+                .oauth_client_secret
+                .clone_from(&overlay.oauth_client_secret);
         }
     }
     resolved
@@ -768,6 +791,62 @@ mod tests {
         let mut user = None;
         apply_gitlab_defaults(&mut user, None);
         assert!(user.is_none());
+    }
+
+    #[test]
+    fn gitlab_oauth_settings_follow_the_same_precedence() {
+        // A company manifest is how a team shares one registered OAuth app:
+        // the client id is not a secret, so it travels with the connection
+        // settings.
+        let company = GitlabConfig {
+            base_url: Some("https://gitlab.company.com".into()),
+            auth_method: Some("oauth".into()),
+            oauth_client_id: Some("company-app".into()),
+            ..Default::default()
+        };
+        let mut user = None;
+        apply_gitlab_defaults(&mut user, Some(&company));
+        let resolved = resolve_team_gitlab(user.as_ref(), None);
+        assert!(resolved.uses_oauth());
+        assert_eq!(resolved.oauth_client_id.as_deref(), Some("company-app"));
+        assert_eq!(resolved.oauth_client_secret, None);
+
+        // A user who registered their own app keeps it.
+        let mut user = Some(GitlabConfig {
+            oauth_client_id: Some("my-app".into()),
+            ..Default::default()
+        });
+        apply_gitlab_defaults(&mut user, Some(&company));
+        let resolved = resolve_team_gitlab(user.as_ref(), None);
+        assert_eq!(resolved.oauth_client_id.as_deref(), Some("my-app"));
+        // ...while still inheriting the company's method and instance.
+        assert!(resolved.uses_oauth());
+        assert_eq!(resolved.base_url, "https://gitlab.company.com");
+
+        // A team can opt back out of an OAuth-by-default company setup.
+        let team = GitlabConfig {
+            auth_method: Some("token".into()),
+            ..Default::default()
+        };
+        let resolved = resolve_team_gitlab(user.as_ref(), Some(&team));
+        assert!(!resolved.uses_oauth());
+    }
+
+    #[test]
+    fn gitlab_defaults_to_the_token_path_when_nothing_says_otherwise() {
+        let resolved = resolve_team_gitlab(None, None);
+        assert_eq!(resolved.auth_method, None);
+        assert!(
+            !resolved.uses_oauth(),
+            "absent auth_method must mean the personal-token path"
+        );
+        // An unrecognised value is not OAuth either — it must not silently
+        // enable a different flow.
+        let odd = GitlabConfig {
+            auth_method: Some("OAuth".into()),
+            ..Default::default()
+        };
+        assert!(!resolve_team_gitlab(Some(&odd), None).uses_oauth());
     }
 
     #[test]

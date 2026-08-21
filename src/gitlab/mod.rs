@@ -5,30 +5,47 @@
 //! Read-only by design — `o` opens a merge request in the browser and `i`
 //! hides it for a day; nothing here approves, merges or comments.
 
+pub mod auth;
 mod client;
+pub mod oauth;
 pub mod types;
 
 use anyhow::{Context, Result};
 
-use crate::config::credentials::resolve_gitlab_token;
+use crate::config::credentials::resolve_gitlab_auth;
 use crate::config::types::ResolvedTeam;
+use auth::GitlabAuth;
 pub use client::GitlabClient;
 use types::ApiUser;
 
 /// Check a token against the API and return the user it belongs to. Used by
 /// the interactive token setup to catch typos before storing.
 pub async fn validate_token(base_url: &str, token: String) -> Result<ApiUser> {
-    GitlabClient::new(base_url, token)?
-        .current_user()
+    validate_auth(base_url, GitlabAuth::Token(token))
         .await
         .context("token check against the GitLab API failed")
 }
 
-/// One token-setup target: the teams behind a single GitLab instance (one
-/// token covers every team on the same instance).
+/// Confirm credentials work and report whose they are. Used after an OAuth
+/// flow, and by the token setup above.
+pub async fn validate_auth(base_url: &str, auth: GitlabAuth) -> Result<ApiUser> {
+    GitlabClient::new(base_url, auth)?
+        .current_user()
+        .await
+        .context("credential check against the GitLab API failed")
+}
+
+/// One credential-setup target: the teams behind a single GitLab instance (one
+/// credential covers every team on the same instance).
+///
+/// The OAuth fields are the *effective* ones — team override merged over the
+/// user config and the company manifest — so a shared application id reaches
+/// the setup flow without the user retyping it.
 pub struct TokenSetupTarget {
     pub base_url: String,
     pub team_ids: Vec<String>,
+    pub oauth_client_id: Option<String>,
+    pub oauth_client_secret: Option<String>,
 }
 
 /// Teams with GitLab sources, grouped by instance base URL. Order follows the
@@ -47,6 +64,8 @@ pub fn gitlab_api_urls(teams: &[ResolvedTeam]) -> Vec<TokenSetupTarget> {
             None => groups.push(TokenSetupTarget {
                 base_url: team.gitlab.base_url.clone(),
                 team_ids: vec![team.id.clone()],
+                oauth_client_id: team.gitlab.oauth_client_id.clone(),
+                oauth_client_secret: team.gitlab.oauth_client_secret.clone(),
             }),
         }
     }
@@ -60,7 +79,7 @@ pub fn gitlab_api_urls(teams: &[ResolvedTeam]) -> Vec<TokenSetupTarget> {
 pub fn teams_missing_token(teams: &[ResolvedTeam]) -> Vec<TokenSetupTarget> {
     let missing: Vec<ResolvedTeam> = teams
         .iter()
-        .filter(|t| t.uses_gitlab() && matches!(resolve_gitlab_token(&t.gitlab), Ok(None)))
+        .filter(|t| t.uses_gitlab() && matches!(resolve_gitlab_auth(&t.gitlab), Ok(None)))
         .cloned()
         .collect();
     gitlab_api_urls(&missing)
@@ -95,6 +114,7 @@ mod tests {
             grafana: None,
             gitlab: ResolvedGitlab {
                 base_url: base_url.into(),
+                oauth_client_id: Some(format!("app-for-{base_url}")),
                 ..Default::default()
             },
             normal_sources: sources,
@@ -114,6 +134,20 @@ mod tests {
         assert_eq!(targets[0].base_url, "https://gitlab.com");
         assert_eq!(targets[0].team_ids, vec!["a", "c"]);
         assert_eq!(targets[1].team_ids, vec!["b"]);
+    }
+
+    #[test]
+    fn a_setup_target_carries_the_effective_oauth_app() {
+        // The setup flow reads the application id from here, not from the raw
+        // on-disk config — otherwise an id shared through a company manifest
+        // would be invisible and the user prompted to retype it.
+        let teams = [team("a", "https://gitlab.com", &[SourceKind::Gitlab])];
+        let targets = gitlab_api_urls(&teams);
+        assert_eq!(
+            targets[0].oauth_client_id.as_deref(),
+            Some("app-for-https://gitlab.com")
+        );
+        assert_eq!(targets[0].oauth_client_secret, None);
     }
 
     #[test]

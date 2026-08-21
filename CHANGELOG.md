@@ -21,6 +21,7 @@ All notable changes to `do-next` are documented here.
 - Linked issues support for the new issue form
 - Labels support for the new issue form
 - `inspect` command to make configuration easier
+- GitLab oauth sign-in: **Web** and **Device** for headless sessions.
 
 ### Fixes
 

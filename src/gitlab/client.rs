@@ -1,5 +1,7 @@
-//! HTTP client for the GitLab REST API (`/api/v4`), authenticated with a
-//! personal access token in the `PRIVATE-TOKEN` header.
+//! HTTP client for the GitLab REST API (`/api/v4`), authenticated with either
+//! a personal access token (`PRIVATE-TOKEN`) or OAuth credentials
+//! (`Authorization: Bearer`) — see [`crate::gitlab::auth`], which also handles
+//! refreshing an expiring OAuth token.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -11,6 +13,7 @@ use tokio::sync::RwLock;
 
 use crate::config::types::GitlabFilters;
 
+use super::auth::GitlabAuth;
 use super::types::{
     ApiApprovals, ApiEvent, ApiMergeRequest, ApiMergeRequestDetail, ApiProject, ApiUser,
     MergeRequest, apply_enriched_fields, build_mr_query, build_standup_mr_query, encode_path,
@@ -60,13 +63,15 @@ pub struct GitlabClient {
     client: Client,
     /// Instance base URL without a trailing slash, e.g. `https://gitlab.com`.
     base_url: String,
-    token: String,
+    /// Shared so an OAuth refresh applies to every clone — and every fetch
+    /// task gets a clone.
+    auth: Arc<RwLock<GitlabAuth>>,
     /// Cached username of the token's own user.
     me: Arc<RwLock<Option<String>>>,
 }
 
 impl GitlabClient {
-    pub fn new(base_url: &str, token: String) -> Result<Self> {
+    pub fn new(base_url: &str, auth: GitlabAuth) -> Result<Self> {
         // Self-hosted instances are commonly VPN-only; with the VPN off the
         // connect never answers, and without a deadline the merge-request
         // sources would spin for the whole session instead of showing an
@@ -79,9 +84,15 @@ impl GitlabClient {
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_owned(),
-            token,
+            auth: Arc::new(RwLock::new(auth)),
             me: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Refresh an expiring OAuth token, then attach credentials to `req`.
+    async fn authorized(&self, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+        super::auth::maybe_refresh(&self.auth).await?;
+        Ok(super::auth::apply(&self.auth, req).await)
     }
 
     fn api(&self, path: &str) -> String {
@@ -95,10 +106,8 @@ impl GitlabClient {
     ) -> Result<T> {
         log::debug!("GitLab request: {url}");
         let resp = self
-            .client
-            .get(url)
-            .query(query)
-            .header("PRIVATE-TOKEN", &self.token)
+            .authorized(self.client.get(url).query(query))
+            .await?
             .send()
             .await
             .with_context(|| format!("Failed to send GitLab request: {url}"))?;
@@ -124,10 +133,8 @@ impl GitlabClient {
 
             log::debug!("GitLab request: {url} (page {page})");
             let resp = self
-                .client
-                .get(url)
-                .query(&paged)
-                .header("PRIVATE-TOKEN", &self.token)
+                .authorized(self.client.get(url).query(&paged))
+                .await?
                 .send()
                 .await
                 .with_context(|| format!("Failed to send GitLab request: {url}"))?;

@@ -104,7 +104,7 @@ pub fn spawn_source_fetch(
                     source_cfg.id.clone(),
                     anyhow::anyhow!(
                         "GitLab is not configured for this team \
-                         (run `do-next auth` to store a token)"
+                         (run `do-next auth` to sign in or store a token)"
                     ),
                 ));
             }

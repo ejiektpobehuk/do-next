@@ -7,6 +7,7 @@ mod grafana;
 mod http;
 mod items;
 mod jira;
+mod oauth;
 mod sources;
 mod standup;
 mod startup;
@@ -219,18 +220,18 @@ async fn main() -> Result<()> {
                     .context("Grafana token setup failed")?;
             }
         }
-        // Same for teams with GitLab sources — the merge-request token.
+        // Same for teams with GitLab sources — the merge-request credentials.
         let gitlab_teams = gitlab::gitlab_api_urls(&loaded.teams);
         if !gitlab_teams.is_empty()
             && tui::onboarding::prompt_yes_no(
-                "\nAlso configure the GitLab token (merge requests)? [y/N]: ",
+                "\nAlso set up GitLab sign-in (merge requests)? [y/N]: ",
                 false,
             )?
         {
             for target in &gitlab_teams {
                 tui::onboarding::gitlab::setup_gitlab_token(target, &mut loaded.raw)
                     .await
-                    .context("GitLab token setup failed")?;
+                    .context("GitLab credential setup failed")?;
             }
         }
         return Ok(());
@@ -367,7 +368,7 @@ async fn main() -> Result<()> {
         let (missing_grafana, missing_gitlab) = {
             let (group, [grafana_slot, gitlab_slot]) = startup::Group::start([
                 has_grafana.then_some("reading Grafana OnCall token"),
-                has_gitlab.then_some("reading GitLab token"),
+                has_gitlab.then_some("reading GitLab credentials"),
             ]);
             let teams = &loaded.teams;
             let probes = std::thread::scope(|scope| {
@@ -383,9 +384,9 @@ async fn main() -> Result<()> {
                 let gitlab_probe = scope.spawn(|| {
                     let missing = gitlab::teams_missing_token(teams);
                     if missing.is_empty() {
-                        gitlab_slot.done("GitLab token found");
+                        gitlab_slot.done("GitLab credentials found");
                     } else {
-                        gitlab_slot.warn("no GitLab token stored");
+                        gitlab_slot.warn("no GitLab credentials stored");
                     }
                     missing
                 });
@@ -400,7 +401,7 @@ async fn main() -> Result<()> {
                     .map_err(|_| anyhow::anyhow!("Grafana token probe panicked"))?,
                 probes
                     .1
-                    .map_err(|_| anyhow::anyhow!("GitLab token probe panicked"))?,
+                    .map_err(|_| anyhow::anyhow!("GitLab credential probe panicked"))?,
             )
         };
 
@@ -430,7 +431,7 @@ async fn main() -> Result<()> {
                 match tui::onboarding::gitlab::setup_gitlab_token(target, &mut loaded.raw).await {
                     Ok(tui::onboarding::SetupOutcome::Configured) => configured = true,
                     Ok(_) => {}
-                    Err(e) => eprintln!("warning: GitLab token setup failed: {e:#}"),
+                    Err(e) => eprintln!("warning: GitLab credential setup failed: {e:#}"),
                 }
             }
             if configured {
@@ -553,41 +554,46 @@ async fn main() -> Result<()> {
             // duty sources at runtime). A missing token is not fatal: the
             // source reports it, so the rest of the list still loads.
             let gitlab = scope.spawn(|| {
-                let mut tokens: Vec<(String, String, String)> = Vec::new();
+                let mut auths: Vec<(String, String, gitlab::auth::GitlabAuth)> = Vec::new();
                 let mut warnings = Vec::new();
                 for team in teams {
                     if !team.uses_gitlab() {
                         continue;
                     }
                     let url = team.gitlab.base_url.clone();
-                    if tokens.iter().any(|(seen, _, _)| *seen == url) {
+                    if auths.iter().any(|(seen, _, _)| *seen == url) {
                         continue;
                     }
-                    match config::credentials::resolve_gitlab_token(&team.gitlab) {
-                        Ok(Some(token)) => tokens.push((url, team.id.clone(), token)),
+                    let how = if team.gitlab.uses_oauth() {
+                        "sign in"
+                    } else {
+                        "set it up"
+                    };
+                    match config::credentials::resolve_gitlab_auth(&team.gitlab) {
+                        Ok(Some(auth)) => auths.push((url, team.id.clone(), auth)),
                         Ok(None) => warnings.push(format!(
-                            "team '{}': no GitLab token configured for {url} \
-                             (run `do-next auth` to set it up)",
+                            "team '{}': no GitLab credentials for {url} \
+                             (run `do-next auth` to {how})",
                             team.id
                         )),
                         Err(e) => warnings.push(format!(
-                            "team '{}': GitLab token resolution failed: {e:#}",
+                            "team '{}': GitLab credential resolution failed: {e:#}",
                             team.id
                         )),
                     }
                 }
                 if !warnings.is_empty() {
                     gitlab_slot.warn("GitLab credentials incomplete");
-                } else if tokens.is_empty() {
+                } else if auths.is_empty() {
                     gitlab_slot.clear();
                 } else {
-                    let count = tokens.len();
+                    let count = auths.len();
                     gitlab_slot.done(format!(
                         "GitLab ready ({count} instance{})",
                         if count == 1 { "" } else { "s" }
                     ));
                 }
-                (tokens, warnings)
+                (auths, warnings)
             });
 
             (jira.join(), confluence.join(), gitlab.join())
@@ -602,7 +608,7 @@ async fn main() -> Result<()> {
     let mut confluence_auths = resolved
         .1
         .map_err(|_| anyhow::anyhow!("Confluence credential resolution panicked"))??;
-    let (gitlab_tokens, gitlab_warnings) = resolved
+    let (gitlab_auths, gitlab_warnings) = resolved
         .2
         .map_err(|_| anyhow::anyhow!("GitLab credential resolution panicked"))?;
 
@@ -636,8 +642,8 @@ async fn main() -> Result<()> {
         clients.confluence.insert(url, client);
     }
 
-    for (url, team_id, token) in gitlab_tokens {
-        let client = gitlab::GitlabClient::new(&url, token)
+    for (url, team_id, auth) in gitlab_auths {
+        let client = gitlab::GitlabClient::new(&url, auth)
             .with_context(|| format!("Failed to create GitLab client for team '{team_id}'"))?;
         clients.gitlab.insert(url, client);
     }

@@ -2,13 +2,18 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration as ChronoDuration, Utc};
-use rand::RngExt;
-use sha2::{Digest, Sha256};
 
 use crate::jira::auth::{OAuthCredentials, OAuthStore};
+use crate::oauth::{self, LoopbackServer, percent_encode};
+
+/// Fixed callback port. Must match the URI registered in the Atlassian
+/// Developer Console, so — unlike the GitLab flow — there is no fallback port:
+/// Atlassian compares redirect URIs exactly.
+const CALLBACK_PORT: u16 = 19872;
+
+/// How long to wait for the user to finish consenting in the browser.
+const CONSENT_TIMEOUT: Duration = Duration::from_mins(2);
 
 const AUTH_URL: &str = "https://auth.atlassian.com/authorize";
 const TOKEN_URL: &str = "https://auth.atlassian.com/oauth/token";
@@ -78,37 +83,41 @@ pub fn run_oauth_flow(
     store: OAuthStore,
     extra: ExtraScopes,
 ) -> Result<OAuthCredentials> {
-    // 1. Start local HTTP server on a fixed port (must match the callback URL
-    //    registered in the Atlassian Developer Console).
-    let server = tiny_http::Server::http("127.0.0.1:19872")
-        .map_err(|e| anyhow::anyhow!("Failed to start local HTTP server on port 19872: {e}"))?;
-    let redirect_uri = "http://localhost:19872/callback".to_string();
+    // 1. Start local HTTP server on the fixed port registered in the Atlassian
+    //    Developer Console.
+    let server = LoopbackServer::bind(CALLBACK_PORT)?;
+    if server.port() != CALLBACK_PORT {
+        bail!(
+            "Port {CALLBACK_PORT} is in use, and Atlassian only accepts the exact\n\
+             callback URL registered for the app (http://localhost:{CALLBACK_PORT}/callback).\n\
+             Free the port and run `do-next auth` again."
+        );
+    }
+    let redirect_uri = format!("http://localhost:{CALLBACK_PORT}/callback");
 
-    // 2. Generate PKCE code_verifier and code_challenge (S256).
-    let code_verifier = generate_code_verifier();
-    let code_challenge = generate_code_challenge(&code_verifier);
+    // 2. PKCE (S256) and a CSRF state value.
+    let pkce = oauth::pkce();
+    let state = oauth::state();
 
-    // 3. Generate random state for CSRF protection.
-    let state = generate_state();
-
-    // 4. Build authorization URL.
+    // 3. Build authorization URL.
     let requested_scopes = scopes(extra);
     let auth_url = format!(
         "{AUTH_URL}?\
          audience=api.atlassian.com&\
          client_id={client_id}&\
          scope={scopes}&\
-         redirect_uri={redirect_uri}&\
+         redirect_uri={redirect}&\
          state={state}&\
          response_type=code&\
          prompt=consent&\
-         code_challenge={code_challenge}&\
+         code_challenge={challenge}&\
          code_challenge_method=S256",
-        scopes = urlencoded(&requested_scopes),
-        redirect_uri = urlencoded(&redirect_uri),
+        scopes = percent_encode(&requested_scopes),
+        redirect = percent_encode(&redirect_uri),
+        challenge = pkce.challenge,
     );
 
-    // 5. Open browser.
+    // 4. Open browser.
     println!("Opening browser for Atlassian authorization...");
     if open::that(&auth_url).is_err() {
         println!("Could not open browser automatically.");
@@ -118,34 +127,9 @@ pub fn run_oauth_flow(
     println!();
     println!("Waiting for authorization (up to 2 minutes)...");
 
-    // 6. Wait for the callback.
-    let request = server
-        .recv_timeout(Duration::from_secs(120))
-        .context("Error waiting for OAuth callback")?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Timed out waiting for authorization.\n\
-             Make sure you complete the authorization in your browser within 2 minutes.\n\
-             Run `do-next auth` to try again."
-            )
-        })?;
-
-    let url = request.url().to_string();
-    let (code, callback_state) = parse_callback_params(&url)?;
-
-    if callback_state != state {
-        bail!("OAuth state mismatch — possible CSRF attack. Run `do-next auth` to try again.");
-    }
-
-    // Respond to the browser.
-    let response = tiny_http::Response::from_string(include_str!("authorization_complete.html"))
-        .with_header(
-            "Content-Type: text/html"
-                .parse::<tiny_http::Header>()
-                .expect("static header is valid"),
-        );
-    let _ = request.respond(response);
-    drop(server); // Release the listener before making outbound HTTP calls.
+    // 5. Wait for the callback.
+    let code = server.await_code(&state, CONSENT_TIMEOUT)?;
+    let code_verifier = pkce.verifier;
 
     println!("Authorization received. Exchanging for tokens...");
 
@@ -155,13 +139,8 @@ pub fn run_oauth_flow(
     let client_id_owned = client_id.to_string();
     let client_secret_owned = client_secret.to_string();
     let requested = requested_scopes;
-    let (token_data, mut resources) = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("Failed to build HTTP runtime")?;
-
-        rt.block_on(async {
+    let (token_data, mut resources) = oauth::blocking_http(move || {
+        Box::pin(async move {
             let http = reqwest::Client::new();
 
             // 7. Token exchange.
@@ -228,9 +207,7 @@ pub fn run_oauth_flow(
 
             Ok((token_data, resources))
         })
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("Token exchange thread panicked"))??;
+    })?;
 
     let expires_at = Utc::now() + ChronoDuration::seconds(token_data.expires_in);
 
@@ -492,78 +469,4 @@ struct StoredTokens {
     cloud_id: String,
     client_id: String,
     client_secret: String,
-}
-
-fn generate_code_verifier() -> String {
-    let bytes: [u8; 32] = rand::rng().random();
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn generate_code_challenge(verifier: &str) -> String {
-    let digest = Sha256::digest(verifier.as_bytes());
-    URL_SAFE_NO_PAD.encode(digest)
-}
-
-fn generate_state() -> String {
-    let bytes: [u8; 16] = rand::rng().random();
-    hex::encode(&bytes)
-}
-
-/// Minimal percent-encoding for URL query values.
-fn urlencoded(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push('%');
-                out.push(char::from(b"0123456789ABCDEF"[(b >> 4) as usize]));
-                out.push(char::from(b"0123456789ABCDEF"[(b & 0x0F) as usize]));
-            }
-        }
-    }
-    out
-}
-
-/// Parse `code` and `state` from the OAuth callback URL query string.
-fn parse_callback_params(url: &str) -> Result<(String, String)> {
-    let query = url.split_once('?').map_or("", |(_, q)| q);
-
-    let mut code = None;
-    let mut state = None;
-
-    for pair in query.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            match key {
-                "code" => code = Some(value.to_string()),
-                "state" => state = Some(value.to_string()),
-                _ => {}
-            }
-        }
-    }
-
-    let code = code.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Authorization callback missing 'code' parameter.\n\
-         The authorization may have been denied. Run `do-next auth` to try again."
-        )
-    })?;
-    let state =
-        state.ok_or_else(|| anyhow::anyhow!("Authorization callback missing 'state' parameter"))?;
-
-    Ok((code, state))
-}
-
-/// Encode bytes as hexadecimal string.
-mod hex {
-    pub fn encode(bytes: &[u8]) -> String {
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for &b in bytes {
-            s.push(char::from(b"0123456789abcdef"[(b >> 4) as usize]));
-            s.push(char::from(b"0123456789abcdef"[(b & 0x0F) as usize]));
-        }
-        s
-    }
 }

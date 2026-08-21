@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::process::Command;
 
 use crate::config::types::{JiraConfig, ResolvedGitlab, ResolvedGrafana};
+use crate::gitlab::auth::GitlabAuth;
 use crate::jira::auth::{Auth, BasicCredentials};
 use crate::jira::oauth;
 
@@ -205,6 +206,76 @@ pub fn resolve_gitlab_token(gitlab: &ResolvedGitlab) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Resolve GitLab authentication for a team's merge-request sources.
+///
+/// `Ok(None)` means nothing is configured anywhere (the caller may offer
+/// interactive setup); `Err` is a hard failure (locked keyring, failing
+/// command, expired OAuth session).
+///
+/// An explicit `DO_NEXT_GITLAB_TOKEN` wins over everything, *including* an
+/// `auth_method: "oauth"` config. That variable holds a personal access token,
+/// which must go out as `PRIVATE-TOKEN`; deciding the header from a config flag
+/// while taking the token from the environment is what made `glab` send PATs
+/// under a `Bearer` header (gitlab-org/cli#8482). Here the token and the
+/// knowledge of what kind of token it is always travel together.
+pub fn resolve_gitlab_auth(gitlab: &ResolvedGitlab) -> Result<Option<GitlabAuth>> {
+    match gitlab_auth_source(
+        std::env::var("DO_NEXT_GITLAB_TOKEN").ok(),
+        gitlab.uses_oauth(),
+    ) {
+        GitlabAuthSource::EnvToken(token) => {
+            log::debug!("credentials: using DO_NEXT_GITLAB_TOKEN env var");
+            Ok(Some(GitlabAuth::Token(token)))
+        }
+        GitlabAuthSource::Oauth => resolve_gitlab_oauth(gitlab),
+        GitlabAuthSource::StoredToken => Ok(resolve_gitlab_token(gitlab)?.map(GitlabAuth::Token)),
+    }
+}
+
+/// Which GitLab credential source wins.
+#[derive(Debug, PartialEq, Eq)]
+enum GitlabAuthSource {
+    /// A personal access token from the environment.
+    EnvToken(String),
+    /// Stored OAuth credentials for the instance.
+    Oauth,
+    /// A personal access token from the command/keyring/file chain.
+    StoredToken,
+}
+
+/// Decide the credential source. Pure, so the precedence rule is testable
+/// without mutating the process environment.
+fn gitlab_auth_source(env_token: Option<String>, uses_oauth: bool) -> GitlabAuthSource {
+    // An empty variable is someone unsetting it awkwardly, not a token.
+    if let Some(token) = env_token.filter(|t| !t.is_empty()) {
+        return GitlabAuthSource::EnvToken(token);
+    }
+    if uses_oauth {
+        return GitlabAuthSource::Oauth;
+    }
+    GitlabAuthSource::StoredToken
+}
+
+/// Load stored OAuth credentials for one instance.
+///
+/// The config's client id/secret override whatever the stored tokens were
+/// minted with, so a rotated company app heals token refresh without a manual
+/// re-auth — the same trick [`resolve_oauth`] plays for Jira.
+fn resolve_gitlab_oauth(gitlab: &ResolvedGitlab) -> Result<Option<GitlabAuth>> {
+    // No stored tokens is "not set up yet", not a failure: the caller offers
+    // an interactive sign-in, exactly as it does for a missing token.
+    let Some(mut creds) = crate::gitlab::oauth::load_oauth_tokens(&gitlab.base_url)? else {
+        return Ok(None);
+    };
+    if let Some(id) = &gitlab.oauth_client_id {
+        creds.client_id.clone_from(id);
+    }
+    if gitlab.oauth_client_secret.is_some() {
+        creds.client_secret.clone_from(&gitlab.oauth_client_secret);
+    }
+    Ok(Some(GitlabAuth::OAuth(creds)))
+}
+
 /// Path of the shared credentials file (`~/.config/do-next/credentials.json5`).
 pub fn credentials_file_path() -> Result<std::path::PathBuf> {
     Ok(dirs::config_dir()
@@ -363,6 +434,44 @@ fn read_credentials_file() -> Result<Option<CredentialsFile>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_env_token_wins_over_an_oauth_config() {
+        // DO_NEXT_GITLAB_TOKEN holds a personal access token, which must go out
+        // as PRIVATE-TOKEN. Taking the token from the environment while letting
+        // a config flag decide the header is exactly how `glab` ended up
+        // sending PATs as bearer tokens (gitlab-org/cli#8482).
+        assert_eq!(
+            gitlab_auth_source(Some("glpat-xyz".into()), true),
+            GitlabAuthSource::EnvToken("glpat-xyz".into())
+        );
+        assert_eq!(
+            gitlab_auth_source(Some("glpat-xyz".into()), false),
+            GitlabAuthSource::EnvToken("glpat-xyz".into())
+        );
+    }
+
+    #[test]
+    fn without_an_env_token_the_config_picks_the_source() {
+        assert_eq!(gitlab_auth_source(None, true), GitlabAuthSource::Oauth);
+        assert_eq!(
+            gitlab_auth_source(None, false),
+            GitlabAuthSource::StoredToken
+        );
+    }
+
+    #[test]
+    fn an_empty_env_token_is_not_a_token() {
+        // `DO_NEXT_GITLAB_TOKEN=` must not shadow a working configuration.
+        assert_eq!(
+            gitlab_auth_source(Some(String::new()), true),
+            GitlabAuthSource::Oauth
+        );
+        assert_eq!(
+            gitlab_auth_source(Some(String::new()), false),
+            GitlabAuthSource::StoredToken
+        );
+    }
 
     #[test]
     fn credentials_file_parses_every_token_section() {

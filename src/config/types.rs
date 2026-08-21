@@ -841,6 +841,16 @@ pub struct GitlabConfig {
     pub credential_store: Option<String>,
     /// Key label for keyring lookup (defaults to `base_url`).
     pub credential_key: Option<String>,
+    /// How to authenticate: "token" (default) or "oauth".
+    pub auth_method: Option<String>,
+    /// OAuth application id. Not a secret — a GitLab app registered as
+    /// non-confidential has no client secret at all — so this belongs with the
+    /// other connection settings and is safe to share through a company
+    /// manifest.
+    pub oauth_client_id: Option<String>,
+    /// Only needed for a confidential app, which the browser flows cannot use;
+    /// present so an instance that insists on one is still reachable.
+    pub oauth_client_secret: Option<String>,
 }
 
 /// The instance used when nothing configures a `base_url`.
@@ -853,6 +863,17 @@ pub struct ResolvedGitlab {
     pub credential_command: Option<String>,
     pub credential_store: Option<String>,
     pub credential_key: Option<String>,
+    pub auth_method: Option<String>,
+    pub oauth_client_id: Option<String>,
+    pub oauth_client_secret: Option<String>,
+}
+
+impl ResolvedGitlab {
+    /// True when this instance is set up for OAuth rather than a personal
+    /// access token.
+    pub fn uses_oauth(&self) -> bool {
+        self.auth_method.as_deref() == Some("oauth")
+    }
 }
 
 impl Default for ResolvedGitlab {
@@ -862,6 +883,9 @@ impl Default for ResolvedGitlab {
             credential_command: None,
             credential_store: None,
             credential_key: None,
+            auth_method: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
         }
     }
 }

@@ -85,7 +85,11 @@ fn report_offline(loaded: &config::LoadedConfig) -> usize {
             );
         }
         if team.uses_gitlab() {
-            println!("  gitlab:     {}", team.gitlab.base_url);
+            println!(
+                "  gitlab:     {} ({})",
+                team.gitlab.base_url,
+                team.gitlab.auth_method.as_deref().unwrap_or("token")
+            );
         }
         if let Some(grafana) = &team.grafana {
             println!(
