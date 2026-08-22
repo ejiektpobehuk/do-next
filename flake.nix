@@ -44,11 +44,15 @@
       {
         checks = {
           fmt = craneLib.cargoFmt { inherit src; };
+          # The lint set lives in Cargo.toml's [lints] table; `deny` applies to
+          # local packages only, so dependency warnings stay non-fatal and the
+          # shared build cache is not invalidated.
           clippy = craneLib.cargoClippy (
             commonArgs
             // {
               inherit cargoArtifacts;
-              cargoClippyExtraArgs = "-- -W clippy::pedantic -W clippy::nursery -W clippy::unwrap_used";
+              cargoClippyExtraArgs = "";
+              CARGO_BUILD_WARNINGS = "deny";
             }
           );
           test = craneLib.cargoTest (

@@ -19,13 +19,17 @@ check:
 test:
     {{wrap}}cargo test
 
-# Run clippy with this project's strict lint set
+# Run clippy with this project's strict lint set (see [lints] in Cargo.toml)
 lint:
-    {{wrap}}cargo clippy -- -W clippy::pedantic -W clippy::nursery -W clippy::unwrap_used
+    {{wrap}}cargo clippy
+
+# Same lints, but any warning fails — what `nix flake check` enforces
+lint-strict:
+    {{wrap}}env CARGO_BUILD_WARNINGS=deny cargo clippy
 
 # Auto-apply clippy fixes (allows a dirty working tree)
 lint-fix:
-    {{wrap}}cargo clippy --allow-dirty --fix -- -W clippy::pedantic -W clippy::nursery -W clippy::unwrap_used
+    {{wrap}}cargo clippy --allow-dirty --fix
 
 # Format Rust code
 fmt:
