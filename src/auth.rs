@@ -1075,6 +1075,7 @@ mod tests {
     use crate::config::types::{
         OnDutyMode, ResolvedGitlab, ScheduleSelector, SourceConfig, StandupFilters, TeamConfig,
     };
+    use std::assert_matches;
 
     /// A Grafana connection with only the credential-relevant fields set.
     /// `ResolvedGrafana` has no `Default` — `ScheduleSelector` has none.
@@ -1428,15 +1429,12 @@ mod tests {
             KeyringProbe::Found,
             false,
         );
-        assert!(
-            matches!(
-                with_env,
-                CredentialState::Present {
-                    store: Store::Env("DO_NEXT_GITLAB_TOKEN"),
-                    ..
-                }
-            ),
-            "got {with_env:?}"
+        assert_matches!(
+            with_env,
+            CredentialState::Present {
+                store: Store::Env("DO_NEXT_GITLAB_TOKEN"),
+                ..
+            }
         );
     }
 

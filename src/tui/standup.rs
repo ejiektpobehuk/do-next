@@ -279,6 +279,7 @@ mod tests {
     use crate::datetime::TzSpec;
     use crate::standup::types::{Backend, EntryKind};
     use chrono::{DateTime, FixedOffset, TimeZone, Utc};
+    use std::assert_matches;
 
     fn tz() -> TzSpec {
         TzSpec::Fixed(FixedOffset::east_opt(0).expect("valid"))
@@ -317,10 +318,10 @@ mod tests {
         let days = group::by_day(&refs, tz());
         let rows = rows(&days);
 
-        assert!(matches!(rows[0], Row::Day { entries: 2, .. }));
-        assert!(matches!(rows[1], Row::Item(_)));
-        assert!(matches!(rows[2], Row::Entry { idx: 0, .. }));
-        assert!(matches!(rows[3], Row::Entry { idx: 1, .. }));
+        assert_matches!(rows[0], Row::Day { entries: 2, .. });
+        assert_matches!(rows[1], Row::Item(_));
+        assert_matches!(rows[2], Row::Entry { idx: 0, .. });
+        assert_matches!(rows[3], Row::Entry { idx: 1, .. });
         assert_eq!(rows.len(), 4);
     }
 

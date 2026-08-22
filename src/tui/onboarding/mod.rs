@@ -501,6 +501,7 @@ const TEAM_SETUP_DESCRIPTIONS: [&str; TEAM_SETUP_COUNT] = [
 
 /// Interactive prompt when config exists but has no teams.
 /// Adds at least one team to the config and returns the updated `LoadedConfig`.
+#[allow(clippy::too_many_lines)]
 pub fn run_team_setup(config: &mut Config) -> Result<LoadedConfig> {
     println!("No teams configured. Let's set one up.\n");
 
@@ -816,9 +817,8 @@ fn probe_credential_status(jira: &AtlassianConfig) -> CredentialStatus {
     );
 
     let keyring_key = jira.credential_key.as_deref().unwrap_or(&jira.base_url);
-    let keyring_found = keyring::Entry::new("do-next", keyring_key)
-        .map(|e| e.get_password().is_ok())
-        .unwrap_or(false);
+    let keyring_found =
+        keyring::Entry::new("do-next", keyring_key).is_ok_and(|e| e.get_password().is_ok());
 
     CredentialStatus {
         env_set,

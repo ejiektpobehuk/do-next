@@ -397,6 +397,7 @@ pub struct BoardScroll {
 
 /// Render the kanban board over the full main area: an info header line,
 /// then swimlane bands stacked vertically, each a row of bordered columns.
+#[allow(clippy::too_many_lines)]
 pub fn render_board(
     f: &mut Frame,
     area: Rect,

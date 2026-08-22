@@ -1991,7 +1991,7 @@ fn apply_search_jira_result(
                     hits.push(hit);
                 }
             }
-            hits.sort_by(|a, b| b.score.cmp(&a.score));
+            hits.sort_by_key(|h| std::cmp::Reverse(h.score));
             *jira_state = JiraSearchState::Loaded { hits, issues };
             let total = local_results.len()
                 + match jira_state {
@@ -3291,6 +3291,7 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
     // `gg` motion: first `g` arms the latch; a second `g` fires jump-to-first.
     // Any other key clears the latch (handled at the end of each arm via the default clear below).
@@ -6076,6 +6077,7 @@ pub fn compute_completions_for(path: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::jira::types::{IssueFields, IssueTypeField, ProjectField, StatusField};
+    use std::assert_matches;
 
     fn make_item(key: &str, status: &str, source_id: Option<&str>) -> WorkItem {
         WorkItem::Jira(make_issue(key, status, source_id))
@@ -6501,14 +6503,10 @@ mod tests {
         assert!(app.resolved_teams[0].on_duty);
         let keys: Vec<&str> = app.sources.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["incidents", "mine"], "duty sources go on top");
-        assert!(
-            matches!(app.sources.get("mine"), Some(SourceState::Loaded(items)) if items.len() == 1),
+        assert_matches!(app.sources.get("mine"), Some(SourceState::Loaded(items)) if items.len() == 1,
             "normal source keeps its loaded items"
         );
-        assert!(matches!(
-            app.sources.get("incidents"),
-            Some(SourceState::Pending)
-        ));
+        assert_matches!(app.sources.get("incidents"), Some(SourceState::Pending));
         assert_eq!(app.pending_duty_fetch, vec!["incidents".to_string()]);
         assert!(
             !app.flags.pending_team_fetch,
@@ -6520,10 +6518,7 @@ mod tests {
         assert!(!app.resolved_teams[0].on_duty);
         let keys: Vec<&str> = app.sources.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["mine"]);
-        assert!(matches!(
-            app.sources.get("mine"),
-            Some(SourceState::Loaded(_))
-        ));
+        assert_matches!(app.sources.get("mine"), Some(SourceState::Loaded(_)));
         assert!(
             app.pending_duty_fetch.is_empty(),
             "queued duty fetch is cancelled"
@@ -6546,10 +6541,7 @@ mod tests {
         assert!(app.resolved_teams[0].on_duty);
         let keys: Vec<&str> = app.sources.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["incidents"]);
-        assert!(matches!(
-            app.sources.get("incidents"),
-            Some(SourceState::Pending)
-        ));
+        assert_matches!(app.sources.get("incidents"), Some(SourceState::Pending));
         assert!(app.pending_duty_fetch.is_empty());
         assert!(
             app.flags.pending_team_fetch,
@@ -6807,14 +6799,8 @@ mod tests {
             .get(&0)
             .expect("the team we left is parked");
 
-        assert!(matches!(
-            saved.sources.get("mine"),
-            Some(SourceState::Loading)
-        ));
-        assert!(matches!(
-            saved.board_lanes.get("inc"),
-            Some(LanesState::Loading)
-        ));
+        assert_matches!(saved.sources.get("mine"), Some(SourceState::Loading));
+        assert_matches!(saved.board_lanes.get("inc"), Some(LanesState::Loading));
         assert!(
             app.tab_loading(0, None) && app.tab_loading(0, Some("inc")),
             "a background tab goes on spinning for what it is still waiting on"
@@ -6865,14 +6851,11 @@ mod tests {
 
         app.switch_team(0);
 
-        assert!(matches!(
+        assert_matches!(
             app.sources.get("mine"),
             Some(SourceState::Loaded(items)) if items.len() == 1
-        ));
-        assert!(matches!(
-            app.board_lanes.get("inc"),
-            Some(LanesState::Loaded(_))
-        ));
+        );
+        assert_matches!(app.board_lanes.get("inc"), Some(LanesState::Loaded(_)));
         assert!(
             !app.flags.pending_team_fetch,
             "the delivered fetch is not repeated on return"
@@ -6892,10 +6875,7 @@ mod tests {
         app.switch_team(0);
 
         assert!(app.flags.pending_team_fetch);
-        assert!(matches!(
-            app.sources.get("mine"),
-            Some(SourceState::Loading)
-        ));
+        assert_matches!(app.sources.get("mine"), Some(SourceState::Loading));
     }
 
     /// A stamped event for the tab still on screen takes the ordinary path,
@@ -6916,10 +6896,7 @@ mod tests {
             },
         );
 
-        assert!(matches!(
-            app.sources.get("mine"),
-            Some(SourceState::Loaded(_))
-        ));
+        assert_matches!(app.sources.get("mine"), Some(SourceState::Loaded(_)));
         assert_eq!(app.issues.len(), 1);
     }
 
@@ -7122,7 +7099,7 @@ mod tests {
         let mut app = search_app();
         app.action_state = searching_state(vec![ranked_hit("M-1")], JiraSearchState::Idle, 5);
         commit_search_selection(&mut app);
-        assert!(matches!(app.action_state, ActionState::Searching { .. }));
+        assert_matches!(app.action_state, ActionState::Searching { .. });
         assert!(app.saved_search.is_none());
     }
 
@@ -7306,7 +7283,7 @@ mod tests {
         let flat: Vec<&str> = app.issues.iter().map(WorkItem::key).collect();
         assert_eq!(flat, ["B-1", "B-2"]);
         assert!(app.nav_idx < app.nav_items.len());
-        assert!(matches!(app.action_state, ActionState::None));
+        assert_matches!(app.action_state, ActionState::None);
     }
 
     #[test]
@@ -7336,11 +7313,11 @@ mod tests {
     fn sprints_loaded_explains_kanban_and_empty_boards() {
         let mut app = backlog_app();
         apply_sprints_loaded(&mut app, "B-1".into(), None);
-        assert!(matches!(app.action_state, ActionState::Error { .. }));
+        assert_matches!(app.action_state, ActionState::Error { .. });
 
         app.action_state = ActionState::None;
         apply_sprints_loaded(&mut app, "B-1".into(), Some(Vec::new()));
-        assert!(matches!(app.action_state, ActionState::Error { .. }));
+        assert_matches!(app.action_state, ActionState::Error { .. });
     }
 
     #[test]
@@ -7396,7 +7373,7 @@ mod tests {
 
         // Flat list updated, source state untouched (still Loading).
         assert_eq!(item_status(&issues[0]), "Done");
-        assert!(matches!(sources.get(src), Some(SourceState::Loading)));
+        assert_matches!(sources.get(src), Some(SourceState::Loading));
     }
 
     #[test]
@@ -7432,7 +7409,7 @@ mod tests {
             },
             anyhow::anyhow!("boom"),
         );
-        assert!(matches!(state, ActionState::Error { .. }));
+        assert_matches!(state, ActionState::Error { .. });
     }
 
     fn app_for_keys() -> AppState {

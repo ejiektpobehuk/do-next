@@ -212,10 +212,8 @@ pub fn handle_date_key(picker: &mut DatetimePicker, code: crossterm::event::KeyC
             advance_month(picker);
             picker.clamp_day();
         }
-        KeyCode::Char('t') | KeyCode::Tab => {
-            if !picker.date_only {
-                picker.mode = DatetimePickerMode::Time;
-            }
+        KeyCode::Char('t') | KeyCode::Tab if !picker.date_only => {
+            picker.mode = DatetimePickerMode::Time;
         }
         _ => {}
     }

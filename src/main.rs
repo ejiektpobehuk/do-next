@@ -1,3 +1,7 @@
+// `unwrap()` in a test is the assertion; the strict set in Cargo.toml is
+// aimed at the shipped binary, not at test scaffolding.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 mod atlassian;
 mod auth;
 mod config;

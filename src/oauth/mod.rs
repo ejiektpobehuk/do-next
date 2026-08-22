@@ -269,16 +269,16 @@ fn percent_decode(s: &str) -> String {
                 out.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
-                if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    out.push(byte);
-                    i += 3;
-                } else {
-                    // Not a real escape — keep the '%' as written.
-                    out.push(bytes[i]);
-                    i += 1;
-                }
+            // Only a well-formed `%XX` is an escape; anything else falls through
+            // to the default arm, which keeps the '%' as written.
+            b'%' if i + 2 < bytes.len()
+                && let Ok(byte) = u8::from_str_radix(
+                    std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                    16,
+                ) =>
+            {
+                out.push(byte);
+                i += 3;
             }
             other => {
                 out.push(other);
@@ -339,6 +339,17 @@ mod tests {
         assert_eq!(percent_encode("read_api openid"), "read_api%20openid");
         // The unreserved set survives untouched.
         assert_eq!(percent_encode("aZ09-_.~"), "aZ09-_.~");
+    }
+
+    #[test]
+    fn a_malformed_escape_decodes_to_itself() {
+        // Not hex, and truncated: both keep the '%' as written rather than
+        // swallowing the bytes that follow it.
+        assert_eq!(percent_decode("a%ZZb"), "a%ZZb");
+        assert_eq!(percent_decode("done%4"), "done%4");
+        assert_eq!(percent_decode("100%"), "100%");
+        // Well-formed escapes and '+' still decode.
+        assert_eq!(percent_decode("a+b%20c%3Ad"), "a b c:d");
     }
 
     #[test]

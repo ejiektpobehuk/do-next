@@ -429,6 +429,7 @@ mod tests {
         ProjectField, StatusField,
     };
     use chrono::TimeZone;
+    use std::assert_matches;
     use std::collections::HashMap;
 
     const ME: &str = "557058:me";
@@ -631,7 +632,7 @@ mod tests {
         });
         let got = entries_from_issue(&i, ME, &window(), "https://jira.test");
         assert_eq!(got.len(), 2);
-        assert!(matches!(got[0].kind, EntryKind::FieldChange { .. }));
+        assert_matches!(got[0].kind, EntryKind::FieldChange { .. });
         assert_eq!(got[1].detail, "Story Points: 5");
     }
 
@@ -730,7 +731,7 @@ mod tests {
         });
         let got = entries_from_issue(&i, ME, &window(), "https://jira.test");
         assert_eq!(got.len(), 1);
-        assert!(matches!(got[0].kind, EntryKind::Comment { .. }));
+        assert_matches!(got[0].kind, EntryKind::Comment { .. });
     }
 
     // ── Worklogs ─────────────────────────────────────────────────────────────

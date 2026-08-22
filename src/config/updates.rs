@@ -253,6 +253,7 @@ fn git_rev_parse(repo_path: &Path, rev: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn fetched(behind: u32) -> UpdateStatus {
         UpdateStatus {
@@ -378,9 +379,10 @@ mod tests {
         let timeout = Duration::from_secs(2);
         let started = Instant::now();
         let freshness = fetch(dir.path(), timeout);
-        assert!(
-            matches!(freshness, Freshness::Unreachable(_)),
-            "expected an unreachable verdict, got {freshness:?}"
+        assert_matches!(
+            freshness,
+            Freshness::Unreachable(_),
+            "expected an unreachable verdict"
         );
         assert!(
             started.elapsed() < timeout * 3,

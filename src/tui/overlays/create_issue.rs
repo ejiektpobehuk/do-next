@@ -3469,6 +3469,7 @@ fn project_picker_hints_line(searching: bool) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn schema(ty: &str) -> Value {
         json!({ "type": ty })
@@ -4136,10 +4137,7 @@ mod tests {
         );
         // Only the reporter: other user fields stay for Jira to default.
         let assignee = form.fields.iter().find(|f| f.field_id == "assignee");
-        assert!(matches!(
-            assignee.map(|f| &f.value),
-            Some(FieldValue::User(None))
-        ));
+        assert_matches!(assignee.map(|f| &f.value), Some(FieldValue::User(None)));
     }
 
     #[test]
@@ -4233,7 +4231,7 @@ mod tests {
     fn epic_starts_unset_and_is_omitted_from_the_payload() {
         let form = epic_form("parent", parent_schema());
         assert_eq!(form.fields[0].widget, WidgetKind::Epic);
-        assert!(matches!(form.fields[0].value, FieldValue::Epic(None)));
+        assert_matches!(form.fields[0].value, FieldValue::Epic(None));
         let payload = build_create_payload(&form).expect("valid");
         assert!(payload["fields"].get("parent").is_none());
     }
@@ -4274,7 +4272,7 @@ mod tests {
         let mut form = epic_form("parent", parent_schema());
         form.focus = 2;
         activate_field(&mut form);
-        assert!(matches!(form.picker, Some(CreatePicker::Epic { .. })));
+        assert_matches!(form.picker, Some(CreatePicker::Epic { .. }));
         assert!(form.epic_search.is_some(), "opening asks for the epics");
 
         // The search lands, and the second row (first match) is chosen.
@@ -4292,10 +4290,10 @@ mod tests {
             form.epic_search.is_none(),
             "matches do not outlive the picker"
         );
-        assert!(matches!(
+        assert_matches!(
             &form.fields[0].value,
             FieldValue::Epic(Some(e)) if e.key == "PROJ-7"
-        ));
+        );
         assert!(form_is_dirty(&form), "a chosen epic is unsaved work");
 
         // Reopen and take the unset row: back to letting Jira decide.
@@ -4303,7 +4301,7 @@ mod tests {
         activate_field(&mut form);
         let picker = form.picker.take().expect("open");
         handle_epic_picker_key(&mut form, KeyCode::Enter, picker);
-        assert!(matches!(form.fields[0].value, FieldValue::Epic(None)));
+        assert_matches!(form.fields[0].value, FieldValue::Epic(None));
     }
 
     // ── Linked issues ──────────────────────────────────────────────────────
@@ -4370,10 +4368,10 @@ mod tests {
     fn issuelinks_field_is_a_link_widget_starting_empty() {
         let form = links_form();
         assert_eq!(form.fields[0].widget, WidgetKind::IssueLinks);
-        assert!(matches!(
+        assert_matches!(
             form.fields[0].value,
             FieldValue::IssueLinks(ref l) if l.is_empty()
-        ));
+        );
         // Nothing added → no `update` block at all, not an empty one.
         let payload = build_create_payload(&form).expect("valid");
         assert!(payload.get("update").is_none());
@@ -4448,11 +4446,11 @@ mod tests {
         let mut form = links_form();
         form.focus = 2;
         activate_field(&mut form);
-        assert!(matches!(form.picker, Some(CreatePicker::IssueLinks { .. })));
+        assert_matches!(form.picker, Some(CreatePicker::IssueLinks { .. }));
 
         // Enter on the list opens the relation chooser.
         press_links(&mut form, KeyCode::Enter);
-        assert!(matches!(form.picker, Some(CreatePicker::LinkType { .. })));
+        assert_matches!(form.picker, Some(CreatePicker::LinkType { .. }));
         assert!(
             !form.needs_link_types_fetch,
             "already-loaded relations are not refetched"
@@ -4461,10 +4459,10 @@ mod tests {
         // Second relation ("is blocked by") opens the issue chooser.
         press_link_type(&mut form, KeyCode::Char('j'));
         press_link_type(&mut form, KeyCode::Enter);
-        assert!(matches!(
+        assert_matches!(
             form.picker,
             Some(CreatePicker::LinkIssue { ref link_type, .. }) if link_type.label == "is blocked by"
-        ));
+        );
         assert!(form.link_search.is_some(), "opening asks for candidates");
 
         // The search lands and its first match is taken.
@@ -4475,13 +4473,10 @@ mod tests {
         let picker = form.picker.take().expect("open");
         handle_link_issue_picker_key(&mut form, KeyCode::Enter, picker);
 
-        assert!(
-            matches!(
-                form.picker,
-                Some(CreatePicker::IssueLinks { cursor: 0, .. })
-            ),
-            "back on the list, cursor on the new link: {:?}",
-            form.picker
+        assert_matches!(
+            form.picker,
+            Some(CreatePicker::IssueLinks { cursor: 0, .. }),
+            "back on the list, cursor on the new link"
         );
         assert!(
             form.link_search.is_none(),
@@ -4506,13 +4501,10 @@ mod tests {
             panic!("still a links field");
         };
         assert_eq!(links.len(), 1, "Jira would reject the duplicate operation");
-        assert!(
-            matches!(
-                form.picker,
-                Some(CreatePicker::IssueLinks { cursor: 0, .. })
-            ),
-            "the cursor lands on the existing row: {:?}",
-            form.picker
+        assert_matches!(
+            form.picker,
+            Some(CreatePicker::IssueLinks { cursor: 0, .. }),
+            "the cursor lands on the existing row"
         );
     }
 
@@ -4530,13 +4522,10 @@ mod tests {
         };
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].issue.key, "OPS-1");
-        assert!(
-            matches!(
-                form.picker,
-                Some(CreatePicker::IssueLinks { cursor: 1, .. })
-            ),
-            "cursor clamps to a row that still exists — here the add row: {:?}",
-            form.picker
+        assert_matches!(
+            form.picker,
+            Some(CreatePicker::IssueLinks { cursor: 1, .. }),
+            "cursor clamps to a row that still exists — here the add row"
         );
 
         // `d` on the add row removes nothing.
@@ -4557,13 +4546,10 @@ mod tests {
 
         // Cursor is on the existing link, where Enter would edit it.
         press_links(&mut form, KeyCode::Char('n'));
-        assert!(
-            matches!(
-                form.picker,
-                Some(CreatePicker::LinkType { editing: None, .. })
-            ),
-            "n adds rather than edits: {:?}",
-            form.picker
+        assert_matches!(
+            form.picker,
+            Some(CreatePicker::LinkType { editing: None, .. }),
+            "n adds rather than edits"
         );
     }
 
@@ -4576,17 +4562,14 @@ mod tests {
         add_link(&mut form, 0, choices[1].clone(), issue("OPS-1")); // is blocked by
 
         press_links(&mut form, KeyCode::Enter);
-        assert!(
-            matches!(
-                form.picker,
-                Some(CreatePicker::LinkType {
-                    editing: Some(0),
-                    cursor: 1,
-                    ..
-                })
-            ),
-            "starts on the relation the link already has: {:?}",
-            form.picker
+        assert_matches!(
+            form.picker,
+            Some(CreatePicker::LinkType {
+                editing: Some(0),
+                cursor: 1,
+                ..
+            }),
+            "starts on the relation the link already has"
         );
 
         // Up one row: "blocks".
@@ -4598,13 +4581,10 @@ mod tests {
         assert_eq!(links[0].link_type.label, "blocks");
         assert_eq!(links[0].link_type.direction, LinkDirection::Outward);
         assert_eq!(links[0].issue.key, "OPS-1", "the issue is untouched");
-        assert!(
-            matches!(
-                form.picker,
-                Some(CreatePicker::IssueLinks { cursor: 0, .. })
-            ),
-            "back on the list, on the link just edited: {:?}",
-            form.picker
+        assert_matches!(
+            form.picker,
+            Some(CreatePicker::IssueLinks { cursor: 0, .. }),
+            "back on the list, on the link just edited"
         );
     }
 
@@ -4620,17 +4600,14 @@ mod tests {
         // Issue chooser → relation chooser → list → form.
         let picker = form.picker.take().expect("open");
         handle_link_issue_picker_key(&mut form, KeyCode::Char('q'), picker);
-        assert!(matches!(form.picker, Some(CreatePicker::LinkType { .. })));
+        assert_matches!(form.picker, Some(CreatePicker::LinkType { .. }));
         assert!(form.link_search.is_none(), "the search is abandoned too");
 
         press_link_type(&mut form, KeyCode::Char('q'));
-        assert!(
-            matches!(
-                form.picker,
-                Some(CreatePicker::IssueLinks { cursor: 0, .. })
-            ),
-            "back on the add row the walk started from: {:?}",
-            form.picker
+        assert_matches!(
+            form.picker,
+            Some(CreatePicker::IssueLinks { cursor: 0, .. }),
+            "back on the add row the walk started from"
         );
 
         press_links(&mut form, KeyCode::Char('q'));
@@ -4653,17 +4630,13 @@ mod tests {
 
         let picker = form.picker.take().expect("open");
         handle_link_issue_picker_key(&mut form, KeyCode::Char('q'), picker);
-        assert!(
-            matches!(
-                form.picker,
-                Some(CreatePicker::LinkType {
-                    editing: None,
-                    cursor: 2,
-                    ..
-                })
-            ),
-            "{:?}",
-            form.picker
+        assert_matches!(
+            form.picker,
+            Some(CreatePicker::LinkType {
+                editing: None,
+                cursor: 2,
+                ..
+            })
         );
     }
 
@@ -4673,7 +4646,7 @@ mod tests {
         form.link_types = CacheState::Idle;
         open_link_type_picker(&mut form, 0, None);
         assert!(form.needs_link_types_fetch);
-        assert!(matches!(form.link_types, CacheState::Loading));
+        assert_matches!(form.link_types, CacheState::Loading);
 
         // The dispatcher takes the flag; reopening while loading must not refetch.
         form.needs_link_types_fetch = false;
@@ -5484,7 +5457,7 @@ mod tests {
         form.focus = 2;
         activate_field(&mut form);
         assert!(form.needs_labels_fetch, "opening asks for the vocabulary");
-        assert!(matches!(form.labels, CacheState::Loading));
+        assert_matches!(form.labels, CacheState::Loading);
 
         // The dispatcher takes the request, and the fetch lands.
         form.needs_labels_fetch = false;

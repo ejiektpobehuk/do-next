@@ -209,6 +209,8 @@ fn pick_teams(
     manifest: &CompanyManifest,
     preselected: &[CompanyTeamSelection],
 ) -> Result<Vec<(CompanyTeamSelection, TeamConfig)>> {
+    const BACKLOG_LABEL: &str = "backlog";
+
     if manifest.teams.is_empty() {
         bail!(
             "the company manifest has no teams in its catalog — \
@@ -216,7 +218,6 @@ fn pick_teams(
         );
     }
 
-    const BACKLOG_LABEL: &str = "backlog";
     let label_width = manifest
         .teams
         .iter()
