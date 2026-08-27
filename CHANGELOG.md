@@ -24,6 +24,8 @@ All notable changes to `do-next` are documented here.
 - GitLab oauth sign-in: **Web** and **Device** for headless sessions.
 - `do-next auth` is now a menu of integrations
 - Shared views in a company config
+- Vim-style paging: `Ctrl+d`/`Ctrl+u` scroll a page down/up everywhere
+  `PgDn`/`PgUp` do — detail panel, board, standup timeline and popups
 
 ### Renames
 

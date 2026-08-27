@@ -3169,8 +3169,32 @@ fn start_attachment_delete(app: &mut AppState) {
 }
 
 #[allow(clippy::too_many_lines)]
+/// Vim-style paging: rewrite `Ctrl+d`/`Ctrl+u` into `PageDown`/`PageUp`
+/// before dispatch, so every view and popup that pages answers the chords
+/// too — no per-handler wiring, and handlers that bail on control chords
+/// (board, standup) see a plain Page key.
+fn normalize_paging_chords(mut event: crossterm::event::Event) -> crossterm::event::Event {
+    if let crossterm::event::Event::Key(ref mut key) = event
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        let page = match key.code {
+            KeyCode::Char('d') => Some(KeyCode::PageDown),
+            KeyCode::Char('u') => Some(KeyCode::PageUp),
+            _ => None,
+        };
+        if let Some(code) = page {
+            key.code = code;
+            key.modifiers.remove(KeyModifiers::CONTROL);
+        }
+    }
+    event
+}
+
+#[allow(clippy::too_many_lines)]
 fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
     use crossterm::event::{Event, KeyEvent};
+
+    let event = normalize_paging_chords(event);
 
     // Sub-view overlay captures all input
     if app.overlay.is_some() {
@@ -6472,6 +6496,30 @@ mod tests {
         key_jump_first(&mut app);
         assert_eq!(app.detail_scroll, 0);
         assert_eq!(app.detail_focus, DetailFocus::Comments);
+    }
+
+    /// `Ctrl+d`/`Ctrl+u` are the vim spellings of `PageDown`/`PageUp`: the
+    /// chord is rewritten before dispatch, so it pages the same fixed jump
+    /// with the same end-of-page clamp.
+    #[test]
+    fn ctrl_d_and_ctrl_u_page_like_pagedown_and_pageup() {
+        use crossterm::event::{Event, KeyEvent};
+
+        let chord = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        let (mut app, _) = detail_app();
+        let max_scroll = app.last_detail_content_h - DETAIL_VIEWPORT;
+
+        handle_input(&mut app, chord('d'));
+        assert_eq!(app.detail_scroll, 10);
+
+        // Paging past the end clamps exactly as PageDown does.
+        for _ in 0..10 {
+            handle_input(&mut app, chord('d'));
+        }
+        assert_eq!(app.detail_scroll, max_scroll);
+
+        handle_input(&mut app, chord('u'));
+        assert_eq!(app.detail_scroll, max_scroll - 10);
     }
 
     /// Before the first frame there is no measured geometry, so navigation has
