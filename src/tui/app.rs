@@ -2686,10 +2686,10 @@ fn handle_overlay_input(app: &mut AppState, event: &crossterm::event::Event) {
             }
         }
         (KeyCode::PageDown, _) => {
-            app.overlay_scroll = app.overlay_scroll.saturating_add(10);
+            app.overlay_scroll = app.overlay_scroll.saturating_add(PAGE_LINES);
         }
         (KeyCode::PageUp, _) => {
-            app.overlay_scroll = app.overlay_scroll.saturating_sub(10);
+            app.overlay_scroll = app.overlay_scroll.saturating_sub(PAGE_LINES);
         }
         // Comment actions (only in comments overlay)
         (KeyCode::Char('n'), _) if is_comments => {
@@ -2871,12 +2871,8 @@ fn handle_comment_edit_confirm_input(
         (KeyCode::Down | KeyCode::Char('j'), _) => {
             *scroll = scroll.saturating_add(1).min(max_scroll);
         }
-        (KeyCode::PageUp, _) => {
-            *scroll = scroll.saturating_sub(10);
-        }
-        (KeyCode::PageDown, _) => {
-            *scroll = scroll.saturating_add(10).min(max_scroll);
-        }
+        (KeyCode::PageUp, _) => page_scroll(scroll, max_scroll, scroll::Dir::Up),
+        (KeyCode::PageDown, _) => page_scroll(scroll, max_scroll, scroll::Dir::Down),
         (KeyCode::Enter, _) => {
             let issue_key = issue_key.clone();
             let comment_id = comment_id.clone();
@@ -3168,26 +3164,41 @@ fn start_attachment_delete(app: &mut AppState) {
     };
 }
 
-#[allow(clippy::too_many_lines)]
-/// Vim-style paging: rewrite `Ctrl+d`/`Ctrl+u` into `PageDown`/`PageUp`
-/// before dispatch, so every view and popup that pages answers the chords
+/// The fixed jump every paging key makes.
+const PAGE_LINES: usize = 10;
+
+/// The vim paging chords and the Page key each one stands in for.
+const PAGING_CHORDS: &[(char, KeyCode)] = &[('d', KeyCode::PageDown), ('u', KeyCode::PageUp)];
+
+/// Vim-style paging: rewrite the chords in `PAGING_CHORDS` into their Page
+/// keys before dispatch, so every view and popup that pages answers the chords
 /// too — no per-handler wiring, and handlers that bail on control chords
 /// (board, standup) see a plain Page key.
+///
+/// Rewriting rather than passing the chord through is load-bearing: a bare
+/// `Char('d')` would hit the arms that delete a comment, delete an attachment,
+/// or decline a template, and would type a literal `d` into every text input
+/// that falls through to `edit_text`.
 fn normalize_paging_chords(mut event: crossterm::event::Event) -> crossterm::event::Event {
     if let crossterm::event::Event::Key(ref mut key) = event
         && key.modifiers.contains(KeyModifiers::CONTROL)
+        && let KeyCode::Char(c) = key.code
+        && let Some(&(_, page)) = PAGING_CHORDS.iter().find(|(chord, _)| *chord == c)
     {
-        let page = match key.code {
-            KeyCode::Char('d') => Some(KeyCode::PageDown),
-            KeyCode::Char('u') => Some(KeyCode::PageUp),
-            _ => None,
-        };
-        if let Some(code) = page {
-            key.code = code;
-            key.modifiers.remove(KeyModifiers::CONTROL);
-        }
+        key.code = page;
+        key.modifiers.remove(KeyModifiers::CONTROL);
     }
     event
+}
+
+/// One paging step over a scroll offset, clamped to `max`. Shared by every
+/// popup that scrolls a rendered body.
+fn page_scroll(scroll: &mut u16, max: u16, dir: scroll::Dir) {
+    let lines = u16::try_from(PAGE_LINES).unwrap_or(u16::MAX);
+    *scroll = match dir {
+        scroll::Dir::Down => scroll.saturating_add(lines).min(max),
+        scroll::Dir::Up => scroll.saturating_sub(lines),
+    };
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3505,12 +3516,12 @@ fn handle_standup_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers
         }
         KeyCode::PageDown => {
             if count > 0 {
-                app.standup_selected = (app.standup_selected + 10).min(count - 1);
+                app.standup_selected = (app.standup_selected + PAGE_LINES).min(count - 1);
             }
             true
         }
         KeyCode::PageUp => {
-            app.standup_selected = app.standup_selected.saturating_sub(10);
+            app.standup_selected = app.standup_selected.saturating_sub(PAGE_LINES);
             true
         }
         KeyCode::Home => {
@@ -3829,6 +3840,9 @@ fn handle_sprint_picker_input(app: &mut AppState, event: &crossterm::event::Even
     }
 }
 
+/// How far a paging key moves the board cursor, in card steps.
+const BOARD_PAGE_MOVES: usize = 5;
+
 /// Board-mode key handling. Returns true when the key was consumed.
 fn handle_board_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> bool {
     use crate::tui::board::{BoardMove, app_board_grouping, cursor_pos};
@@ -3863,14 +3877,14 @@ fn handle_board_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) 
         KeyCode::Right | KeyCode::Char('l') => board_move(app, &grouping, BoardMove::Right),
         KeyCode::Down | KeyCode::Char('j') => board_move(app, &grouping, BoardMove::Down),
         KeyCode::Up | KeyCode::Char('k') => board_move(app, &grouping, BoardMove::Up),
-        KeyCode::PageDown => {
-            for _ in 0..5 {
-                board_move(app, &grouping, BoardMove::Down);
-            }
-        }
-        KeyCode::PageUp => {
-            for _ in 0..5 {
-                board_move(app, &grouping, BoardMove::Up);
+        KeyCode::PageDown | KeyCode::PageUp => {
+            let mv = if code == KeyCode::PageDown {
+                BoardMove::Down
+            } else {
+                BoardMove::Up
+            };
+            for _ in 0..BOARD_PAGE_MOVES {
+                board_move(app, &grouping, mv);
             }
         }
         KeyCode::Enter => {
@@ -5291,19 +5305,18 @@ fn reveal_detail_focus(app: &mut AppState, dir: scroll::Dir) {
 /// where it is, exactly as when `j`/`k` scroll past it — or a same-sized jump
 /// of the list selection.
 fn key_page(app: &mut AppState, dir: scroll::Dir) {
-    const PAGE: usize = 10;
     if app.focused_panel == FocusedPanel::Detail {
         match dir {
             scroll::Dir::Down => {
-                app.detail_scroll = app.detail_scroll.saturating_add(PAGE);
+                app.detail_scroll = app.detail_scroll.saturating_add(PAGE_LINES);
                 clamp_detail_scroll(app);
             }
-            scroll::Dir::Up => app.detail_scroll = app.detail_scroll.saturating_sub(PAGE),
+            scroll::Dir::Up => app.detail_scroll = app.detail_scroll.saturating_sub(PAGE_LINES),
         }
     } else if !app.nav_items.is_empty() {
         app.nav_idx = match dir {
-            scroll::Dir::Down => (app.nav_idx + PAGE).min(app.nav_items.len() - 1),
-            scroll::Dir::Up => app.nav_idx.saturating_sub(PAGE),
+            scroll::Dir::Down => (app.nav_idx + PAGE_LINES).min(app.nav_items.len() - 1),
+            scroll::Dir::Up => app.nav_idx.saturating_sub(PAGE_LINES),
         };
         update_view_mode_on_navigate(app);
     }
@@ -5486,12 +5499,8 @@ fn handle_error_input(app: &mut AppState, event: &crossterm::event::Event) {
         KeyCode::Down | KeyCode::Char('j') => {
             *scroll = scroll.saturating_add(1).min(max_scroll);
         }
-        KeyCode::PageUp => {
-            *scroll = scroll.saturating_sub(10);
-        }
-        KeyCode::PageDown => {
-            *scroll = scroll.saturating_add(10).min(max_scroll);
-        }
+        KeyCode::PageUp => page_scroll(scroll, max_scroll, scroll::Dir::Up),
+        KeyCode::PageDown => page_scroll(scroll, max_scroll, scroll::Dir::Down),
         _ => {}
     }
 }
@@ -5542,12 +5551,8 @@ fn handle_confirm_field_edit_input(app: &mut AppState, event: &crossterm::event:
         KeyCode::Down | KeyCode::Char('j') => {
             *scroll = scroll.saturating_add(1).min(max_scroll);
         }
-        KeyCode::PageUp => {
-            *scroll = scroll.saturating_sub(10);
-        }
-        KeyCode::PageDown => {
-            *scroll = scroll.saturating_add(10).min(max_scroll);
-        }
+        KeyCode::PageUp => page_scroll(scroll, max_scroll, scroll::Dir::Up),
+        KeyCode::PageDown => page_scroll(scroll, max_scroll, scroll::Dir::Down),
         KeyCode::Char('y') | KeyCode::Enter => {
             let issue_key = issue_key.clone();
             let field_id = field_id.clone();
@@ -5660,12 +5665,8 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
             KeyCode::Down | KeyCode::Char('j') => {
                 *scroll = scroll.saturating_add(1).min(max_scroll);
             }
-            KeyCode::PageUp => {
-                *scroll = scroll.saturating_sub(10);
-            }
-            KeyCode::PageDown => {
-                *scroll = scroll.saturating_add(10).min(max_scroll);
-            }
+            KeyCode::PageUp => page_scroll(scroll, max_scroll, scroll::Dir::Up),
+            KeyCode::PageDown => page_scroll(scroll, max_scroll, scroll::Dir::Down),
             _ => {}
         }
     } else {
