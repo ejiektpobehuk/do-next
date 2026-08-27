@@ -26,6 +26,8 @@ All notable changes to `do-next` are documented here.
 - Shared views in a company config
 - Vim-style `Ctrl+f`/`Ctrl+b` scroll a screenful, `Ctrl+d`/`Ctrl+u` half of one
 - Section jumps: `[[`/`]]` hop between the list's sections, sources
+- The list pins the current source's name to its top row while its section
+  overflows the screen, so it is always clear which source you are in
 
 ### Renames
 
