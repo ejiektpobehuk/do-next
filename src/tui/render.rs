@@ -44,6 +44,8 @@ pub struct RenderOut {
     pub overlay_content_h: usize,
     /// Viewport height of the sub-view overlay; written each render.
     pub overlay_viewport_h: usize,
+    /// Visible row count of the item list; written each render.
+    pub list_viewport_h: usize,
     /// Virtual (top, bottom) row offsets for each comment widget; written each render.
     pub overlay_comment_offsets: Vec<(usize, usize)>,
 }
@@ -111,6 +113,7 @@ pub fn render(f: &mut Frame, app: &AppState, views: &mut ViewStates, render_out:
             app,
             &mut views.list,
             app.focused_panel == FocusedPanel::List && !popup,
+            render_out,
         );
         render_detail(
             f,

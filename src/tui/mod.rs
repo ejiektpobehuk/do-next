@@ -219,6 +219,7 @@ async fn run_inner(
         app.last_detail_content_h = render_out.detail_content_h;
         app.overlay_content_h = render_out.overlay_content_h;
         app.overlay_viewport_h = render_out.overlay_viewport_h;
+        app.last_list_viewport_h = render_out.list_viewport_h;
         app.overlay_comment_offsets = std::mem::take(&mut render_out.overlay_comment_offsets);
         app.last_confirm_content_h = render_out.confirm_content_h;
         app.last_confirm_viewport_h = render_out.confirm_viewport_h;

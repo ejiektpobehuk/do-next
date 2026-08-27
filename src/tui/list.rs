@@ -20,6 +20,7 @@ pub fn render_list(
     app: &AppState,
     list_state: &mut ListState,
     focused: bool,
+    render_out: &mut crate::tui::render::RenderOut,
 ) {
     let mut items: Vec<ListItem> = Vec::new();
     // Index into `app.nav_items` for each visual row (None for non-navigable rows).
@@ -126,6 +127,7 @@ pub fn render_list(
     f.render_stateful_widget(list, area, list_state);
 
     let viewport = area.height.saturating_sub(2) as usize;
+    render_out.list_viewport_h = viewport;
     if total > viewport {
         render_scrollbar(
             f,
