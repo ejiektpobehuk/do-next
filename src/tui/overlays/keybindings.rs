@@ -69,6 +69,7 @@ fn left_column() -> Vec<Line<'static>> {
         key_line("↓ / j", "select down, then scroll"),
         key_line("← / h", "move left"),
         key_line("→ / l", "move right"),
+        key_line("[[ / ]]", "jump to the previous / next section"),
         key_line("gg / G", "top / bottom of the page"),
         key_line("PgUp / PgDn", "scroll a page"),
         key_line("Ctrl+B/Ctrl+F", "scroll a screen"),

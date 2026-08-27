@@ -110,6 +110,10 @@ pub fn render_list(
         .position(|opt| *opt == Some(app.nav_idx));
     list_state.select(list_selected);
 
+    if let Some(sel) = list_selected {
+        reveal_section_context(list_state, &item_nav_indices, sel);
+    }
+
     let total = items.len();
 
     let accent = if focused {
@@ -137,6 +141,24 @@ pub fn render_list(
             list_state.selected().unwrap_or(0),
             accent,
         );
+    }
+}
+
+/// The selected row's section context — the separator and blank rows directly
+/// above it — scrolls into view with it. Scrolling up reveals rows top-first,
+/// so without this an upward jump to a section's first item would leave the
+/// section name one row above the viewport.
+fn reveal_section_context(
+    list_state: &mut ListState,
+    item_nav_indices: &[Option<usize>],
+    selected: usize,
+) {
+    let mut ctx_start = selected;
+    while ctx_start > 0 && item_nav_indices[ctx_start - 1].is_none() {
+        ctx_start -= 1;
+    }
+    if *list_state.offset_mut() > ctx_start {
+        *list_state.offset_mut() = ctx_start;
     }
 }
 
