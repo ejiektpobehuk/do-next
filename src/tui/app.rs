@@ -561,6 +561,8 @@ pub struct AppState {
     pub overlay_content_h: usize,
     /// Viewport height of the sub-view overlay; written each render.
     pub overlay_viewport_h: usize,
+    /// Visible row count of the item list, measured at the last render.
+    pub last_list_viewport_h: usize,
     /// Index of the focused comment widget in the comments overlay.
     pub overlay_focused_comment: usize,
     /// Virtual (top, bottom) row for each comment widget; written each render.
@@ -721,6 +723,7 @@ impl AppState {
             overlay_scroll: 0,
             overlay_content_h: 0,
             overlay_viewport_h: 0,
+            last_list_viewport_h: 0,
             overlay_focused_comment: 0,
             overlay_comment_offsets: Vec::new(),
             overlay_focused_attachment: 0,
@@ -2629,7 +2632,7 @@ fn handle_attachment_path_input(app: &mut AppState, code: crossterm::event::KeyC
     true
 }
 
-fn handle_overlay_input(app: &mut AppState, event: &crossterm::event::Event) {
+fn handle_overlay_input(app: &mut AppState, event: &crossterm::event::Event, span: PageSpan) {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     let Event::Key(KeyEvent {
         code, modifiers, ..
@@ -2654,7 +2657,7 @@ fn handle_overlay_input(app: &mut AppState, event: &crossterm::event::Event) {
     }
 
     // Sub-modal: comment edit confirmation/diff
-    if handle_comment_edit_confirm_input(app, code, modifiers) {
+    if handle_comment_edit_confirm_input(app, code, modifiers, span) {
         return;
     }
 
@@ -2686,10 +2689,12 @@ fn handle_overlay_input(app: &mut AppState, event: &crossterm::event::Event) {
             }
         }
         (KeyCode::PageDown, _) => {
-            app.overlay_scroll = app.overlay_scroll.saturating_add(PAGE_LINES);
+            let lines = span.lines(app.overlay_viewport_h);
+            app.overlay_scroll = app.overlay_scroll.saturating_add(lines);
         }
         (KeyCode::PageUp, _) => {
-            app.overlay_scroll = app.overlay_scroll.saturating_sub(PAGE_LINES);
+            let lines = span.lines(app.overlay_viewport_h);
+            app.overlay_scroll = app.overlay_scroll.saturating_sub(lines);
         }
         // Comment actions (only in comments overlay)
         (KeyCode::Char('n'), _) if is_comments => {
@@ -2820,6 +2825,7 @@ fn handle_comment_edit_confirm_input(
     app: &mut AppState,
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
+    span: PageSpan,
 ) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
     if matches!(
@@ -2829,6 +2835,7 @@ fn handle_comment_edit_confirm_input(
         app.should_quit = true;
         return true;
     }
+    let viewport_h = app.last_confirm_viewport_h;
     let max_scroll = u16::try_from(
         app.last_confirm_content_h
             .saturating_sub(app.last_confirm_viewport_h),
@@ -2871,8 +2878,10 @@ fn handle_comment_edit_confirm_input(
         (KeyCode::Down | KeyCode::Char('j'), _) => {
             *scroll = scroll.saturating_add(1).min(max_scroll);
         }
-        (KeyCode::PageUp, _) => page_scroll(scroll, max_scroll, scroll::Dir::Up),
-        (KeyCode::PageDown, _) => page_scroll(scroll, max_scroll, scroll::Dir::Down),
+        (KeyCode::PageUp, _) => page_scroll(scroll, max_scroll, viewport_h, scroll::Dir::Up, span),
+        (KeyCode::PageDown, _) => {
+            page_scroll(scroll, max_scroll, viewport_h, scroll::Dir::Down, span);
+        }
         (KeyCode::Enter, _) => {
             let issue_key = issue_key.clone();
             let comment_id = comment_id.clone();
@@ -3164,11 +3173,73 @@ fn start_attachment_delete(app: &mut AppState) {
     };
 }
 
-/// The fixed jump every paging key makes.
+/// The fixed jump the Page keys make, independent of window size.
 const PAGE_LINES: usize = 10;
 
-/// The vim paging chords and the Page key each one stands in for.
-const PAGING_CHORDS: &[(char, KeyCode)] = &[('d', KeyCode::PageDown), ('u', KeyCode::PageUp)];
+/// How far a paging key moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageSpan {
+    /// What `PageUp`/`PageDown` have always done: a fixed jump that does not
+    /// track the window size.
+    Fixed,
+    /// A full screenful — vim's `Ctrl+f`/`Ctrl+b`.
+    Screen,
+    /// Half a screenful — vim's `Ctrl+d`/`Ctrl+u`.
+    HalfScreen,
+}
+
+impl PageSpan {
+    /// Lines to move over a viewport `viewport_h` rows tall.
+    ///
+    /// Never zero: before the first frame nothing has measured the geometry
+    /// yet, and a paging key should still move rather than sit dead.
+    const fn lines(self, viewport_h: usize) -> usize {
+        match self {
+            Self::Fixed => PAGE_LINES,
+            Self::Screen => {
+                if viewport_h == 0 {
+                    1
+                } else {
+                    viewport_h
+                }
+            }
+            Self::HalfScreen => {
+                if viewport_h < 2 {
+                    1
+                } else {
+                    viewport_h / 2
+                }
+            }
+        }
+    }
+
+    /// Steps to move where nothing measures a viewport. The board cursor and
+    /// the standup timeline step over rows of their own rather than screen
+    /// lines, so a screenful is their existing fixed jump and a half-page is
+    /// half of it.
+    const fn steps(self, full: usize) -> usize {
+        match self {
+            Self::HalfScreen => {
+                if full < 2 {
+                    1
+                } else {
+                    full / 2
+                }
+            }
+            _ => full,
+        }
+    }
+}
+
+/// The vim paging chords: the Page key each one stands in for, and how far it
+/// moves. `Ctrl+f`/`Ctrl+b` are vim's full page and `Ctrl+d`/`Ctrl+u` its half
+/// page; `PageUp`/`PageDown` keep their own fixed jump.
+const PAGING_CHORDS: &[(char, KeyCode, PageSpan)] = &[
+    ('f', KeyCode::PageDown, PageSpan::Screen),
+    ('b', KeyCode::PageUp, PageSpan::Screen),
+    ('d', KeyCode::PageDown, PageSpan::HalfScreen),
+    ('u', KeyCode::PageUp, PageSpan::HalfScreen),
+];
 
 /// Vim-style paging: rewrite the chords in `PAGING_CHORDS` into their Page
 /// keys before dispatch, so every view and popup that pages answers the chords
@@ -3179,22 +3250,23 @@ const PAGING_CHORDS: &[(char, KeyCode)] = &[('d', KeyCode::PageDown), ('u', KeyC
 /// `Char('d')` would hit the arms that delete a comment, delete an attachment,
 /// or decline a template, and would type a literal `d` into every text input
 /// that falls through to `edit_text`.
-fn normalize_paging_chords(mut event: crossterm::event::Event) -> crossterm::event::Event {
-    if let crossterm::event::Event::Key(ref mut key) = event
+fn normalize_paging_chords(event: &mut crossterm::event::Event) -> PageSpan {
+    if let crossterm::event::Event::Key(ref mut key) = *event
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && let KeyCode::Char(c) = key.code
-        && let Some(&(_, page)) = PAGING_CHORDS.iter().find(|(chord, _)| *chord == c)
+        && let Some(&(_, page, span)) = PAGING_CHORDS.iter().find(|(chord, _, _)| *chord == c)
     {
         key.code = page;
         key.modifiers.remove(KeyModifiers::CONTROL);
+        return span;
     }
-    event
+    PageSpan::Fixed
 }
 
 /// One paging step over a scroll offset, clamped to `max`. Shared by every
 /// popup that scrolls a rendered body.
-fn page_scroll(scroll: &mut u16, max: u16, dir: scroll::Dir) {
-    let lines = u16::try_from(PAGE_LINES).unwrap_or(u16::MAX);
+fn page_scroll(scroll: &mut u16, max: u16, viewport_h: usize, dir: scroll::Dir, span: PageSpan) {
+    let lines = u16::try_from(span.lines(viewport_h)).unwrap_or(u16::MAX);
     *scroll = match dir {
         scroll::Dir::Down => scroll.saturating_add(lines).min(max),
         scroll::Dir::Up => scroll.saturating_sub(lines),
@@ -3202,14 +3274,14 @@ fn page_scroll(scroll: &mut u16, max: u16, dir: scroll::Dir) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
+fn handle_input(app: &mut AppState, mut event: crossterm::event::Event) {
     use crossterm::event::{Event, KeyEvent};
 
-    let event = normalize_paging_chords(event);
+    let span = normalize_paging_chords(&mut event);
 
     // Sub-view overlay captures all input
     if app.overlay.is_some() {
-        handle_overlay_input(app, &event);
+        handle_overlay_input(app, &event, span);
         return;
     }
 
@@ -3232,7 +3304,7 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
             return;
         }
         ActionState::Error { .. } => {
-            handle_error_input(app, &event);
+            handle_error_input(app, &event, span);
             return;
         }
         ActionState::InlineEditingField { .. } => {
@@ -3252,11 +3324,11 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
             return;
         }
         ActionState::OfferingTemplate { .. } => {
-            handle_offering_template_input(app, &event);
+            handle_offering_template_input(app, &event, span);
             return;
         }
         ActionState::ConfirmingFieldEdit { .. } => {
-            handle_confirm_field_edit_input(app, &event);
+            handle_confirm_field_edit_input(app, &event, span);
             return;
         }
         ActionState::ConfirmingCompleteTask { .. } => {
@@ -3322,12 +3394,12 @@ fn handle_input(app: &mut AppState, event: crossterm::event::Event) {
         code, modifiers, ..
     }) = event
     {
-        handle_key(app, code, modifiers);
+        handle_key(app, code, modifiers, span);
     }
 }
 
 #[allow(clippy::too_many_lines)]
-fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
+fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers, span: PageSpan) {
     // `gg` motion: first `g` arms the latch; a second `g` fires jump-to-first.
     // Any other key clears the latch (handled at the end of each arm via the default clear below).
     if code == KeyCode::Char('g') {
@@ -3344,13 +3416,13 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
     // Board mode remaps navigation to the 3-D board cursor; anything it
     // doesn't consume falls through to the normal arms below (item actions
     // all resolve via selected_item(), so they work unchanged on cards).
-    if board_mode_active(app) && handle_board_key(app, code, modifiers) {
+    if board_mode_active(app) && handle_board_key(app, code, modifiers, span) {
         return;
     }
 
     // Standup mode owns navigation over its own timeline rows, plus the window
     // and digest keys. Anything it doesn't consume (Tab, q, ?) falls through.
-    if standup_mode_active(app) && handle_standup_key(app, code, modifiers) {
+    if standup_mode_active(app) && handle_standup_key(app, code, modifiers, span) {
         return;
     }
 
@@ -3447,8 +3519,8 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
             };
             app.detail_scroll = 0;
         }
-        (KeyCode::PageDown, _) => key_page(app, scroll::Dir::Down),
-        (KeyCode::PageUp, _) => key_page(app, scroll::Dir::Up),
+        (KeyCode::PageDown, _) => key_page(app, scroll::Dir::Down, span),
+        (KeyCode::PageUp, _) => key_page(app, scroll::Dir::Up, span),
         (KeyCode::Char('o'), _) => {
             if let Some(item) = app.selected_item() {
                 let url = item.browse_url(&app.team_jira().base_url);
@@ -3496,7 +3568,12 @@ fn standup_mode_active(app: &AppState) -> bool {
 
 /// Standup-only keys: window stepping, digest export, and navigation over the
 /// timeline's entry rows. Returns true when the key was consumed.
-fn handle_standup_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> bool {
+fn handle_standup_key(
+    app: &mut AppState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    span: PageSpan,
+) -> bool {
     // Never swallow control chords (Ctrl+C must keep quitting).
     if modifiers.contains(KeyModifiers::CONTROL) {
         return false;
@@ -3516,12 +3593,13 @@ fn handle_standup_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers
         }
         KeyCode::PageDown => {
             if count > 0 {
-                app.standup_selected = (app.standup_selected + PAGE_LINES).min(count - 1);
+                app.standup_selected =
+                    (app.standup_selected + span.steps(PAGE_LINES)).min(count - 1);
             }
             true
         }
         KeyCode::PageUp => {
-            app.standup_selected = app.standup_selected.saturating_sub(PAGE_LINES);
+            app.standup_selected = app.standup_selected.saturating_sub(span.steps(PAGE_LINES));
             true
         }
         KeyCode::Home => {
@@ -3844,7 +3922,12 @@ fn handle_sprint_picker_input(app: &mut AppState, event: &crossterm::event::Even
 const BOARD_PAGE_MOVES: usize = 5;
 
 /// Board-mode key handling. Returns true when the key was consumed.
-fn handle_board_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> bool {
+fn handle_board_key(
+    app: &mut AppState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    span: PageSpan,
+) -> bool {
     use crate::tui::board::{BoardMove, app_board_grouping, cursor_pos};
 
     // Never swallow control chords (Ctrl+C must keep quitting).
@@ -3883,7 +3966,7 @@ fn handle_board_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) 
             } else {
                 BoardMove::Up
             };
-            for _ in 0..BOARD_PAGE_MOVES {
+            for _ in 0..span.steps(BOARD_PAGE_MOVES) {
                 board_move(app, &grouping, mv);
             }
         }
@@ -5304,19 +5387,24 @@ fn reveal_detail_focus(app: &mut AppState, dir: scroll::Dir) {
 /// every other navigation key: a fixed jump of the detail page — focus stays
 /// where it is, exactly as when `j`/`k` scroll past it — or a same-sized jump
 /// of the list selection.
-fn key_page(app: &mut AppState, dir: scroll::Dir) {
+fn key_page(app: &mut AppState, dir: scroll::Dir, span: PageSpan) {
     if app.focused_panel == FocusedPanel::Detail {
+        let lines = span.lines(app.last_detail_viewport_h);
         match dir {
             scroll::Dir::Down => {
-                app.detail_scroll = app.detail_scroll.saturating_add(PAGE_LINES);
+                app.detail_scroll = app.detail_scroll.saturating_add(lines);
                 clamp_detail_scroll(app);
             }
-            scroll::Dir::Up => app.detail_scroll = app.detail_scroll.saturating_sub(PAGE_LINES),
+            scroll::Dir::Up => app.detail_scroll = app.detail_scroll.saturating_sub(lines),
         }
     } else if !app.nav_items.is_empty() {
+        // Rows, not lines: the list steps over `nav_items`, exactly as `j`/`k`
+        // do. Separators and headers make a screenful of rows slightly fewer
+        // than a screenful of items, which is what the eye expects anyway.
+        let rows = span.lines(app.last_list_viewport_h);
         app.nav_idx = match dir {
-            scroll::Dir::Down => (app.nav_idx + PAGE_LINES).min(app.nav_items.len() - 1),
-            scroll::Dir::Up => app.nav_idx.saturating_sub(PAGE_LINES),
+            scroll::Dir::Down => (app.nav_idx + rows).min(app.nav_items.len() - 1),
+            scroll::Dir::Up => app.nav_idx.saturating_sub(rows),
         };
         update_view_mode_on_navigate(app);
     }
@@ -5476,8 +5564,9 @@ fn handle_hide_input(app: &mut AppState, event: crossterm::event::Event) {
     }
 }
 
-fn handle_error_input(app: &mut AppState, event: &crossterm::event::Event) {
+fn handle_error_input(app: &mut AppState, event: &crossterm::event::Event, span: PageSpan) {
     use crossterm::event::{Event, KeyCode, KeyEvent};
+    let viewport_h = app.last_confirm_viewport_h;
     let max_scroll = u16::try_from(
         app.last_confirm_content_h
             .saturating_sub(app.last_confirm_viewport_h),
@@ -5499,14 +5588,19 @@ fn handle_error_input(app: &mut AppState, event: &crossterm::event::Event) {
         KeyCode::Down | KeyCode::Char('j') => {
             *scroll = scroll.saturating_add(1).min(max_scroll);
         }
-        KeyCode::PageUp => page_scroll(scroll, max_scroll, scroll::Dir::Up),
-        KeyCode::PageDown => page_scroll(scroll, max_scroll, scroll::Dir::Down),
+        KeyCode::PageUp => page_scroll(scroll, max_scroll, viewport_h, scroll::Dir::Up, span),
+        KeyCode::PageDown => page_scroll(scroll, max_scroll, viewport_h, scroll::Dir::Down, span),
         _ => {}
     }
 }
 
-fn handle_confirm_field_edit_input(app: &mut AppState, event: &crossterm::event::Event) {
+fn handle_confirm_field_edit_input(
+    app: &mut AppState,
+    event: &crossterm::event::Event,
+    span: PageSpan,
+) {
     use crossterm::event::{Event, KeyCode, KeyEvent};
+    let viewport_h = app.last_confirm_viewport_h;
     let max_scroll = u16::try_from(
         app.last_confirm_content_h
             .saturating_sub(app.last_confirm_viewport_h),
@@ -5551,8 +5645,8 @@ fn handle_confirm_field_edit_input(app: &mut AppState, event: &crossterm::event:
         KeyCode::Down | KeyCode::Char('j') => {
             *scroll = scroll.saturating_add(1).min(max_scroll);
         }
-        KeyCode::PageUp => page_scroll(scroll, max_scroll, scroll::Dir::Up),
-        KeyCode::PageDown => page_scroll(scroll, max_scroll, scroll::Dir::Down),
+        KeyCode::PageUp => page_scroll(scroll, max_scroll, viewport_h, scroll::Dir::Up, span),
+        KeyCode::PageDown => page_scroll(scroll, max_scroll, viewport_h, scroll::Dir::Down, span),
         KeyCode::Char('y') | KeyCode::Enter => {
             let issue_key = issue_key.clone();
             let field_id = field_id.clone();
@@ -5603,9 +5697,14 @@ fn resolve_templates(
 }
 
 #[allow(clippy::too_many_lines)]
-fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::Event) {
+fn handle_offering_template_input(
+    app: &mut AppState,
+    event: &crossterm::event::Event,
+    span: PageSpan,
+) {
     use crossterm::event::{Event, KeyCode, KeyEvent};
 
+    let viewport_h = app.last_confirm_viewport_h;
     let max_scroll = u16::try_from(
         app.last_confirm_content_h
             .saturating_sub(app.last_confirm_viewport_h),
@@ -5665,8 +5764,12 @@ fn handle_offering_template_input(app: &mut AppState, event: &crossterm::event::
             KeyCode::Down | KeyCode::Char('j') => {
                 *scroll = scroll.saturating_add(1).min(max_scroll);
             }
-            KeyCode::PageUp => page_scroll(scroll, max_scroll, scroll::Dir::Up),
-            KeyCode::PageDown => page_scroll(scroll, max_scroll, scroll::Dir::Down),
+            KeyCode::PageUp => {
+                page_scroll(scroll, max_scroll, viewport_h, scroll::Dir::Up, span);
+            }
+            KeyCode::PageDown => {
+                page_scroll(scroll, max_scroll, viewport_h, scroll::Dir::Down, span);
+            }
             _ => {}
         }
     } else {
@@ -6509,28 +6612,69 @@ mod tests {
         assert_eq!(app.detail_focus, DetailFocus::Comments);
     }
 
-    /// `Ctrl+d`/`Ctrl+u` are the vim spellings of `PageDown`/`PageUp`: the
-    /// chord is rewritten before dispatch, so it pages the same fixed jump
-    /// with the same end-of-page clamp.
+    /// The three spans are distinct: `Ctrl+f`/`Ctrl+b` move a screenful,
+    /// `Ctrl+d`/`Ctrl+u` half of one, and `PageDown`/`PageUp` keep the fixed
+    /// jump they have always had — the guard against a refactor quietly
+    /// collapsing the Page keys onto the viewport height.
     #[test]
-    fn ctrl_d_and_ctrl_u_page_like_pagedown_and_pageup() {
+    fn each_paging_span_moves_its_own_distance() {
         use crossterm::event::{Event, KeyEvent};
 
         let chord = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        let plain = |c| Event::Key(KeyEvent::new(c, KeyModifiers::NONE));
         let (mut app, _) = detail_app();
-        let max_scroll = app.last_detail_content_h - DETAIL_VIEWPORT;
+        // Neither `PAGE_LINES` nor half of it, so all three spans differ.
+        app.last_detail_viewport_h = 24;
+        app.last_detail_content_h = 500;
+        let max_scroll = 500 - 24;
+
+        handle_input(&mut app, chord('f'));
+        assert_eq!(app.detail_scroll, 24, "Ctrl+f is a screenful");
+        handle_input(&mut app, chord('b'));
+        assert_eq!(app.detail_scroll, 0, "Ctrl+b comes back");
 
         handle_input(&mut app, chord('d'));
-        assert_eq!(app.detail_scroll, 10);
+        assert_eq!(app.detail_scroll, 12, "Ctrl+d is half a screenful");
+        handle_input(&mut app, chord('u'));
+        assert_eq!(app.detail_scroll, 0, "Ctrl+u comes back");
 
-        // Paging past the end clamps exactly as PageDown does.
-        for _ in 0..10 {
-            handle_input(&mut app, chord('d'));
+        handle_input(&mut app, plain(KeyCode::PageDown));
+        assert_eq!(app.detail_scroll, PAGE_LINES, "PageDown is unchanged");
+        handle_input(&mut app, plain(KeyCode::PageUp));
+        assert_eq!(app.detail_scroll, 0, "PageUp is unchanged");
+
+        // Paging past the end clamps, whatever the span.
+        for _ in 0..40 {
+            handle_input(&mut app, chord('f'));
         }
         assert_eq!(app.detail_scroll, max_scroll);
+    }
 
-        handle_input(&mut app, chord('u'));
-        assert_eq!(app.detail_scroll, max_scroll - 10);
+    /// A chord must be rewritten before dispatch, never passed through: a
+    /// bare `Ctrl+d` lands on the arms that delete a comment, delete an
+    /// attachment and decline a template, and types a literal `d` into every
+    /// text input that falls through to `edit_text`.
+    #[test]
+    fn a_paging_chord_never_survives_as_a_character() {
+        use crossterm::event::{Event, KeyEvent};
+
+        for &(c, page, span) in PAGING_CHORDS {
+            let mut event = Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+            assert_eq!(normalize_paging_chords(&mut event), span);
+            let Event::Key(key) = event else {
+                panic!("still a key event");
+            };
+            assert_eq!(key.code, page);
+            assert!(!key.modifiers.contains(KeyModifiers::CONTROL));
+        }
+
+        // The Page keys are not chords and keep the fixed span.
+        let mut page_key = Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(normalize_paging_chords(&mut page_key), PageSpan::Fixed);
+        assert_eq!(
+            page_key,
+            Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+        );
     }
 
     /// With the list panel focused, paging jumps the selection — it must not
@@ -6545,21 +6689,26 @@ mod tests {
         let items = (1..=25)
             .map(|i| WorkItem::Jira(make_issue(&format!("PROJ-{i}"), "Open", Some("mine"))))
             .collect();
-        app.sources.insert("mine".into(), SourceState::Loaded(items));
+        app.sources
+            .insert("mine".into(), SourceState::Loaded(items));
         app.rebuild_issues();
         app.focused_panel = FocusedPanel::List;
 
-        handle_input(&mut app, chord('d'));
-        assert_eq!(app.nav_idx, 10);
+        app.last_list_viewport_h = 12;
+
+        handle_input(&mut app, chord('f'));
+        assert_eq!(app.nav_idx, 12, "a screenful of rows");
         assert_eq!(app.detail_scroll, 0, "the detail page must not move");
 
+        handle_input(&mut app, chord('d'));
+        assert_eq!(app.nav_idx, 18, "half a screenful of rows");
+
         // Past the end: land on the last row, exactly as `j` would.
-        handle_input(&mut app, chord('d'));
-        handle_input(&mut app, chord('d'));
+        handle_input(&mut app, chord('f'));
         assert_eq!(app.nav_idx, app.nav_items.len() - 1);
 
-        handle_input(&mut app, chord('u'));
-        assert_eq!(app.nav_idx, app.nav_items.len() - 1 - 10);
+        handle_input(&mut app, chord('b'));
+        assert_eq!(app.nav_idx, app.nav_items.len() - 1 - 12);
     }
 
     /// Before the first frame there is no measured geometry, so navigation has
@@ -7523,6 +7672,7 @@ mod tests {
         handle_confirm_field_edit_input(
             &mut app,
             &crossterm::event::Event::Key(crossterm::event::KeyEvent::from(KeyCode::Char('e'))),
+            PageSpan::Fixed,
         );
         let ActionState::PendingFieldEdit {
             issue_key,
@@ -7557,6 +7707,7 @@ mod tests {
             &mut app,
             KeyCode::Char('e'),
             KeyModifiers::NONE,
+            PageSpan::Fixed,
         ));
         let ActionState::PendingCommentEdit {
             issue_key,
