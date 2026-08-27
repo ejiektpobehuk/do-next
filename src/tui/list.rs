@@ -25,6 +25,8 @@ pub fn render_list(
     let mut items: Vec<ListItem> = Vec::new();
     // Index into `app.nav_items` for each visual row (None for non-navigable rows).
     let mut item_nav_indices: Vec<Option<usize>> = Vec::new();
+    // Source separator rows, by visual row index — the sticky-header source.
+    let mut separator_rows: Vec<(usize, String)> = Vec::new();
 
     let mut issue_pos = 0usize;
 
@@ -50,6 +52,7 @@ pub fn render_list(
         // Add source separator
         if visible_sources > 1 {
             let sep_text = source_separator_text(source_id, src_cfg);
+            separator_rows.push((items.len(), sep_text.clone()));
             items.push(ListItem::new(Line::from(Span::styled(
                 sep_text,
                 Style::default().add_modifier(Modifier::DIM),
@@ -114,24 +117,86 @@ pub fn render_list(
         reveal_section_context(list_state, &item_nav_indices, sel);
     }
 
-    let total = items.len();
-
     let accent = if focused {
         theme::BORDER_FOCUS
     } else {
         theme::MUTED
     };
+    render_out.list_viewport_h = render_rows(
+        f,
+        area,
+        items,
+        &separator_rows,
+        list_state,
+        list_selected,
+        accent,
+    );
+}
+
+/// Scroll bookkeeping and the actual draw: predict the scroll offset, pin the
+/// top source's name when its separator has scrolled off, then render the rows
+/// and the scrollbar.
+///
+/// Returns the rows the list actually got — the inner height, less the one a
+/// pinned name takes — which is the distance the paging keys move over.
+fn render_rows(
+    f: &mut Frame,
+    area: Rect,
+    items: Vec<ListItem<'static>>,
+    separator_rows: &[(usize, String)],
+    list_state: &mut ListState,
+    list_selected: Option<usize>,
+    accent: Color,
+) -> usize {
+    let total = items.len();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent));
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    f.render_stateful_widget(list, area, list_state);
+    // Every row is one line tall, so the offset ratatui will render with is
+    // predictable: the stored one, pulled just far enough to show the selection.
+    debug_assert!(
+        items.iter().all(|item| item.height() == 1),
+        "a taller row would break the offset prediction below",
+    );
+    let clamp_offset = |offset: usize, viewport: usize| match list_selected {
+        Some(sel) if sel < offset => sel,
+        Some(sel) if viewport > 0 && sel >= offset + viewport => sel + 1 - viewport,
+        _ => offset,
+    };
+    let mut viewport = inner.height as usize;
+    let mut offset = clamp_offset(list_state.offset().min(total.saturating_sub(1)), viewport);
 
-    let viewport = area.height.saturating_sub(2) as usize;
-    render_out.list_viewport_h = viewport;
+    // Sticky source name: when the source at the top of the viewport continues
+    // above it, its separator has scrolled off — pin the name to the first row
+    // and render the list underneath.
+    let sticky = separator_rows
+        .iter()
+        .rev()
+        .find(|(row, _)| *row <= offset)
+        .filter(|(row, _)| *row < offset && viewport > 1)
+        .map(|(_, text)| text.clone());
+    let mut list_area = inner;
+    if let Some(text) = sticky {
+        f.render_widget(
+            Line::from(Span::styled(
+                text,
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+            Rect { height: 1, ..inner },
+        );
+        list_area.y += 1;
+        list_area.height -= 1;
+        viewport -= 1;
+        offset = clamp_offset(offset, viewport);
+    }
+    *list_state.offset_mut() = offset;
+
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, list_area, list_state);
+
     if total > viewport {
         render_scrollbar(
             f,
@@ -142,6 +207,8 @@ pub fn render_list(
             accent,
         );
     }
+
+    viewport
 }
 
 /// The selected row's section context — the separator and blank rows directly

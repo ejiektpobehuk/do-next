@@ -6856,17 +6856,9 @@ mod tests {
         assert_eq!(app.nav_idx, 0);
     }
 
-    /// After an upward jump to a section's first item, the section's separator
-    /// row must be on screen too — the name is what tells you where you landed.
-    /// Scrolling up reveals rows top-first, so without the renderer pulling the
-    /// separator in it would sit one row above the viewport (checked against a
-    /// real frame because it is the list's scroll offset, not the selection,
-    /// that decides).
-    #[test]
-    fn an_upward_section_jump_reveals_the_section_name() {
-        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
-
-        // A short first section, then one long enough to fill the viewport.
+    /// A short "mrs" section, then a "tasks" section long enough to overflow
+    /// the 8-row test viewport, with the selection on the very last row.
+    fn sectioned_list_app() -> AppState {
         let teams = vec![resolved_team(
             "platform",
             vec![jira_source("mrs"), jira_source("tasks")],
@@ -6893,42 +6885,62 @@ mod tests {
         app.rebuild_issues();
         app.focused_panel = FocusedPanel::List;
         app.nav_idx = app.nav_items.len() - 1;
+        app
+    }
 
-        let area = Rect {
+    fn list_test_terminal() -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 8))
+            .expect("test backend starts")
+    }
+
+    /// Render the list into an 8-row frame, returning it as one string and the
+    /// row count the renderer reported for the paging keys. The list state is
+    /// carried between calls exactly as the real render loop does: frame checks
+    /// matter here because the list's scroll offset, not the selection, decides
+    /// what is visible.
+    fn drawn_list_frame(
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        app: &AppState,
+        list_state: &mut ratatui::widgets::ListState,
+    ) -> (String, usize) {
+        let area = ratatui::layout::Rect {
             x: 0,
             y: 0,
             width: 60,
             height: 8,
         };
-        let mut terminal =
-            Terminal::new(TestBackend::new(area.width, area.height)).expect("test backend starts");
+        let mut render_out = crate::tui::render::RenderOut::default();
+        terminal
+            .draw(|f| {
+                crate::tui::list::render_list(f, area, app, list_state, true, &mut render_out);
+            })
+            .expect("frame draws");
+        let buf = terminal.backend().buffer().clone();
+        let frame = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (frame, render_out.list_viewport_h)
+    }
+
+    /// After an upward jump to a section's first item, the section's separator
+    /// row must be on screen too — the name is what tells you where you landed.
+    /// Scrolling up reveals rows top-first, so without the renderer pulling the
+    /// separator in it would sit one row above the viewport (checked against a
+    /// real frame because it is the list's scroll offset, not the selection,
+    /// that decides).
+    #[test]
+    fn an_upward_section_jump_reveals_the_section_name() {
+        let mut app = sectioned_list_app();
+        let mut terminal = list_test_terminal();
         let mut list_state = ratatui::widgets::ListState::default();
-        let mut draw = |app: &AppState, list_state: &mut ratatui::widgets::ListState| {
-            terminal
-                .draw(|f| {
-                    crate::tui::list::render_list(
-                        f,
-                        area,
-                        app,
-                        list_state,
-                        true,
-                        &mut crate::tui::render::RenderOut::default(),
-                    );
-                })
-                .expect("frame draws");
-            let buf = terminal.backend().buffer().clone();
-            (0..area.height)
-                .map(|y| {
-                    (0..area.width)
-                        .map(|x| buf[(x, y)].symbol().to_owned())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
 
         // The first frame scrolls to the bottom of the long second section…
-        draw(&app, &mut list_state);
+        drawn_list_frame(&mut terminal, &app, &mut list_state);
         // …an upward jump lands on that section's first item…
         handle_key(
             &mut app,
@@ -6942,7 +6954,7 @@ mod tests {
             KeyModifiers::NONE,
             PageSpan::Fixed,
         );
-        let visible = draw(&app, &mut list_state);
+        let (visible, _) = drawn_list_frame(&mut terminal, &app, &mut list_state);
 
         assert!(
             visible.contains("tasks"),
@@ -6952,6 +6964,86 @@ mod tests {
             visible.contains("PROJ-1"),
             "with the section's first item on screen, got:\n{visible}"
         );
+    }
+
+    /// Deep inside a section that overflows the screen, the source name is
+    /// pinned to the list's first row — its separator has scrolled off above,
+    /// and without the pin nothing on screen says which section this is.
+    #[test]
+    fn a_section_taller_than_the_screen_keeps_its_name_pinned_on_top() {
+        let app = sectioned_list_app();
+        let mut terminal = list_test_terminal();
+        let mut list_state = ratatui::widgets::ListState::default();
+
+        let (visible, _) = drawn_list_frame(&mut terminal, &app, &mut list_state);
+        // Row 0 is the panel border, so the list's first row is row 1.
+        let rows: Vec<&str> = visible.lines().collect();
+
+        assert!(
+            rows[1].contains("tasks"),
+            "the source name must be pinned to the top row, got:\n{visible}"
+        );
+        assert!(
+            visible.contains("PROJ-8"),
+            "with the selected last item still on screen, got:\n{visible}"
+        );
+        assert!(
+            !visible.contains("MINE"),
+            "rows of the previous section stay off screen, got:\n{visible}"
+        );
+    }
+
+    /// Scrolling back up out of an overflowing section, the pin hands over to
+    /// the real separator row: the name is never shown twice at once, because
+    /// the pin only ever stands in for a separator that has scrolled off.
+    #[test]
+    fn the_pinned_name_hands_over_to_the_separator_row_without_doubling() {
+        let mut app = sectioned_list_app();
+        let mut terminal = list_test_terminal();
+        let mut list_state = ratatui::widgets::ListState::default();
+
+        // Walk the selection up a row at a time, as `k` does, carrying the list
+        // state between frames — the handover happens through the offset.
+        for nav_idx in (0..app.nav_items.len()).rev() {
+            app.nav_idx = nav_idx;
+            let (visible, _) = drawn_list_frame(&mut terminal, &app, &mut list_state);
+            assert_eq!(
+                visible.matches("tasks").count(),
+                1,
+                "at nav_idx {nav_idx} the name is on screen exactly once, got:\n{visible}"
+            );
+            assert!(
+                visible.matches("mrs").count() <= 1,
+                "at nav_idx {nav_idx} the first section's name never doubles, got:\n{visible}"
+            );
+        }
+    }
+
+    /// The pin spends one of the list's rows, so the geometry handed to the
+    /// paging keys has to shrink with it — otherwise `Ctrl+f` and `Ctrl+d` step
+    /// over a row that was never on screen.
+    #[test]
+    fn a_pinned_name_shortens_the_page_the_paging_keys_move_over() {
+        let mut app = sectioned_list_app();
+        let mut terminal = list_test_terminal();
+        let mut list_state = ratatui::widgets::ListState::default();
+
+        // Deep in the overflowing section the pin is up, costing a row.
+        let (pinned, pinned_rows) = drawn_list_frame(&mut terminal, &app, &mut list_state);
+        assert!(
+            pinned
+                .lines()
+                .nth(1)
+                .is_some_and(|row| row.contains("tasks")),
+            "expected the pin to be up, got:\n{pinned}"
+        );
+        assert_eq!(pinned_rows, 5, "the pin costs a row, got:\n{pinned}");
+
+        // At the top of the list the real separator shows and the list keeps
+        // the whole inner height.
+        app.nav_idx = 0;
+        let (top, top_rows) = drawn_list_frame(&mut terminal, &app, &mut list_state);
+        assert_eq!(top_rows, 6, "nothing pinned, nothing spent, got:\n{top}");
     }
 
     /// Before the first frame there is no measured geometry, so navigation has
