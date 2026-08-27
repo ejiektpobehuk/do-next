@@ -503,6 +503,8 @@ pub struct AppFlags {
     pub field_names: FieldNamesState,
     /// Tracks first `g` press for `gg` (jump to first) motion.
     pub pending_g: bool,
+    /// Tracks the first bracket press for the `[[`/`]]` section motions.
+    pub pending_bracket: Option<char>,
     /// Set when a tab switch requires fetching sources for the new team.
     pub pending_team_fetch: bool,
 }
@@ -3403,6 +3405,7 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers, span: 
     // `gg` motion: first `g` arms the latch; a second `g` fires jump-to-first.
     // Any other key clears the latch (handled at the end of each arm via the default clear below).
     if code == KeyCode::Char('g') {
+        app.flags.pending_bracket = None;
         if app.flags.pending_g {
             app.flags.pending_g = false;
             key_jump_first(app);
@@ -3412,6 +3415,29 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers, span: 
         return;
     }
     app.flags.pending_g = false;
+
+    // `[[`/`]]` motions — vim's section jumps, latched like `gg`: hop between
+    // the (source, subsource) runs the list marks with separator rows.
+    // Boards and standup have no sections.
+    if let KeyCode::Char(c @ ('[' | ']')) = code {
+        if app.flags.pending_bracket.take() == Some(c) {
+            if app.focused_panel == FocusedPanel::List
+                && !board_mode_active(app)
+                && !standup_mode_active(app)
+            {
+                let dir = if c == '[' {
+                    scroll::Dir::Up
+                } else {
+                    scroll::Dir::Down
+                };
+                key_section_jump(app, dir);
+            }
+        } else {
+            app.flags.pending_bracket = Some(c);
+        }
+        return;
+    }
+    app.flags.pending_bracket = None;
 
     // Board mode remaps navigation to the 3-D board cursor; anything it
     // doesn't consume falls through to the normal arms below (item actions
@@ -5410,6 +5436,56 @@ fn key_page(app: &mut AppState, dir: scroll::Dir, span: PageSpan) {
     }
 }
 
+/// Section identity of a nav row: the (source, subsource) pair whose changes
+/// the list marks with separator rows. A section is a maximal run of adjacent
+/// rows sharing this key.
+fn nav_section_key(app: &AppState, i: usize) -> (&str, usize) {
+    match &app.nav_items[i] {
+        NavItem::Issue(idx) => app.issues.get(*idx).map_or(("", 0), |item| {
+            (item.source_id().unwrap_or(""), item.subsource_idx())
+        }),
+        // A whole-source failure is its own one-row section.
+        NavItem::SourceError(id) => (id, usize::MAX),
+        NavItem::SubsourceError(id, sub) => (id, *sub),
+    }
+}
+
+/// `[[`/`]]` — hop over sections, exactly vim's section motions: down to the
+/// first row of the next section; up to the top of the current section, or of
+/// the previous one when already there.
+fn key_section_jump(app: &mut AppState, dir: scroll::Dir) {
+    let len = app.nav_items.len();
+    if len == 0 {
+        return;
+    }
+    let cur = app.nav_idx.min(len - 1);
+    let cur_key = nav_section_key(app, cur);
+    let target = match dir {
+        // In the final section there is no next top: the last row instead.
+        scroll::Dir::Down => (cur + 1..len)
+            .find(|&i| nav_section_key(app, i) != cur_key)
+            .unwrap_or(len - 1),
+        scroll::Dir::Up => {
+            let mut start = cur;
+            while start > 0 && nav_section_key(app, start - 1) == cur_key {
+                start -= 1;
+            }
+            if start == cur && start > 0 {
+                let prev_key = nav_section_key(app, start - 1);
+                start -= 1;
+                while start > 0 && nav_section_key(app, start - 1) == prev_key {
+                    start -= 1;
+                }
+            }
+            start
+        }
+    };
+    if target != app.nav_idx {
+        app.nav_idx = target;
+        update_view_mode_on_navigate(app);
+    }
+}
+
 /// No scrolling past the end of the detail content, and none at all when the
 /// content fits. Heights come from the last rendered frame — which is the one
 /// the user was looking at when they pressed the key.
@@ -6709,6 +6785,173 @@ mod tests {
 
         handle_input(&mut app, chord('b'));
         assert_eq!(app.nav_idx, app.nav_items.len() - 1 - 12);
+    }
+
+    /// `[[`/`]]` hop over the list's sections — the (source, subsource) runs
+    /// the list separates visually — instead of stepping row by row: down to
+    /// the next section's first row, up to the top of the current section and
+    /// then of the previous ones. A single bracket only arms the latch.
+    #[test]
+    fn double_brackets_jump_between_sections() {
+        let teams = vec![resolved_team(
+            "platform",
+            vec![jira_source("mrs"), jira_source("tasks")],
+        )];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        // First source: two subsource runs; second source: one more section.
+        let mine =
+            (1..=2).map(|i| WorkItem::Jira(make_issue(&format!("MINE-{i}"), "Open", Some("mrs"))));
+        let reviewing = (1..=2).map(|i| {
+            let mut issue = make_issue(&format!("REV-{i}"), "Open", Some("mrs"));
+            issue.subsource_idx = 1;
+            WorkItem::Jira(issue)
+        });
+        app.sources.insert(
+            "mrs".into(),
+            SourceState::Loaded(mine.chain(reviewing).collect()),
+        );
+        app.sources.insert(
+            "tasks".into(),
+            SourceState::Loaded(
+                (1..=2)
+                    .map(|i| {
+                        WorkItem::Jira(make_issue(&format!("PROJ-{i}"), "Open", Some("tasks")))
+                    })
+                    .collect(),
+            ),
+        );
+        app.rebuild_issues();
+        app.focused_panel = FocusedPanel::List;
+        assert_eq!(app.nav_items.len(), 6, "fixture: three 2-row sections");
+
+        let press = |app: &mut AppState, c| {
+            handle_key(app, KeyCode::Char(c), KeyModifiers::NONE, PageSpan::Fixed);
+        };
+        let jump = |app: &mut AppState, c| {
+            press(app, c);
+            press(app, c);
+        };
+
+        // A single bracket only arms the latch, and any other key clears it.
+        press(&mut app, ']');
+        assert_eq!(app.nav_idx, 0, "one bracket must not move");
+        press(&mut app, 'k');
+        press(&mut app, ']');
+        assert_eq!(app.nav_idx, 0, "an interposed key clears the latch");
+
+        // Down: the first row of each following section, then the last row.
+        jump(&mut app, ']');
+        assert_eq!(app.nav_idx, 2);
+        jump(&mut app, ']');
+        assert_eq!(app.nav_idx, 4);
+        jump(&mut app, ']');
+        assert_eq!(app.nav_idx, 5, "no next section: the last row");
+
+        // Up from mid-section: this section's top, then the previous tops.
+        jump(&mut app, '[');
+        assert_eq!(app.nav_idx, 4);
+        jump(&mut app, '[');
+        assert_eq!(app.nav_idx, 2);
+        jump(&mut app, '[');
+        assert_eq!(app.nav_idx, 0);
+    }
+
+    /// After an upward jump to a section's first item, the section's separator
+    /// row must be on screen too — the name is what tells you where you landed.
+    /// Scrolling up reveals rows top-first, so without the renderer pulling the
+    /// separator in it would sit one row above the viewport (checked against a
+    /// real frame because it is the list's scroll offset, not the selection,
+    /// that decides).
+    #[test]
+    fn an_upward_section_jump_reveals_the_section_name() {
+        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+        // A short first section, then one long enough to fill the viewport.
+        let teams = vec![resolved_team(
+            "platform",
+            vec![jira_source("mrs"), jira_source("tasks")],
+        )];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        app.sources.insert(
+            "mrs".into(),
+            SourceState::Loaded(
+                (1..=4)
+                    .map(|i| WorkItem::Jira(make_issue(&format!("MINE-{i}"), "Open", Some("mrs"))))
+                    .collect(),
+            ),
+        );
+        app.sources.insert(
+            "tasks".into(),
+            SourceState::Loaded(
+                (1..=8)
+                    .map(|i| {
+                        WorkItem::Jira(make_issue(&format!("PROJ-{i}"), "Open", Some("tasks")))
+                    })
+                    .collect(),
+            ),
+        );
+        app.rebuild_issues();
+        app.focused_panel = FocusedPanel::List;
+        app.nav_idx = app.nav_items.len() - 1;
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 8,
+        };
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test backend starts");
+        let mut list_state = ratatui::widgets::ListState::default();
+        let mut draw = |app: &AppState, list_state: &mut ratatui::widgets::ListState| {
+            terminal
+                .draw(|f| {
+                    crate::tui::list::render_list(
+                        f,
+                        area,
+                        app,
+                        list_state,
+                        true,
+                        &mut crate::tui::render::RenderOut::default(),
+                    );
+                })
+                .expect("frame draws");
+            let buf = terminal.backend().buffer().clone();
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol().to_owned())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // The first frame scrolls to the bottom of the long second section…
+        draw(&app, &mut list_state);
+        // …an upward jump lands on that section's first item…
+        handle_key(
+            &mut app,
+            KeyCode::Char('['),
+            KeyModifiers::NONE,
+            PageSpan::Fixed,
+        );
+        handle_key(
+            &mut app,
+            KeyCode::Char('['),
+            KeyModifiers::NONE,
+            PageSpan::Fixed,
+        );
+        let visible = draw(&app, &mut list_state);
+
+        assert!(
+            visible.contains("tasks"),
+            "the section separator must be visible, got:\n{visible}"
+        );
+        assert!(
+            visible.contains("PROJ-1"),
+            "with the section's first item on screen, got:\n{visible}"
+        );
     }
 
     /// Before the first frame there is no measured geometry, so navigation has

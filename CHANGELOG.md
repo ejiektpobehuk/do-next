@@ -25,6 +25,7 @@ All notable changes to `do-next` are documented here.
 - `do-next auth` is now a menu of integrations
 - Shared views in a company config
 - Vim-style `Ctrl+f`/`Ctrl+b` scroll a screenful, `Ctrl+d`/`Ctrl+u` half of one
+- Section jumps: `[[`/`]]` hop between the list's sections, sources
 
 ### Renames
 
