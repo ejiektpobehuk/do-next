@@ -3436,8 +3436,8 @@ fn handle_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
             };
             app.detail_scroll = 0;
         }
-        (KeyCode::PageDown, _) => page_detail_scroll(app, scroll::Dir::Down),
-        (KeyCode::PageUp, _) => page_detail_scroll(app, scroll::Dir::Up),
+        (KeyCode::PageDown, _) => key_page(app, scroll::Dir::Down),
+        (KeyCode::PageUp, _) => key_page(app, scroll::Dir::Up),
         (KeyCode::Char('o'), _) => {
             if let Some(item) = app.selected_item() {
                 let url = item.browse_url(&app.team_jira().base_url);
@@ -5286,16 +5286,26 @@ fn reveal_detail_focus(app: &mut AppState, dir: scroll::Dir) {
         scroll::reveal_block(app.detail_scroll, app.last_detail_viewport_h, block, dir);
 }
 
-/// `PageUp`/`PageDown` in the detail panel: a fixed jump, clamped to the page.
-/// Focus stays where it is, exactly as when `j`/`k` scroll past it.
-fn page_detail_scroll(app: &mut AppState, dir: scroll::Dir) {
+/// `PageUp`/`PageDown` (and the vim chords) act on the focused panel, like
+/// every other navigation key: a fixed jump of the detail page — focus stays
+/// where it is, exactly as when `j`/`k` scroll past it — or a same-sized jump
+/// of the list selection.
+fn key_page(app: &mut AppState, dir: scroll::Dir) {
     const PAGE: usize = 10;
-    match dir {
-        scroll::Dir::Down => {
-            app.detail_scroll = app.detail_scroll.saturating_add(PAGE);
-            clamp_detail_scroll(app);
+    if app.focused_panel == FocusedPanel::Detail {
+        match dir {
+            scroll::Dir::Down => {
+                app.detail_scroll = app.detail_scroll.saturating_add(PAGE);
+                clamp_detail_scroll(app);
+            }
+            scroll::Dir::Up => app.detail_scroll = app.detail_scroll.saturating_sub(PAGE),
         }
-        scroll::Dir::Up => app.detail_scroll = app.detail_scroll.saturating_sub(PAGE),
+    } else if !app.nav_items.is_empty() {
+        app.nav_idx = match dir {
+            scroll::Dir::Down => (app.nav_idx + PAGE).min(app.nav_items.len() - 1),
+            scroll::Dir::Up => app.nav_idx.saturating_sub(PAGE),
+        };
+        update_view_mode_on_navigate(app);
     }
 }
 
@@ -6520,6 +6530,35 @@ mod tests {
 
         handle_input(&mut app, chord('u'));
         assert_eq!(app.detail_scroll, max_scroll - 10);
+    }
+
+    /// With the list panel focused, paging jumps the selection — it must not
+    /// scroll the detail page of whatever item happens to be under the cursor.
+    #[test]
+    fn paging_moves_the_list_selection_when_the_list_is_focused() {
+        use crossterm::event::{Event, KeyEvent};
+
+        let chord = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        let teams = vec![resolved_team("platform", vec![jira_source("mine")])];
+        let mut app = AppState::new(teams, &cfg::Config::default());
+        let items = (1..=25)
+            .map(|i| WorkItem::Jira(make_issue(&format!("PROJ-{i}"), "Open", Some("mine"))))
+            .collect();
+        app.sources.insert("mine".into(), SourceState::Loaded(items));
+        app.rebuild_issues();
+        app.focused_panel = FocusedPanel::List;
+
+        handle_input(&mut app, chord('d'));
+        assert_eq!(app.nav_idx, 10);
+        assert_eq!(app.detail_scroll, 0, "the detail page must not move");
+
+        // Past the end: land on the last row, exactly as `j` would.
+        handle_input(&mut app, chord('d'));
+        handle_input(&mut app, chord('d'));
+        assert_eq!(app.nav_idx, app.nav_items.len() - 1);
+
+        handle_input(&mut app, chord('u'));
+        assert_eq!(app.nav_idx, app.nav_items.len() - 1 - 10);
     }
 
     /// Before the first frame there is no measured geometry, so navigation has
