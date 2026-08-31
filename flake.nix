@@ -39,6 +39,9 @@
             pkgs.cacert
             pkgs.git
           ];
+          # The oauth callback tests bind a listener on 127.0.0.1; the darwin
+          # sandbox denies even loopback networking without this attribute.
+          __darwinAllowLocalNetworking = true;
         };
       in
       {
