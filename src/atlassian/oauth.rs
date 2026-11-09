@@ -309,9 +309,8 @@ pub async fn refresh_access_token(creds: &OAuthCredentials) -> Result<OAuthCrede
 
 /// Keyring entry pointing at the `cloud_id` whose tokens are stored.
 ///
-/// Named so a status probe can ask whether the store is *readable* — the
-/// loaders below deliberately swallow keyring errors into "no tokens", which is
-/// right for a credential path and a lie for a display.
+/// Named so a status probe can ask whether the store is *readable* when the
+/// loaders below come back empty.
 pub const KEYRING_INDEX_KEY: &str = "oauth:_index";
 /// Save OAuth tokens using the store indicated by `creds.store`.
 pub fn save_oauth_tokens(creds: &OAuthCredentials) -> Result<()> {
@@ -354,12 +353,23 @@ pub fn save_oauth_tokens(creds: &OAuthCredentials) -> Result<()> {
 }
 
 /// Load OAuth tokens, trying keyring first then file.
+///
+/// A keyring that can't be read (locked, secret service down) is not "no
+/// tokens": the file store still gets a chance, but if it has nothing either
+/// the keyring failure is the error, so a locked keyring never looks like
+/// being signed out.
 pub fn load_oauth_tokens() -> Result<Option<OAuthCredentials>> {
-    // Try keyring — we don't know the cloud_id yet, so scan for any oauth:* entry.
-    if let Some(creds) = load_oauth_from_keyring()? {
-        return Ok(Some(creds));
+    match load_oauth_from_keyring() {
+        Ok(Some(creds)) => Ok(Some(creds)),
+        Ok(None) => load_oauth_from_file(),
+        Err(keyring_err) => {
+            if let Some(creds) = load_oauth_from_file()? {
+                log::debug!("keyring unreadable ({keyring_err:#}); using OAuth tokens from file");
+                return Ok(Some(creds));
+            }
+            Err(keyring_err)
+        }
     }
-    load_oauth_from_file()
 }
 
 fn load_oauth_from_keyring() -> Result<Option<OAuthCredentials>> {
@@ -368,39 +378,13 @@ fn load_oauth_from_keyring() -> Result<Option<OAuthCredentials>> {
     // keyring, we stored a pointer under "oauth:_index" with the cloud_id.
     //
     // Since keyring 4 the platform store is initialized on the first `Entry::new`,
-    // so a keyring that isn't available fails here. Treat that like a missing
-    // entry so the file store still gets a chance.
-    let index_entry = match keyring::Entry::new("do-next", KEYRING_INDEX_KEY) {
-        Ok(entry) => entry,
-        Err(e) => {
-            log::debug!("keyring unavailable for OAuth index lookup: {e}");
-            return Ok(None);
-        }
+    // so a keyring that isn't available fails there rather than on the lookup.
+    let Some(cloud_id) = crate::config::credentials::oauth_keyring_get(KEYRING_INDEX_KEY)? else {
+        return Ok(None);
     };
-    let cloud_id = match index_entry.get_password() {
-        Ok(id) => id,
-        Err(keyring::Error::NoEntry) => return Ok(None),
-        Err(e) => {
-            log::debug!("keyring index lookup failed: {e}");
-            return Ok(None);
-        }
-    };
-
     let key = format!("oauth:{cloud_id}");
-    let entry = match keyring::Entry::new("do-next", &key) {
-        Ok(entry) => entry,
-        Err(e) => {
-            log::debug!("keyring unavailable for OAuth token lookup: {e}");
-            return Ok(None);
-        }
-    };
-    let json = match entry.get_password() {
-        Ok(s) => s,
-        Err(keyring::Error::NoEntry) => return Ok(None),
-        Err(e) => {
-            log::debug!("keyring OAuth token lookup failed: {e}");
-            return Ok(None);
-        }
+    let Some(json) = crate::config::credentials::oauth_keyring_get(&key)? else {
+        return Ok(None);
     };
 
     let stored: StoredTokens =

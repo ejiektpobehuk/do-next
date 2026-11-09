@@ -650,18 +650,17 @@ pub fn probe(spec: &TargetSpec) -> CredentialState {
 
 fn probe_atlassian(config: &AtlassianConfig) -> CredentialState {
     if config.auth_method.as_deref() == Some("oauth") {
-        // `load_oauth_tokens` already swallows keyring errors, so this cannot
-        // hang or hard-fail the listing.
+        // A keyring error comes back as `Err` and is shown as unreadable
+        // below, so this cannot hard-fail the listing.
         return match crate::atlassian::oauth::load_oauth_tokens() {
             Ok(Some(creds)) => CredentialState::Present {
                 method: Method::OAuth,
                 store: oauth_store(&creds.store),
                 expires_at: Some(creds.expires_at),
             },
-            // `load_oauth_tokens` folds a locked keyring into "no tokens",
-            // which is right for a credential path and wrong here: reporting a
-            // store we could not read as "not configured" is a lie the user
-            // would act on. So when nothing turned up, ask why.
+            // Nothing in either store. Probe once more so a keyring that
+            // became unreadable between reads still isn't reported as
+            // "not configured".
             Ok(None) => unreadable_or_missing(crate::atlassian::oauth::KEYRING_INDEX_KEY),
             Err(e) => {
                 log::debug!("auth: reading Atlassian OAuth tokens failed: {e:#}");
@@ -1440,9 +1439,9 @@ mod tests {
 
     #[test]
     fn an_empty_oauth_store_says_unreadable_only_when_it_could_not_be_read() {
-        // load_oauth_tokens folds a locked keyring into "no tokens". Reporting
-        // that as "not configured" tells the user to sign in again when the
-        // real problem is a locked store, so the two are separated here.
+        // Reporting an unreadable store as "not configured" tells the user to
+        // sign in again when the real problem is a locked keyring, so the two
+        // are separated here.
         assert_eq!(
             unreadable_or_missing_from(KeyringProbe::Unavailable),
             CredentialState::Unreadable {

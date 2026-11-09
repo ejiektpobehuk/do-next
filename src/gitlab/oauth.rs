@@ -488,33 +488,31 @@ pub fn save_oauth_tokens(creds: &GitlabOAuthCredentials) -> Result<()> {
 }
 
 /// Load stored tokens for one instance: keyring first, then the file.
+///
+/// An unreadable keyring falls through to the file, but if the file has no
+/// tokens either the keyring failure is returned — a locked keyring must not
+/// look like being signed out.
 pub fn load_oauth_tokens(base_url: &str) -> Result<Option<GitlabOAuthCredentials>> {
     let base_url = base_url.trim_end_matches('/');
-    if let Some(creds) = load_from_keyring(base_url)? {
-        return Ok(Some(creds));
+    match load_from_keyring(base_url) {
+        Ok(Some(creds)) => Ok(Some(creds)),
+        Ok(None) => load_from_file(base_url),
+        Err(keyring_err) => {
+            if let Some(creds) = load_from_file(base_url)? {
+                log::debug!(
+                    "keyring unreadable ({keyring_err:#}); using GitLab OAuth tokens from file"
+                );
+                return Ok(Some(creds));
+            }
+            Err(keyring_err)
+        }
     }
-    load_from_file(base_url)
 }
 
 fn load_from_keyring(base_url: &str) -> Result<Option<GitlabOAuthCredentials>> {
     let key = keyring_key(base_url);
-    // Since keyring 4 the platform store initializes on the first `Entry::new`,
-    // so an unavailable keyring fails here. Treat that like a missing entry so
-    // the file store still gets a chance.
-    let entry = match keyring::Entry::new("do-next", &key) {
-        Ok(entry) => entry,
-        Err(e) => {
-            log::debug!("keyring unavailable for GitLab OAuth lookup: {e}");
-            return Ok(None);
-        }
-    };
-    let json = match entry.get_password() {
-        Ok(json) => json,
-        Err(keyring::Error::NoEntry) => return Ok(None),
-        Err(e) => {
-            log::debug!("keyring GitLab OAuth lookup failed: {e}");
-            return Ok(None);
-        }
+    let Some(json) = crate::config::credentials::oauth_keyring_get(&key)? else {
+        return Ok(None);
     };
     let stored: StoredTokens = serde_json::from_str(&json)
         .context("Failed to parse GitLab OAuth tokens from the keyring")?;

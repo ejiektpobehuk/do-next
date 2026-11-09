@@ -395,6 +395,34 @@ fn keyring_lookup(key: &str, hints: &KeyringHints) -> Result<Option<String>> {
     }
 }
 
+/// Read an OAuth keyring entry. `Ok(None)` only for a genuinely missing entry;
+/// a locked or unavailable keyring is an error, so callers can't mistake it
+/// for "signed out".
+pub fn oauth_keyring_get(key: &str) -> Result<Option<String>> {
+    // Since keyring 4 the platform store is initialized on the first `Entry::new`,
+    // so an unavailable or locked keyring can surface here rather than on the lookup.
+    let entry = keyring::Entry::new("do-next", key).map_err(|e| oauth_keyring_failure(key, &e))?;
+    match entry.get_password() {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(oauth_keyring_failure(key, &e)),
+    }
+}
+
+fn oauth_keyring_failure(key: &str, err: &keyring::Error) -> anyhow::Error {
+    log::debug!("credentials: OAuth keyring read failed for key={key}: {err}");
+    anyhow!(
+        "Could not read OAuth tokens from the system keyring (key={key}): {err}\n\
+         The keyring may be locked, or the secret service may not be running.\n\
+         \n\
+         Possible fixes:\n\
+         • Unlock your keyring and try again\n\
+         • Run `do-next auth` to sign in again\n\
+         \n\
+         Run with --log <file> for details."
+    )
+}
+
 /// Turn a keyring failure into an actionable error. `NoEntry` never reaches
 /// here: a missing entry means "fall through to the next source", not a failure.
 fn keyring_failure(key: &str, hints: &KeyringHints, err: &keyring::Error) -> anyhow::Error {
