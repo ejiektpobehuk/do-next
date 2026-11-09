@@ -14,6 +14,7 @@ mod http;
 mod items;
 mod jira;
 mod oauth;
+mod secret_file;
 mod sources;
 mod standup;
 mod startup;

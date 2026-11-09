@@ -475,21 +475,12 @@ pub fn save_oauth_tokens(creds: &GitlabOAuthCredentials) -> Result<()> {
         }
         OAuthStore::File => {
             let path = tokens_file_path()?;
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
             let mut all = read_tokens_file()?;
             all.retain(|t| t.base_url != stored.base_url);
             all.push(stored);
             let json =
                 serde_json::to_string(&all).context("Failed to serialize GitLab OAuth tokens")?;
-            std::fs::write(&path, &json)
-                .with_context(|| format!("Failed to write {}", path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            }
+            crate::secret_file::write_secret_file(&path, &json)?;
             log::debug!("GitLab OAuth tokens saved to {}", path.display());
         }
     }

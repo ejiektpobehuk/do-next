@@ -250,16 +250,7 @@ async fn setup_token(
                 }
             };
             let merged = merge_token_into_credentials(existing.as_deref(), "gitlab", &token)?;
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&path, merged)
-                .with_context(|| format!("Failed to write {}", path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            }
+            crate::secret_file::write_secret_file(&path, merged)?;
             println!("GitLab token written to {}", path.display());
             Ok(SetupOutcome::Configured)
         }

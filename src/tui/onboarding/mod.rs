@@ -692,13 +692,7 @@ pub(super) fn apply_token_storage(
                 crate::config::credentials::ATLASSIAN_CREDENTIALS_SECTION,
                 &token,
             )?;
-            std::fs::create_dir_all(config_dir)?;
-            std::fs::write(&creds_path, &creds_content)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&creds_path, std::fs::Permissions::from_mode(0o600))?;
-            }
+            crate::secret_file::write_secret_file(&creds_path, &creds_content)?;
             println!("Credentials written to {}", creds_path.display());
         }
 

@@ -342,17 +342,11 @@ pub fn save_oauth_tokens(creds: &OAuthCredentials) -> Result<()> {
             log::debug!("OAuth tokens saved to keyring (key={key})");
         }
         OAuthStore::File => {
-            let dir = dirs::config_dir()
+            let path = dirs::config_dir()
                 .context("Cannot determine config directory")?
-                .join("do-next");
-            std::fs::create_dir_all(&dir)?;
-            let path = dir.join("oauth_tokens.json5");
-            std::fs::write(&path, &json)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            }
+                .join("do-next")
+                .join("oauth_tokens.json5");
+            crate::secret_file::write_secret_file(&path, &json)?;
             log::debug!("OAuth tokens saved to {}", path.display());
         }
     }
